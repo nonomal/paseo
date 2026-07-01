@@ -1,4 +1,5 @@
 import { defineConfig, configDefaults } from "vitest/config";
+import { playwright } from "@vitest/browser-playwright";
 import path from "path";
 import fs from "fs";
 
@@ -15,7 +16,34 @@ export default defineConfig({
   test: {
     environment: "node",
     exclude: [...configDefaults.exclude, "e2e/**"],
-    setupFiles: [path.resolve(__dirname, "vitest.setup.ts")],
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: "unit",
+          environment: "node",
+          include: ["src/**/*.{test,spec}.{ts,tsx}"],
+          setupFiles: [path.resolve(__dirname, "vitest.setup.ts")],
+          exclude: [...configDefaults.exclude, "e2e/**", "src/**/*.browser.{test,spec}.{ts,tsx}"],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "browser",
+          fileParallelism: false,
+          include: ["src/**/*.browser.{test,spec}.{ts,tsx}"],
+          browser: {
+            enabled: true,
+            provider: playwright(),
+            headless: true,
+            connectTimeout: 180_000,
+            instances: [{ browser: "chromium" }],
+            screenshotDirectory: ".vitest-screenshots",
+          },
+        },
+      },
+    ],
     /**
      * Expo pulls in native tooling (xcode, etc.) that executes files relying on `process.send`.
      * Vitest's default worker pool uses worker_threads, which intentionally stub that API and
@@ -23,11 +51,7 @@ export default defineConfig({
      * keeps `process.send` intact so the app tests can boot before hitting the intentional failures.
      */
     pool: "forks",
-    poolOptions: {
-      forks: {
-        maxForks: 2,
-      },
-    },
+    maxWorkers: 2,
     server: {
       deps: {
         fallbackCJS: true,
@@ -36,6 +60,21 @@ export default defineConfig({
     },
   },
   resolve: {
+    extensions: [
+      ".web.mjs",
+      ".web.js",
+      ".web.mts",
+      ".web.ts",
+      ".web.jsx",
+      ".web.tsx",
+      ".mjs",
+      ".js",
+      ".mts",
+      ".ts",
+      ".jsx",
+      ".tsx",
+      ".json",
+    ],
     alias: [
       {
         find: /^@getpaseo\/relay\/e2ee$/,
@@ -46,7 +85,6 @@ export default defineConfig({
         replacement: path.resolve(__dirname, "../relay/src/index.ts"),
       },
       { find: "@", replacement: path.resolve(__dirname, "src") },
-      { find: "@server", replacement: path.resolve(__dirname, "../server/src") },
       // Point to the ESM build so Vite can transform its imports and apply the
       // react alias below (the CJS build uses require('react') which bypasses
       // Vite alias resolution).
@@ -60,7 +98,11 @@ export default defineConfig({
         replacement: resolvePackageEntry("react-dom"),
       },
       {
-        find: "@xterm/addon-ligatures",
+        find: /^@xterm\/addon-ligatures\/lib\/addon-ligatures\.mjs$/,
+        replacement: path.resolve(__dirname, "test-stubs/xterm-addon-ligatures.ts"),
+      },
+      {
+        find: /^@xterm\/addon-ligatures$/,
         replacement: path.resolve(__dirname, "test-stubs/xterm-addon-ligatures.ts"),
       },
     ],

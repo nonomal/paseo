@@ -6,8 +6,11 @@ import pino from "pino";
 
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
-import { ClaudeAgentClient } from "../agent/providers/claude-agent.js";
-import { getFullAccessConfig, isProviderAvailable } from "./agent-configs.js";
+import {
+  canRunRealProvider,
+  createRealProviderClients,
+  getRealProviderConfig,
+} from "./real-provider-test-config.js";
 import { createMessageCollector } from "../test-utils/message-collector.js";
 import type { AgentTimelineItem } from "../agent/agent-sdk-types.js";
 import type { SessionOutboundMessage } from "../messages.js";
@@ -171,7 +174,7 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
   let canRun = false;
 
   beforeAll(async () => {
-    canRun = await isProviderAvailable("claude");
+    canRun = await canRunRealProvider("claude");
   });
 
   beforeEach((context) => {
@@ -184,7 +187,7 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
     const logger = pino({ level: "silent" });
     const cwd = tmpCwd();
     const daemon = await createTestPaseoDaemon({
-      agentClients: { claude: new ClaudeAgentClient({ logger }) },
+      agentClients: createRealProviderClients(["claude"], logger),
       logger,
     });
 
@@ -197,7 +200,7 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
       const agent = await client.createAgent({
         cwd,
         title: "tool-interrupt-repro",
-        ...getFullAccessConfig("claude"),
+        ...getRealProviderConfig("claude"),
       });
 
       const collector = createMessageCollector(client);
@@ -241,7 +244,7 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
       const timeline = await client.fetchAgentTimeline(agent.id, { limit: 100 });
 
       if (finish.status !== "idle") {
-        const snapshot = await client.fetchAgent(agent.id);
+        const snapshot = await client.fetchAgent({ agentId: agent.id });
         throw new Error(
           `Expected idle after replacement, got ${finish.status}. postSendStatuses=${JSON.stringify(postSendStatuses)} statusesBeforeFirstAssistant=${JSON.stringify(statusesBeforeFirstAssistant)} postSendAssistantTexts=${JSON.stringify(postSendAssistantTexts)} turnStarted=${countTurnStarted(postSendMessages, agent.id)} agentStatus=${snapshot?.agent.status ?? null} recentTimeline=${JSON.stringify(summarizeTimelineItems(timeline))}`,
         );

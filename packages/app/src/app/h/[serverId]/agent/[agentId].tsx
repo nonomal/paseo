@@ -1,10 +1,11 @@
 import { useEffect, useRef } from "react";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { useLocalSearchParams, usePathname, useRouter, type Href } from "expo-router";
 import { HostRouteBootstrapBoundary } from "@/components/host-route-bootstrap-boundary";
 import { useSessionStore } from "@/stores/session-store";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { buildHostRootRoute } from "@/utils/host-routes";
-import { prepareWorkspaceTab } from "@/utils/workspace-navigation";
+import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
+import { navigateToAgent } from "@/utils/navigate-to-agent";
 
 export default function HostAgentReadyRoute() {
   return (
@@ -16,6 +17,7 @@ export default function HostAgentReadyRoute() {
 
 function HostAgentReadyRouteContent() {
   const router = useRouter();
+  const pathname = usePathname();
   const params = useLocalSearchParams<{
     serverId?: string;
     agentId?: string;
@@ -25,12 +27,16 @@ function HostAgentReadyRouteContent() {
   const agentId = typeof params.agentId === "string" ? params.agentId : "";
   const client = useHostRuntimeClient(serverId);
   const isConnected = useHostRuntimeIsConnected(serverId);
-  const agentCwd = useSessionStore((state) => {
+  const agentWorkspaceId = useSessionStore((state) => {
     if (!serverId || !agentId) {
       return null;
     }
-    return state.sessions[serverId]?.agents?.get(agentId)?.cwd ?? null;
+    return state.sessions[serverId]?.agents?.get(agentId)?.workspaceId ?? null;
   });
+  const hasHydratedWorkspaces = useSessionStore((state) =>
+    serverId ? (state.sessions[serverId]?.hasHydratedWorkspaces ?? false) : false,
+  );
+  const resolvedWorkspaceId = normalizeWorkspaceOpaqueId(agentWorkspaceId);
 
   useEffect(() => {
     if (redirectedRef.current) {
@@ -38,22 +44,19 @@ function HostAgentReadyRouteContent() {
     }
     if (!serverId || !agentId) {
       redirectedRef.current = true;
-      router.replace("/" as any);
+      router.replace("/" as Href);
       return;
     }
 
-    const normalizedCwd = agentCwd?.trim();
-    if (normalizedCwd) {
+    if (resolvedWorkspaceId) {
       redirectedRef.current = true;
-      router.replace(
-        prepareWorkspaceTab({
-          serverId,
-          workspaceId: normalizedCwd,
-          target: { kind: "agent", agentId },
-        }) as any,
-      );
+      navigateToAgent({
+        serverId,
+        agentId,
+        currentPathname: pathname,
+      });
     }
-  }, [agentCwd, agentId, router, serverId]);
+  }, [agentId, pathname, resolvedWorkspaceId, router, serverId]);
 
   useEffect(() => {
     if (redirectedRef.current) {
@@ -62,14 +65,14 @@ function HostAgentReadyRouteContent() {
     if (!serverId || !agentId) {
       return;
     }
-    if (agentCwd?.trim()) {
+    if (agentWorkspaceId && !hasHydratedWorkspaces) {
       return;
     }
     if (!client || !isConnected) {
       redirectedRef.current = true;
       router.replace(buildHostRootRoute(serverId));
     }
-  }, [agentCwd, agentId, client, isConnected, router, serverId]);
+  }, [agentWorkspaceId, agentId, client, hasHydratedWorkspaces, isConnected, router, serverId]);
 
   useEffect(() => {
     if (redirectedRef.current) {
@@ -81,24 +84,24 @@ function HostAgentReadyRouteContent() {
 
     let cancelled = false;
     void client
-      .fetchAgent(agentId)
+      .fetchAgent({ agentId })
       .then((result) => {
         if (cancelled || redirectedRef.current) {
           return;
         }
-        const cwd = result?.agent?.cwd?.trim();
+        const workspaceId = normalizeWorkspaceOpaqueId(result?.agent?.workspaceId);
         redirectedRef.current = true;
-        if (cwd) {
-          router.replace(
-            prepareWorkspaceTab({
-              serverId,
-              workspaceId: cwd,
-              target: { kind: "agent", agentId },
-            }) as any,
-          );
+        if (workspaceId) {
+          navigateToAgent({
+            serverId,
+            agentId,
+            workspaceId,
+            currentPathname: pathname,
+          });
           return;
         }
         router.replace(buildHostRootRoute(serverId));
+        return;
       })
       .catch(() => {
         if (cancelled || redirectedRef.current) {
@@ -111,7 +114,7 @@ function HostAgentReadyRouteContent() {
     return () => {
       cancelled = true;
     };
-  }, [agentId, client, isConnected, router, serverId]);
+  }, [agentId, client, isConnected, pathname, router, serverId]);
 
   return null;
 }

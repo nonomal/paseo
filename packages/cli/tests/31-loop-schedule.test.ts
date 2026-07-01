@@ -8,6 +8,26 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitForLoopInList(
+  ctx: Awaited<ReturnType<typeof createE2ETestContext>>,
+  id: string,
+) {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const listed = await ctx.paseo(["loop", "ls", "--json"]);
+    assert.strictEqual(listed.exitCode, 0, listed.stderr);
+    const listedJson = JSON.parse(listed.stdout);
+    assert(Array.isArray(listedJson), listed.stdout);
+    if (listedJson.some((item: { id: string }) => item.id === id)) {
+      return listedJson;
+    }
+    await sleep(250);
+  }
+
+  const listed = await ctx.paseo(["loop", "ls", "--json"]);
+  assert.strictEqual(listed.exitCode, 0, listed.stderr);
+  return JSON.parse(listed.stdout);
+}
+
 console.log("=== Loop And Schedule Command Tests ===\n");
 
 const ctx = await createE2ETestContext({ timeout: 30000 });
@@ -16,7 +36,18 @@ try {
   {
     console.log("Test 1: schedule create/ls/inspect/pause/resume/delete work");
     const created = await ctx.paseo(
-      ["schedule", "create", "Review new PRs", "--every", "5m", "--name", "review-prs", "--json"],
+      [
+        "schedule",
+        "create",
+        "Review new PRs",
+        "--every",
+        "5m",
+        "--name",
+        "review-prs",
+        "--provider",
+        "claude",
+        "--json",
+      ],
       { timeout: 30000 },
     );
     assert.strictEqual(created.exitCode, 0, created.stderr);
@@ -107,7 +138,7 @@ try {
     assert.notStrictEqual(result.exitCode, 0, "should fail for self target with provider");
     const output = result.stdout + result.stderr;
     assert(
-      output.includes("--provider can only be used with a new-agent target"),
+      output.includes("can only be used with a new-agent target"),
       "should explain provider target mismatch",
     );
     console.log("schedule rejects provider with self target\n");
@@ -132,27 +163,26 @@ try {
     const runJson = JSON.parse(run.stdout);
     assert.strictEqual(runJson.name, "smoke-loop");
 
-    const listed = await ctx.paseo(["loop", "ls", "--json"]);
-    assert.strictEqual(listed.exitCode, 0, listed.stderr);
-    const listedJson = JSON.parse(listed.stdout);
-    assert(Array.isArray(listedJson), listed.stdout);
+    const listedJson = await waitForLoopInList(ctx, runJson.id);
     assert(
       listedJson.some((item: { id: string }) => item.id === runJson.id),
-      listed.stdout,
+      JSON.stringify(listedJson),
     );
 
-    let status = "running";
-    for (let attempt = 0; attempt < 40; attempt += 1) {
+    async function pollStatus(attempt: number): Promise<string> {
+      if (attempt >= 40) return "running";
       const inspect = await ctx.paseo(["loop", "inspect", runJson.id, "--json"]);
       assert.strictEqual(inspect.exitCode, 0, inspect.stderr);
       const inspectJson = JSON.parse(inspect.stdout);
-      status = inspectJson.status;
-      if (status !== "running") {
-        assert.strictEqual(status, "succeeded", inspect.stdout);
-        break;
+      const current = inspectJson.status;
+      if (current !== "running") {
+        assert.strictEqual(current, "succeeded", inspect.stdout);
+        return current;
       }
       await sleep(250);
+      return pollStatus(attempt + 1);
     }
+    const status = await pollStatus(0);
     assert.strictEqual(status, "succeeded");
 
     const logs = await ctx.paseo(["loop", "logs", runJson.id], { timeout: 15000 });

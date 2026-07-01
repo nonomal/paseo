@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type pino from "pino";
 import { z } from "zod";
+import { writeJsonFileAtomic } from "../atomic-file.js";
 import {
   ChatMessageSchema,
   ChatRoomDetailSchema,
@@ -10,7 +11,7 @@ import {
   type ChatMessage,
   type ChatRoom,
   type ChatRoomDetail,
-} from "./chat-types.js";
+} from "@getpaseo/protocol/chat/types";
 
 const ChatStorePayloadSchema = z.object({
   rooms: z.array(ChatRoomSchema),
@@ -54,13 +55,13 @@ export class ChatServiceError extends Error {
   }
 }
 
-type Waiter = {
+interface Waiter {
   roomId: string;
   afterMessageId: string | null;
   resolve: (messages: ChatMessage[]) => void;
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout> | null;
-};
+}
 
 export interface CreateChatRoomInput {
   name: string;
@@ -87,6 +88,10 @@ export interface ReadChatMessagesInput {
   limit?: number;
   since?: string;
   authorAgentId?: string;
+}
+
+export interface ListChatRoomPosterAgentIdsInput {
+  room: string;
 }
 
 export interface WaitForChatMessagesInput {
@@ -176,7 +181,7 @@ export class FileBackedChatService {
     return { room: detail };
   }
 
-  async postMessage(input: PostChatMessageInput): Promise<ChatMessage> {
+  async dispatchMessage(input: PostChatMessageInput): Promise<ChatMessage> {
     await this.load();
     const room = this.resolveRoom(input.room);
     const body = input.body.trim();
@@ -247,6 +252,16 @@ export class FileBackedChatService {
       return filtered;
     }
     return filtered.slice(filtered.length - limit);
+  }
+
+  async listRoomPosterAgentIds(input: ListChatRoomPosterAgentIdsInput): Promise<string[]> {
+    await this.load();
+    const room = this.resolveRoom(input.room);
+    const posters = new Set<string>();
+    for (const message of this.getRoomMessages(room.id)) {
+      posters.add(message.authorAgentId);
+    }
+    return Array.from(posters);
   }
 
   async waitForMessages(input: WaitForChatMessagesInput): Promise<ChatMessage[]> {
@@ -350,10 +365,7 @@ export class FileBackedChatService {
         .flat()
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
     };
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    const tempPath = `${this.filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
-    await fs.writeFile(tempPath, JSON.stringify(payload, null, 2), "utf8");
-    await fs.rename(tempPath, this.filePath);
+    await writeJsonFileAtomic(this.filePath, payload);
   }
 
   private findRoomByName(name: string): ChatRoom | null {
@@ -418,7 +430,7 @@ export class FileBackedChatService {
       return;
     }
 
-    for (const waiter of [...waiters]) {
+    for (const waiter of Array.from(waiters)) {
       const messages =
         waiter.afterMessageId === null
           ? this.getRoomMessages(roomId).slice(-1)
@@ -446,7 +458,7 @@ export class FileBackedChatService {
     if (!waiters) {
       return;
     }
-    for (const waiter of [...waiters]) {
+    for (const waiter of Array.from(waiters)) {
       waiter.reject(error);
     }
   }

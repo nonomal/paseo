@@ -1,6 +1,6 @@
-import React, { useMemo, useRef } from "react";
+import React, { useContext, useEffect, useMemo, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
-import Markdown, { MarkdownIt } from "react-native-markdown-display";
+import type { FileReadResult } from "@getpaseo/client/internal/daemon-client";
 import {
   ActivityIndicator,
   Image as RNImage,
@@ -9,29 +9,35 @@ import {
   View,
 } from "react-native";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { useTranslation } from "react-i18next";
+import { MarkdownRenderer } from "@/components/markdown/renderer";
 import { useIsCompactFormFactor } from "@/constants/layout";
-import { Fonts } from "@/constants/theme";
 import { useSessionStore, type ExplorerFile } from "@/stores/session-store";
 import { useWebScrollViewScrollbar } from "@/components/use-web-scrollbar";
 import { useWebScrollbarStyle } from "@/hooks/use-web-scrollbar-style";
-import {
-  highlightCode,
-  darkHighlightColors,
-  lightHighlightColors,
-  type HighlightToken,
-  type HighlightStyle,
-} from "@getpaseo/highlight";
+import { highlightCode, type HighlightToken } from "@getpaseo/highlight";
+import { syntaxTokenStyleFor } from "@/styles/syntax-token-styles";
+import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import { lineNumberGutterWidth } from "@/components/code-insets";
+import { CODE_SURFACE_DATASET } from "@/styles/code-surface";
 import { isRenderedMarkdownFile } from "@/components/file-pane-render-mode";
 import { isWeb } from "@/constants/platform";
-import { createMarkdownStyles } from "@/styles/markdown-styles";
+import type { AttachmentMetadata } from "@/attachments/types";
+import { useAttachmentPreviewUrl } from "@/attachments/use-attachment-preview-url";
+import { persistAttachmentFromBytes } from "@/attachments/service";
+import { createPreviewAttachmentId, getFileNameFromPath } from "@/attachments/utils";
+import { explorerFileFromReadResult } from "@/file-explorer/read-result";
+import { resolveFilePreviewReadTarget } from "@/file-explorer/preview-target";
+import type { WorkspaceFileLocation } from "@/workspace/file-open";
+import { MountedTabActiveContext } from "@/components/split-container";
+import { useAppVisible } from "@/hooks/use-app-visible";
+import { isFileQueryEnabled } from "@/components/file-pane-enabled";
 
 interface CodeLineProps {
   tokens: HighlightToken[];
   lineNumber: number;
   gutterWidth: number;
-  colorMap: Record<HighlightStyle, string>;
-  baseColor: string;
+  highlighted: boolean;
 }
 
 interface FilePreviewBodyProps {
@@ -39,7 +45,8 @@ interface FilePreviewBodyProps {
   isLoading: boolean;
   showDesktopWebScrollbar: boolean;
   isMobile: boolean;
-  filePath: string;
+  location: WorkspaceFileLocation;
+  imagePreviewUri: string | null;
 }
 
 function trimNonEmpty(value: string | null | undefined): string | null {
@@ -48,6 +55,11 @@ function trimNonEmpty(value: string | null | undefined): string | null {
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+interface FileLineSelection {
+  lineStart: number;
+  lineEnd: number;
 }
 
 function formatFileSize({ size }: { size: number }): string {
@@ -60,35 +72,101 @@ function formatFileSize({ size }: { size: number }): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+async function createFilePanePreview(file: FileReadResult | null): Promise<{
+  file: ExplorerFile | null;
+  imageAttachment: AttachmentMetadata | null;
+}> {
+  if (!file) {
+    return { file: null, imageAttachment: null };
+  }
+
+  const explorerFile = explorerFileFromReadResult(file);
+  if (file.kind !== "image") {
+    return { file: explorerFile, imageAttachment: null };
+  }
+
+  const imageAttachment = await persistAttachmentFromBytes({
+    id: createPreviewAttachmentId({
+      mimeType: file.mime,
+      path: file.path,
+      size: file.size,
+      modifiedAt: file.modifiedAt,
+      contentLength: file.bytes.byteLength,
+    }),
+    bytes: file.bytes,
+    mimeType: file.mime,
+    fileName: getFileNameFromPath(file.path),
+  });
+
+  return {
+    file: explorerFile,
+    imageAttachment,
+  };
+}
+
+function clampLineSelection(input: {
+  lineStart?: number;
+  lineEnd?: number;
+  lineCount: number;
+}): FileLineSelection | null {
+  if (!input.lineStart || input.lineStart <= 0 || input.lineCount <= 0) {
+    return null;
+  }
+  const lineStart = Math.min(Math.floor(input.lineStart), input.lineCount);
+  const rawLineEnd =
+    input.lineEnd && input.lineEnd >= input.lineStart ? input.lineEnd : input.lineStart;
+  const lineEnd = Math.min(Math.floor(rawLineEnd), input.lineCount);
+  return { lineStart, lineEnd: Math.max(lineStart, lineEnd) };
+}
+
 const CodeLine = React.memo(function CodeLine({
   tokens,
   lineNumber,
   gutterWidth,
-  colorMap,
-  baseColor,
+  highlighted,
 }: CodeLineProps) {
+  const gutterStyle = useMemo(
+    () => [codeLineStyles.gutter, inlineUnistylesStyle({ width: gutterWidth })],
+    [gutterWidth],
+  );
+  const lineStyle = useMemo(
+    () => [codeLineStyles.line, highlighted && codeLineStyles.highlightedLine],
+    [highlighted],
+  );
+  const keyedTokens = useMemo(
+    () => tokens.map((token, index) => ({ key: `${index}-${token.text}`, token })),
+    [tokens],
+  );
   return (
-    <View style={codeLineStyles.line}>
-      <View style={[codeLineStyles.gutter, { width: gutterWidth }]}>
-        <Text style={[codeLineStyles.gutterText, { color: baseColor }]}>{String(lineNumber)}</Text>
+    <View style={lineStyle}>
+      <View style={gutterStyle}>
+        <Text numberOfLines={1} style={codeLineStyles.gutterText}>
+          {String(lineNumber)}
+        </Text>
       </View>
       <Text selectable style={codeLineStyles.lineText}>
-        {tokens.map((token, index) => (
-          <Text
-            key={index}
-            style={{ color: token.style ? (colorMap[token.style] ?? baseColor) : baseColor }}
-          >
-            {token.text}
-          </Text>
+        {keyedTokens.map(({ key, token }) => (
+          <CodeLineToken key={key} token={token} />
         ))}
       </Text>
     </View>
   );
 });
 
+interface CodeLineTokenProps {
+  token: HighlightToken;
+}
+
+function CodeLineToken({ token }: CodeLineTokenProps) {
+  return <Text style={syntaxTokenStyleFor(token.style)}>{token.text}</Text>;
+}
+
 const codeLineStyles = StyleSheet.create((theme) => ({
   line: {
     flexDirection: "row",
+  },
+  highlightedLine: {
+    backgroundColor: theme.colors.accentBorder,
   },
   gutter: {
     alignItems: "flex-end",
@@ -96,16 +174,17 @@ const codeLineStyles = StyleSheet.create((theme) => ({
     flexShrink: 0,
   },
   gutterText: {
-    fontFamily: Fonts.mono,
-    fontSize: theme.fontSize.sm,
-    lineHeight: theme.fontSize.sm * 1.45,
+    color: theme.colors.foreground,
+    fontFamily: theme.fontFamily.mono,
+    fontSize: theme.fontSize.code,
+    lineHeight: theme.fontSize.code * 1.45,
     opacity: 0.4,
     userSelect: "none",
   },
   lineText: {
-    fontFamily: Fonts.mono,
-    fontSize: theme.fontSize.sm,
-    lineHeight: theme.fontSize.sm * 1.45,
+    fontFamily: theme.fontFamily.mono,
+    fontSize: theme.fontSize.code,
+    lineHeight: theme.fontSize.code * 1.45,
     flex: 1,
   },
 }));
@@ -115,15 +194,14 @@ function FilePreviewBody({
   isLoading,
   showDesktopWebScrollbar,
   isMobile,
-  filePath,
+  location,
+  imagePreviewUri,
 }: FilePreviewBodyProps) {
   const { theme } = useUnistyles();
-  const isDark = theme.colorScheme === "dark";
-  const colorMap = isDark ? darkHighlightColors : lightHighlightColors;
-  const baseColor = isDark ? "#c9d1d9" : "#24292f";
-  const markdownStyles = useMemo(() => createMarkdownStyles(theme), [theme]);
-  const markdownParser = useMemo(() => MarkdownIt({ typographer: true, linkify: true }), []);
-  const isMarkdownFile = preview?.kind === "text" && isRenderedMarkdownFile(filePath);
+  const { t } = useTranslation();
+  const filePath = location.path;
+  const isMarkdownFile =
+    preview?.kind === "text" && isRenderedMarkdownFile(filePath) && !location.lineStart;
 
   const previewScrollRef = useRef<RNScrollView>(null);
   const webScrollbarStyle = useWebScrollbarStyle();
@@ -137,18 +215,47 @@ function FilePreviewBody({
     }
 
     return highlightCode(preview.content ?? "", filePath);
-  }, [isMarkdownFile, preview?.kind, preview?.content, filePath]);
+  }, [isMarkdownFile, preview, filePath]);
 
   const gutterWidth = useMemo(() => {
     if (!highlightedLines) return 0;
-    return lineNumberGutterWidth(highlightedLines.length);
-  }, [highlightedLines]);
+    return lineNumberGutterWidth(highlightedLines.length, theme.fontSize.code);
+  }, [highlightedLines, theme.fontSize.code]);
+  const lineHeight = theme.fontSize.code * 1.45;
+  const lineSelection = useMemo(() => {
+    if (!highlightedLines) {
+      return null;
+    }
+    return clampLineSelection({
+      lineStart: location.lineStart,
+      lineEnd: location.lineEnd,
+      lineCount: highlightedLines.length,
+    });
+  }, [highlightedLines, location.lineEnd, location.lineStart]);
+
+  const imageSource = useMemo(
+    () => (imagePreviewUri ? { uri: imagePreviewUri } : null),
+    [imagePreviewUri],
+  );
+
+  useEffect(() => {
+    if (!lineSelection) {
+      return;
+    }
+    const timeout = setTimeout(() => {
+      previewScrollRef.current?.scrollTo({
+        y: Math.max(0, (lineSelection.lineStart - 1) * lineHeight),
+        animated: false,
+      });
+    }, 0);
+    return () => clearTimeout(timeout);
+  }, [lineHeight, lineSelection]);
 
   if (isLoading && !preview) {
     return (
       <View style={styles.centerState}>
         <ActivityIndicator size="small" />
-        <Text style={styles.loadingText}>Loading file…</Text>
+        <Text style={styles.loadingText}>{t("panels.file.loading")}</Text>
       </View>
     );
   }
@@ -156,7 +263,7 @@ function FilePreviewBody({
   if (!preview) {
     return (
       <View style={styles.centerState}>
-        <Text style={styles.emptyText}>No preview available</Text>
+        <Text style={styles.emptyText}>{t("panels.file.noPreview")}</Text>
       </View>
     );
   }
@@ -175,9 +282,7 @@ function FilePreviewBody({
             scrollEventThrottle={16}
             showsVerticalScrollIndicator={!showDesktopWebScrollbar}
           >
-            <Markdown style={markdownStyles} markdownit={markdownParser}>
-              {preview.content ?? ""}
-            </Markdown>
+            <MarkdownRenderer text={preview.content ?? ""} />
           </RNScrollView>
           {scrollbar.overlay}
         </View>
@@ -185,16 +290,24 @@ function FilePreviewBody({
     }
 
     const lines = highlightedLines ?? [[{ text: preview.content ?? "", style: null }]];
+    const keyedLines = lines.map((tokens, index) => ({
+      key: `line-${index}`,
+      tokens,
+      lineNumber: index + 1,
+    }));
     const codeLines = (
-      <View>
-        {lines.map((tokens, index) => (
+      <View dataSet={CODE_SURFACE_DATASET}>
+        {keyedLines.map(({ key, tokens, lineNumber }) => (
           <CodeLine
-            key={index}
+            key={key}
             tokens={tokens}
-            lineNumber={index + 1}
+            lineNumber={lineNumber}
             gutterWidth={gutterWidth}
-            colorMap={colorMap}
-            baseColor={baseColor}
+            highlighted={
+              Boolean(lineSelection) &&
+              lineNumber >= (lineSelection?.lineStart ?? 0) &&
+              lineNumber <= (lineSelection?.lineEnd ?? 0)
+            }
           />
         ))}
       </View>
@@ -230,7 +343,16 @@ function FilePreviewBody({
     );
   }
 
-  if (preview.kind === "image" && preview.content) {
+  if (preview.kind === "image") {
+    if (!imagePreviewUri) {
+      return (
+        <View style={styles.centerState}>
+          <ActivityIndicator size="small" />
+          <Text style={styles.loadingText}>{t("panels.file.loading")}</Text>
+        </View>
+      );
+    }
+
     return (
       <View style={styles.previewScrollContainer}>
         <RNScrollView
@@ -244,9 +366,7 @@ function FilePreviewBody({
           showsVerticalScrollIndicator={!showDesktopWebScrollbar}
         >
           <RNImage
-            source={{
-              uri: `data:${preview.mimeType ?? "image/png"};base64,${preview.content}`,
-            }}
+            source={imageSource ?? undefined}
             style={styles.previewImage}
             resizeMode="contain"
           />
@@ -258,7 +378,7 @@ function FilePreviewBody({
 
   return (
     <View style={styles.centerState}>
-      <Text style={styles.emptyText}>Binary preview unavailable</Text>
+      <Text style={styles.emptyText}>{t("panels.file.binaryPreviewUnavailable")}</Text>
       <Text style={styles.binaryMetaText}>{formatFileSize({ size: preview.size })}</Text>
     </View>
   );
@@ -267,36 +387,70 @@ function FilePreviewBody({
 export function FilePane({
   serverId,
   workspaceRoot,
-  filePath,
+  location,
 }: {
   serverId: string;
   workspaceRoot: string;
-  filePath: string;
+  location: WorkspaceFileLocation;
 }) {
+  const { t } = useTranslation();
   const isMobile = useIsCompactFormFactor();
   const showDesktopWebScrollbar = isWeb && !isMobile;
 
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
   const normalizedWorkspaceRoot = useMemo(() => workspaceRoot.trim(), [workspaceRoot]);
-  const normalizedFilePath = useMemo(() => trimNonEmpty(filePath), [filePath]);
+  const normalizedFilePath = useMemo(() => trimNonEmpty(location.path), [location.path]);
+  const readTarget = useMemo(
+    () =>
+      normalizedFilePath
+        ? resolveFilePreviewReadTarget({
+            path: normalizedFilePath,
+            workspaceRoot: normalizedWorkspaceRoot,
+          })
+        : null,
+    [normalizedFilePath, normalizedWorkspaceRoot],
+  );
+
+  // Re-read the file when this pane becomes visible again (#445). `isActive`
+  // covers tab switches, `isAppVisible` the whole-app background/foreground; the
+  // gate itself lives in isFileQueryEnabled.
+  const isActive = useContext(MountedTabActiveContext);
+  const isAppVisible = useAppVisible();
 
   const query = useQuery({
-    queryKey: ["workspaceFile", serverId, normalizedWorkspaceRoot, normalizedFilePath],
-    enabled: Boolean(client && normalizedWorkspaceRoot && normalizedFilePath),
+    queryKey: ["workspaceFile", serverId, readTarget?.cwd ?? null, readTarget?.path ?? null],
+    enabled: isFileQueryEnabled({
+      hasReadTarget: Boolean(client && readTarget),
+      isTabActive: isActive,
+      isAppVisible,
+    }),
     queryFn: async () => {
-      if (!client || !normalizedWorkspaceRoot || !normalizedFilePath) {
-        return { file: null as ExplorerFile | null, error: "Host is not connected" };
+      if (!client || !readTarget) {
+        return {
+          file: null as ExplorerFile | null,
+          error: t("workspace.terminal.hostDisconnected"),
+        };
       }
-      const payload = await client.exploreFileSystem(
-        normalizedWorkspaceRoot,
-        normalizedFilePath,
-        "file",
-      );
-      return { file: payload.file ?? null, error: payload.error ?? null };
+      try {
+        const file = await client.readFile(readTarget.cwd, readTarget.path);
+        const preview = await createFilePanePreview(file);
+        return {
+          file: preview.file,
+          imageAttachment: preview.imageAttachment,
+          error: null,
+        };
+      } catch (error) {
+        return {
+          file: null,
+          imageAttachment: null,
+          error: error instanceof Error ? error.message : t("panels.file.failedToLoad"),
+        };
+      }
     },
     staleTime: 5_000,
     refetchOnMount: true,
   });
+  const imagePreviewUri = useAttachmentPreviewUrl(query.data?.imageAttachment ?? null);
 
   return (
     <View style={styles.container} testID="workspace-file-pane">
@@ -311,7 +465,8 @@ export function FilePane({
         isLoading={query.isFetching}
         showDesktopWebScrollbar={showDesktopWebScrollbar}
         isMobile={isMobile}
-        filePath={filePath}
+        location={location}
+        imagePreviewUri={imagePreviewUri}
       />
     </View>
   );

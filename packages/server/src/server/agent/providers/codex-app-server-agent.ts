@@ -1,78 +1,196 @@
-import type {
-  AgentPermissionAction,
-  AgentCapabilityFlags,
-  AgentClient,
-  AgentFeature,
-  AgentLaunchContext,
-  AgentMode,
-  AgentModelDefinition,
-  McpServerConfig,
-  AgentPermissionRequest,
-  AgentPermissionResponse,
-  AgentPermissionResult,
-  AgentPromptContentBlock,
-  AgentPromptInput,
-  AgentRunOptions,
-  AgentRunResult,
-  AgentRuntimeInfo,
-  AgentSession,
-  AgentSessionConfig,
-  AgentSlashCommand,
-  AgentStreamEvent,
-  AgentTimelineItem,
-  ToolCallTimelineItem,
-  AgentUsage,
-  ListModelsOptions,
-  ListPersistedAgentsOptions,
-  PersistedAgentDescriptor,
+import {
+  getAgentStreamEventTurnId,
+  type AgentPermissionAction,
+  type AgentCapabilityFlags,
+  type AgentClient,
+  type AgentCreateSessionOptions,
+  type AgentFeature,
+  type AgentLaunchContext,
+  type AgentMode,
+  type AgentModelDefinition,
+  type McpServerConfig,
+  type AgentPersistenceHandle,
+  type AgentPermissionRequest,
+  type AgentPermissionResponse,
+  type AgentPermissionResult,
+  type AgentProviderNotice,
+  type AgentPromptContentBlock,
+  type AgentPromptInput,
+  type AgentRunOptions,
+  type AgentRunResult,
+  type AgentRuntimeInfo,
+  type AgentSession,
+  type AgentSessionConfig,
+  type AgentSlashCommand,
+  type AgentStreamEvent,
+  type AgentTimelineItem,
+  type ToolCallTimelineItem,
+  type AgentUsage,
+  type FetchCatalogOptions,
+  type ImportableProviderSession,
+  type ImportProviderSessionContext,
+  type ImportProviderSessionInput,
+  type ListImportableSessionsOptions,
+  type ProviderCatalog,
 } from "../agent-sdk-types.js";
+import { importSessionFromPersistence } from "../provider-session-import.js";
 import type { Logger } from "pino";
 
-import { execSync } from "node:child_process";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import readline from "node:readline";
 import { z } from "zod";
-import { loadCodexPersistedTimeline } from "./codex-rollout-timeline.js";
+import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
+import { composeSystemPromptParts } from "../system-prompt.js";
+import { curateAgentActivity } from "../activity-curator.js";
 import {
-  mapCodexRolloutToolCall,
+  mapCodexToolCallEnvelope,
   mapCodexToolCallFromThreadItem,
 } from "./codex/tool-call-mapper.js";
 import {
-  applyProviderEnv,
-  resolveProviderCommandPrefix,
+  checkProviderLaunchAvailable,
+  createProviderEnv,
+  createProviderEnvSpec,
+  resolveProviderLaunch,
   type ProviderRuntimeSettings,
+  type ResolvedProviderLaunch,
 } from "../provider-launch-config.js";
-import { findExecutable, isCommandAvailable } from "../../../utils/executable.js";
+import {
+  findExecutable,
+  probeExecutable,
+} from "../../../executable-resolution/executable-resolution.js";
+import { createPathEquivalenceMatcher } from "../../../utils/path.js";
 import { spawnProcess } from "../../../utils/spawn.js";
 import { extractCodexTerminalSessionId, nonEmptyString } from "./tool-call-mapper-utils.js";
 import { buildCodexFeatures, codexModelSupportsFastMode } from "./codex-feature-definitions.js";
 import {
-  formatDiagnosticStatus,
+  CodexAppServerClient,
+  parseCodexThreadForkResponse,
+  parseCodexThreadRollbackResponse,
+  type CodexThreadForkParams,
+  type CodexThreadForkResponse,
+  type CodexThreadRollbackParams,
+  type CodexThreadRollbackResponse,
+  type CodexAppServerTraceContext,
+} from "./codex/app-server-transport.js";
+import { type CodexUserMessageTurnIndex, revertCodexConversation } from "./codex/rewind.js";
+import {
+  materializeProviderImage,
+  renderProviderImageOutputAsAssistantMarkdown,
+  type ProviderImageOutput,
+} from "./provider-image-output.js";
+import { normalizeProviderReplayTimestamp } from "../provider-history-timestamps.js";
+import {
   formatProviderDiagnostic,
   formatProviderDiagnosticError,
+  buildBinaryDiagnosticRows,
+  buildCommandResolutionDiagnosticRows,
   resolveBinaryVersion,
-  toDiagnosticErrorMessage,
 } from "./diagnostic-utils.js";
+import { runProviderTurn } from "./provider-runner.js";
+import { SETTING_APPLIES_NEXT_TURN_NOTICE } from "../provider-notices.js";
+import type { WorkspaceGitService } from "../../workspace-git-service.js";
 
-const DEFAULT_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
+function assertChildWithPipes(
+  child: ChildProcess,
+): asserts child is ChildProcessWithoutNullStreams {
+  if (!child.stdin || !child.stdout || !child.stderr) {
+    throw new Error("Child process did not expose stdio pipes");
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isCodexAlreadyUnarchivedError(error: unknown, threadId: string): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes(`no archived rollout found for thread id ${threadId}`);
+}
+
 const TURN_START_TIMEOUT_MS = 90 * 1000;
+const INTERRUPT_TIMEOUT_MS = 2_000;
 const CODEX_PROVIDER = "codex" as const;
-const CODEX_IMAGE_ATTACHMENT_DIR = "paseo-attachments";
+// Codex treats most app-server client names as the model-request originator.
+// This reserved Codex name is non-originating, so requests keep Codex's default
+// CLI identity instead of showing up as Paseo in provider usage logs.
+const CODEX_NON_ORIGINATING_APP_SERVER_CLIENT_INFO = {
+  name: "codex_app_server_daemon",
+  title: "Codex App Server Daemon",
+  version: "0.0.0",
+} as const;
+const ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN = "\n\n---\n\n";
+const CODEX_TOOL_THREAD_ITEM_TYPES = new Set([
+  "commandExecution",
+  "fileChange",
+  "mcpToolCall",
+  "webSearch",
+  "collabAgentToolCall",
+]);
+const CODEX_CONTEXT_COMPACTION_TYPE = "contextCompaction";
 const CODEX_PLAN_IMPLEMENTATION_PROMPT_PREFIX =
   "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.";
+
+// Codex's experimental `goals` feature ships in 0.128.0+. Older binaries reject
+// `--enable goals` at launch, so we gate by version and silently skip the flag
+// (and the /goal slash command) when the binary is too old.
+const CODEX_GOALS_MIN_VERSION: readonly [number, number, number] = [0, 128, 0];
+const CODEX_AUTO_REVIEW_MIN_VERSION: readonly [number, number, number] = [0, 115, 0];
+
+function parseCodexVersion(versionOutput: string): [number, number, number] | null {
+  const match = versionOutput.match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function codexVersionAtLeast(
+  versionOutput: string,
+  min: readonly [number, number, number],
+): boolean {
+  const parsed = parseCodexVersion(versionOutput);
+  if (!parsed) return false;
+  for (let i = 0; i < 3; i += 1) {
+    if (parsed[i] > min[i]) return true;
+    if (parsed[i] < min[i]) return false;
+  }
+  return true;
+}
+
+type GoalSubcommand =
+  | { kind: "set"; objective: string }
+  | { kind: "pause" }
+  | { kind: "resume" }
+  | { kind: "clear" }
+  | { kind: "usage" };
+
+function parseGoalSubcommand(args: string | undefined): GoalSubcommand {
+  const trimmed = (args ?? "").trim();
+  if (!trimmed) return { kind: "usage" };
+  const lower = trimmed.toLowerCase();
+  if (lower === "pause") return { kind: "pause" };
+  if (lower === "resume") return { kind: "resume" };
+  if (lower === "clear") return { kind: "clear" };
+  return { kind: "set", objective: trimmed };
+}
+
+function formatOutOfBandStatusMessage(text: string): string {
+  return `${text.replace(/\n+$/u, "")}\n\n`;
+}
 
 const CODEX_APP_SERVER_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: true,
   supportsSessionPersistence: true,
+  supportsSessionListing: true,
   supportsDynamicModes: false,
   supportsMcpServers: true,
   supportsReasoningStream: true,
   supportsToolInvocations: true,
+  supportsRewindConversation: true,
+  supportsRewindFiles: false,
+  supportsRewindBoth: false,
 };
 
 const CODEX_MODES: AgentMode[] = [
@@ -80,6 +198,12 @@ const CODEX_MODES: AgentMode[] = [
     id: "auto",
     label: "Default Permissions",
     description: "Edit files and run commands with Codex's default approval flow.",
+  },
+  {
+    id: "auto-review",
+    label: "Auto-review",
+    description:
+      "Same workspace-write permissions as Default, but eligible `on-request` approvals are routed through the auto-reviewer subagent.",
   },
   {
     id: "full-access",
@@ -90,10 +214,37 @@ const CODEX_MODES: AgentMode[] = [
 
 const DEFAULT_CODEX_MODE_ID = "auto";
 
-const MODE_PRESETS: Record<
-  string,
-  { approvalPolicy: string; sandbox: string; networkAccess?: boolean }
-> = {
+interface CodexAppServerClientLike {
+  request(method: string, params?: unknown): Promise<unknown>;
+  forkThread?(params: CodexThreadForkParams): Promise<CodexThreadForkResponse>;
+  rollbackThread?(params: CodexThreadRollbackParams): Promise<CodexThreadRollbackResponse>;
+  notify(method: string, params?: unknown): void;
+  dispose(): Promise<void>;
+}
+
+interface CodexAppServerAgentDeps {
+  workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
+  customProvider?: {
+    id: string;
+    label: string;
+    extends: string;
+  };
+  customCodexConfig?: Record<string, unknown> | null;
+  _createCodexClient?: (
+    child: ChildProcessWithoutNullStreams,
+    logger: Logger,
+    getTraceContext: () => CodexAppServerTraceContext,
+  ) => CodexAppServerClientLike;
+}
+
+interface CodexModePreset {
+  approvalPolicy: string;
+  sandbox: string;
+  networkAccess?: boolean;
+  approvalsReviewer?: "auto_review";
+}
+
+const MODE_PRESETS: Record<string, CodexModePreset> = {
   "read-only": {
     approvalPolicy: "on-request",
     sandbox: "read-only",
@@ -102,12 +253,42 @@ const MODE_PRESETS: Record<
     approvalPolicy: "on-request",
     sandbox: "workspace-write",
   },
+  "auto-review": {
+    approvalPolicy: "on-request",
+    sandbox: "workspace-write",
+    approvalsReviewer: "auto_review",
+  },
   "full-access": {
     approvalPolicy: "never",
     sandbox: "danger-full-access",
     networkAccess: true,
   },
 };
+
+function isAutoReviewReviewer(value: string | undefined): boolean {
+  return value === "auto_review" || value === "guardian_subagent";
+}
+
+function applyApprovalsReviewerParam(
+  params: Record<string, unknown>,
+  preset: CodexModePreset,
+): void {
+  if (preset.approvalsReviewer) {
+    params.approvalsReviewer = preset.approvalsReviewer;
+  }
+}
+
+function shouldPromoteThreadResponseToAutoReview(params: {
+  approvalsReviewer: string | undefined;
+  approvalPolicy: string;
+  sandbox: string;
+}): boolean {
+  return (
+    isAutoReviewReviewer(params.approvalsReviewer) &&
+    params.approvalPolicy === "on-request" &&
+    params.sandbox === "workspace-write"
+  );
+}
 
 function validateCodexMode(modeId: string): void {
   if (!(modeId in MODE_PRESETS)) {
@@ -157,9 +338,11 @@ function isObjectSchemaNode(schema: Record<string, unknown>): boolean {
   );
 }
 
-function normalizeCodexOutputSchemaNode(schema: unknown, path: string): unknown {
+function normalizeCodexOutputSchemaNode(schema: unknown, schemaPath: string): unknown {
   if (Array.isArray(schema)) {
-    return schema.map((entry, index) => normalizeCodexOutputSchemaNode(entry, `${path}[${index}]`));
+    return schema.map((entry, index) =>
+      normalizeCodexOutputSchemaNode(entry, `${schemaPath}[${index}]`),
+    );
   }
   if (!isSchemaRecord(schema)) {
     return schema;
@@ -167,7 +350,7 @@ function normalizeCodexOutputSchemaNode(schema: unknown, path: string): unknown 
 
   const normalized: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(schema)) {
-    normalized[key] = normalizeCodexOutputSchemaNode(value, `${path}.${key}`);
+    normalized[key] = normalizeCodexOutputSchemaNode(value, `${schemaPath}.${key}`);
   }
 
   if (!isObjectSchemaNode(normalized)) {
@@ -178,7 +361,7 @@ function normalizeCodexOutputSchemaNode(schema: unknown, path: string): unknown 
     normalized.additionalProperties = false;
   } else if (normalized.additionalProperties !== false) {
     throw new Error(
-      `Codex structured outputs require ${path} to set additionalProperties to false for object schemas.`,
+      `Codex structured outputs require ${schemaPath} to set additionalProperties to false for object schemas.`,
     );
   }
 
@@ -195,7 +378,7 @@ function normalizeCodexOutputSchemaNode(schema: unknown, path: string): unknown 
   return normalized;
 }
 
-function normalizeCodexOutputSchema(schema: unknown): Record<string, unknown> {
+export function normalizeCodexOutputSchema(schema: unknown): Record<string, unknown> {
   if (!isSchemaRecord(schema)) {
     throw new Error("Codex structured outputs require a JSON object schema.");
   }
@@ -208,10 +391,15 @@ function normalizeCodexOutputSchema(schema: unknown): Record<string, unknown> {
   return normalized;
 }
 
-type CodexConfiguredDefaults = {
+interface CodexConfiguredDefaults {
   model?: string;
   thinkingOptionId?: string;
-};
+}
+
+interface PersistedTimelineEntry {
+  item: AgentTimelineItem;
+  timestamp?: string;
+}
 
 function mergeCodexConfiguredDefaults(
   primary: CodexConfiguredDefaults,
@@ -223,25 +411,122 @@ function mergeCodexConfiguredDefaults(
   };
 }
 
-async function resolveCodexBinary(): Promise<string> {
-  const found = await findExecutable("codex");
-  if (found) {
-    return found;
+function codexMicrosoftStorePackageRoot(): string | null {
+  const localAppData = process.env.LOCALAPPDATA;
+  if (!localAppData) {
+    return null;
   }
-  throw new Error(
-    "Codex binary not found. Install the Codex CLI (https://github.com/openai/codex) and ensure it is available in your shell PATH.",
-  );
+  return path.join(localAppData, "Packages");
+}
+
+export async function findCodexMicrosoftStoreBinary(): Promise<string | null> {
+  if (process.platform !== "win32") {
+    return null;
+  }
+
+  const packageRoot = codexMicrosoftStorePackageRoot();
+  if (!packageRoot) {
+    return null;
+  }
+
+  let entries: Dirent[];
+  try {
+    entries = await fs.readdir(packageRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  const codexPackages = entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("OpenAI.Codex_"))
+    .map((entry) => entry.name)
+    .sort();
+
+  for (const packageName of codexPackages) {
+    const candidate = path.join(
+      packageRoot,
+      packageName,
+      "LocalCache",
+      "Local",
+      "OpenAI",
+      "Codex",
+      "bin",
+      "codex.exe",
+    );
+    if (await probeExecutable(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+export async function findDefaultCodexBinary(): Promise<string | null> {
+  return (await findExecutable("codex")) ?? (await findCodexMicrosoftStoreBinary());
 }
 
 async function resolveCodexLaunchPrefix(runtimeSettings?: ProviderRuntimeSettings): Promise<{
   command: string;
   args: string[];
 }> {
-  return resolveProviderCommandPrefix(runtimeSettings?.command, resolveCodexBinary);
+  const launch = await resolveCodexLaunch(runtimeSettings);
+  const availability = await checkCodexLaunchAvailable(launch);
+  if (!availability.available) {
+    throw new Error(
+      "Codex binary not found. Install the Codex CLI (https://github.com/openai/codex) and ensure it is available in your shell PATH.",
+    );
+  }
+  return {
+    command:
+      launch.source === "override" ? launch.command : (availability.resolvedPath ?? launch.command),
+    args: launch.args,
+  };
+}
+
+async function resolveCodexLaunch(
+  runtimeSettings?: ProviderRuntimeSettings,
+): Promise<ResolvedProviderLaunch> {
+  return resolveProviderLaunch({
+    commandConfig: runtimeSettings?.command,
+    defaultBinary: {
+      command: "codex",
+      resolvePath: findDefaultCodexBinary,
+    },
+  });
+}
+
+async function checkCodexLaunchAvailable(launch: ResolvedProviderLaunch) {
+  return checkProviderLaunchAvailable(launch, {
+    command: "codex",
+    resolvePath: findDefaultCodexBinary,
+  });
 }
 
 function resolveCodexHomeDir(): string {
   return process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
+}
+
+function decodeEscapedChar(next: string): string {
+  if (next === "n") return "\n";
+  if (next === "t") return "\t";
+  return next;
+}
+
+function resolvePermissionDecision(
+  response: AgentPermissionResponse,
+): "accept" | "cancel" | "decline" {
+  if (response.behavior === "allow") return "accept";
+  if (response.interrupt) return "cancel";
+  return "decline";
+}
+
+function firstPositiveFiniteNumber(primary: unknown, secondary: unknown): number | undefined {
+  if (typeof primary === "number" && Number.isFinite(primary) && primary > 0) {
+    return primary;
+  }
+  if (typeof secondary === "number" && Number.isFinite(secondary) && secondary > 0) {
+    return secondary;
+  }
+  return undefined;
 }
 
 function tokenizeCommandArgs(args: string): string[] {
@@ -249,17 +534,17 @@ function tokenizeCommandArgs(args: string): string[] {
   let current = "";
   let quote: "'" | '"' | null = null;
   for (let i = 0; i < args.length; i += 1) {
-    const ch = args[i]!;
+    const ch = args[i];
     if (quote) {
       if (ch === quote) {
         quote = null;
         continue;
       }
       if (ch === "\\" && i + 1 < args.length) {
-        const next = args[i + 1]!;
+        const next = args[i + 1];
         if (next === quote || next === "\\" || next === "n" || next === "t") {
           i += 1;
-          current += next === "n" ? "\n" : next === "t" ? "\t" : next;
+          current += decodeEscapedChar(next);
           continue;
         }
       }
@@ -337,55 +622,47 @@ async function listCodexCustomPrompts(): Promise<AgentSlashCommand[]> {
     return [];
   }
 
-  const commands: AgentSlashCommand[] = [];
-  for (const entry of entries) {
-    if (!entry.isFile()) {
-      continue;
-    }
-    if (!entry.name.endsWith(".md")) {
-      continue;
-    }
-    const name = entry.name.slice(0, -".md".length);
-    if (!name) {
-      continue;
-    }
-    const fullPath = path.join(promptsDir, entry.name);
-    let content: string;
-    try {
-      content = await fs.readFile(fullPath, "utf8");
-    } catch {
-      continue;
-    }
-    const parsed = parseFrontMatter(content);
-    const description = parsed.frontMatter["description"] ?? "Custom prompt";
-    const argumentHint =
-      parsed.frontMatter["argument-hint"] ?? parsed.frontMatter["argument_hint"] ?? "";
-    commands.push({
-      name: `prompts:${name}`,
-      description,
-      argumentHint,
-    });
-  }
+  const mdEntries = entries.filter(
+    (entry) => entry.isFile() && entry.name.endsWith(".md") && entry.name.slice(0, -".md".length),
+  );
+  const parsedCommands = await Promise.all(
+    mdEntries.map(async (entry): Promise<AgentSlashCommand | null> => {
+      const name = entry.name.slice(0, -".md".length);
+      const fullPath = path.join(promptsDir, entry.name);
+      let content: string;
+      try {
+        content = await fs.readFile(fullPath, "utf8");
+      } catch {
+        return null;
+      }
+      const parsed = parseFrontMatter(content);
+      const description = parsed.frontMatter["description"] ?? "Custom prompt";
+      const argumentHint =
+        parsed.frontMatter["argument-hint"] ?? parsed.frontMatter["argument_hint"] ?? "";
+      return {
+        name: `prompts:${name}`,
+        description,
+        argumentHint,
+        kind: "command",
+      };
+    }),
+  );
+  const commands: AgentSlashCommand[] = parsedCommands.filter(
+    (cmd): cmd is AgentSlashCommand => cmd !== null,
+  );
   return commands.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-async function listCodexSkills(cwd: string): Promise<AgentSlashCommand[]> {
+export async function listCodexSkills(
+  cwd: string,
+  workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">,
+): Promise<AgentSlashCommand[]> {
   const candidates: string[] = [];
   candidates.push(path.join(cwd, ".codex", "skills"));
 
-  const repoRoot = (() => {
-    try {
-      const output = execSync("git rev-parse --show-toplevel", {
-        cwd,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      const trimmed = output.trim();
-      return trimmed ? trimmed : null;
-    } catch {
-      return null;
-    }
-  })();
+  const repoRoot = workspaceGitService
+    ? await workspaceGitService.resolveRepoRoot(cwd).catch(() => null)
+    : null;
   if (repoRoot) {
     candidates.push(path.join(path.dirname(cwd), ".codex", "skills"));
     candidates.push(path.join(repoRoot, ".codex", "skills"));
@@ -393,28 +670,33 @@ async function listCodexSkills(cwd: string): Promise<AgentSlashCommand[]> {
 
   candidates.push(path.join(resolveCodexHomeDir(), "skills"));
 
-  const commandsByName = new Map<string, AgentSlashCommand>();
-
-  for (const dir of candidates) {
-    let entries: Dirent[];
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    for (const entry of entries) {
-      if (!entry.isDirectory() && !entry.isSymbolicLink()) {
-        continue;
-      }
-      const skillDir = path.join(dir, entry.name);
-      const skillPath = path.join(skillDir, "SKILL.md");
-      let content: string;
+  const candidateReads = await Promise.all(
+    candidates.map(async (dir) => {
+      let entries: Dirent[];
       try {
-        content = await fs.readFile(skillPath, "utf8");
+        entries = await fs.readdir(dir, { withFileTypes: true });
       } catch {
-        continue;
+        return [] as string[];
       }
+      const dirEntries = entries.filter((entry) => entry.isDirectory() || entry.isSymbolicLink());
+      const skillContents = await Promise.all(
+        dirEntries.map(async (entry) => {
+          const skillDir = path.join(dir, entry.name);
+          const skillPath = path.join(skillDir, "SKILL.md");
+          try {
+            return await fs.readFile(skillPath, "utf8");
+          } catch {
+            return null;
+          }
+        }),
+      );
+      return skillContents.filter((content): content is string => content !== null);
+    }),
+  );
+
+  const commandsByName = new Map<string, AgentSlashCommand>();
+  for (const skillContents of candidateReads) {
+    for (const content of skillContents) {
       const { frontMatter } = parseFrontMatter(content);
       const name = frontMatter["name"];
       const description = frontMatter["description"];
@@ -426,6 +708,7 @@ async function listCodexSkills(cwd: string): Promise<AgentSlashCommand[]> {
           name,
           description,
           argumentHint: "",
+          kind: "skill",
         });
       }
     }
@@ -505,38 +788,23 @@ function toCodexMcpConfig(config: McpServerConfig): CodexMcpServerConfig {
         url: config.url,
         http_headers: config.headers,
       };
+    default: {
+      const _exhaustive = config as { type: never };
+      throw new Error(`Unsupported MCP config type: ${String(_exhaustive.type)}`);
+    }
   }
 }
-type JsonRpcRequest = {
-  id: number;
-  method: string;
-  params?: unknown;
-};
 
-type JsonRpcResponse = {
-  id: number;
-  result?: unknown;
-  error?: { code?: number; message: string };
-};
-
-type JsonRpcNotification = {
-  method: string;
-  params?: unknown;
-};
-
-type JsonRpcMessage = JsonRpcRequest | JsonRpcResponse | JsonRpcNotification;
-
-type PendingRequest = {
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-};
-
-type RequestHandler = (params: unknown) => Promise<unknown> | unknown;
-
-type NotificationHandler = (method: string, params: unknown) => void;
+function toObjectRecord(value: unknown): Record<string, unknown> | undefined {
+  return isRecord(value) ? value : undefined;
+}
 
 // Codex app-server API response types
+interface CodexReasoningEffortEntry {
+  reasoningEffort?: string;
+  description?: string;
+}
+
 interface CodexModel {
   id: string;
   displayName?: string;
@@ -544,238 +812,61 @@ interface CodexModel {
   isDefault?: boolean;
   model?: string;
   defaultReasoningEffort?: string;
-  supportedReasoningEfforts?: string[];
+  supportedReasoningEfforts?: CodexReasoningEffortEntry[];
 }
 
-interface CodexModelListResponse {
-  data?: CodexModel[];
+const CodexModelListResponseSchema = z.object({
+  data: z
+    .array(
+      z.object({
+        id: z.string(),
+        displayName: z.string().optional(),
+        description: z.string().optional(),
+        isDefault: z.boolean().optional(),
+        model: z.string().optional(),
+        defaultReasoningEffort: z.string().optional(),
+        supportedReasoningEfforts: z
+          .array(
+            z.object({
+              reasoningEffort: z.string().optional(),
+              description: z.string().optional(),
+            }),
+          )
+          .optional(),
+      }),
+    )
+    .optional(),
+});
+
+function filterCodexThreadsByCwd(
+  threads: Array<Record<string, unknown>>,
+  cwd: string | undefined,
+): Array<Record<string, unknown>> {
+  if (!cwd) {
+    return threads;
+  }
+  // thread/list rows carry an optional cwd. The descriptor builder later
+  // falls back to process.cwd() if the field is missing, so we only match
+  // here when the row genuinely carries a cwd string — otherwise threads
+  // with no cwd would falsely match the daemon's own cwd.
+  const matchesCwd = createPathEquivalenceMatcher(cwd);
+  return threads.filter((thread) => typeof thread.cwd === "string" && matchesCwd(thread.cwd));
 }
 
-interface CodexThreadStartResponse {
-  thread?: { id?: string };
-}
-
-class CodexAppServerClient {
-  private readonly rl: readline.Interface;
-  private readonly pending = new Map<number, PendingRequest>();
-  private readonly requestHandlers = new Map<string, RequestHandler>();
-  private notificationHandler: NotificationHandler | null = null;
-  private nextId = 1;
-  private disposed = false;
-  private stderrBuffer = "";
-  private readonly exitPromise: Promise<void>;
-  private resolveExitPromise: (() => void) | null = null;
-
-  constructor(
-    private readonly child: ChildProcessWithoutNullStreams,
-    private readonly logger: Logger,
-  ) {
-    this.rl = readline.createInterface({ input: child.stdout });
-    this.exitPromise = new Promise<void>((resolve) => {
-      this.resolveExitPromise = resolve;
-    });
-    this.rl.on("line", (line) => this.handleLine(line));
-
-    child.stderr.on("data", (chunk) => {
-      this.stderrBuffer += chunk.toString();
-      if (this.stderrBuffer.length > 8192) {
-        this.stderrBuffer = this.stderrBuffer.slice(-8192);
-      }
-    });
-
-    child.on("error", (err) => {
-      this.logger.error({ err }, "Codex app-server child process error");
-      for (const pending of this.pending.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(err);
-      }
-      this.pending.clear();
-      this.disposed = true;
-      this.resolveExitPromise?.();
-      this.resolveExitPromise = null;
-    });
-
-    child.on("exit", (code, signal) => {
-      const message =
-        code === 0 && !signal
-          ? "Codex app-server exited"
-          : `Codex app-server exited with code ${code ?? "null"} and signal ${signal ?? "null"}`;
-      const error = new Error(`${message}\n${this.stderrBuffer}`.trim());
-      for (const pending of this.pending.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(error);
-      }
-      this.pending.clear();
-      this.disposed = true;
-      this.resolveExitPromise?.();
-      this.resolveExitPromise = null;
-    });
-  }
-
-  setNotificationHandler(handler: NotificationHandler): void {
-    this.notificationHandler = handler;
-  }
-
-  setRequestHandler(method: string, handler: RequestHandler): void {
-    this.requestHandlers.set(method, handler);
-  }
-
-  request(method: string, params?: unknown, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<unknown> {
-    if (this.disposed) {
-      return Promise.reject(new Error("Codex app-server client is closed"));
-    }
-    const id = this.nextId++;
-    const payload: JsonRpcRequest = { id, method, params };
-    const serialized = JSON.stringify(payload);
-    this.child.stdin.write(`${serialized}\n`);
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`Codex app-server request timed out for ${method}`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-    });
-  }
-
-  notify(method: string, params?: unknown): void {
-    if (this.disposed) {
-      return;
-    }
-    const payload: JsonRpcNotification = { method, params };
-    this.child.stdin.write(`${JSON.stringify(payload)}\n`);
-  }
-
-  private writeJsonRpcResponse(response: JsonRpcResponse): void {
-    if (this.disposed || this.child.stdin.destroyed || !this.child.stdin.writable) {
-      return;
-    }
-    try {
-      this.child.stdin.write(`${JSON.stringify(response)}\n`);
-    } catch (error) {
-      this.logger.debug({ error }, "Failed to write Codex app-server JSON-RPC response");
-    }
-  }
-
-  async dispose(): Promise<void> {
-    if (this.disposed) return;
-    this.disposed = true;
-    this.rl.close();
-    try {
-      this.child.stdin.end();
-    } catch {
-      // ignore
-    }
-    terminateChildProcessTree(this.child);
-    await this.exitPromise;
-  }
-
-  private async handleLine(line: string): Promise<void> {
-    if (!line.trim()) return;
-    let msg: JsonRpcMessage;
-    try {
-      msg = JSON.parse(line);
-    } catch (error) {
-      this.logger.warn({ error, line }, "Failed to parse Codex app-server JSON");
-      return;
-    }
-
-    if (typeof (msg as JsonRpcResponse).id === "number") {
-      const id = (msg as JsonRpcResponse).id;
-      if ((msg as JsonRpcResponse).result !== undefined || (msg as JsonRpcResponse).error) {
-        const pending = this.pending.get(id);
-        if (!pending) return;
-        clearTimeout(pending.timer);
-        this.pending.delete(id);
-        if ((msg as JsonRpcResponse).error) {
-          pending.reject(new Error((msg as JsonRpcResponse).error?.message ?? "Unknown error"));
-        } else {
-          pending.resolve((msg as JsonRpcResponse).result);
-        }
-        return;
-      }
-
-      // Server-initiated request
-      if (typeof (msg as JsonRpcRequest).method === "string") {
-        const request = msg as JsonRpcRequest;
-        const handler = this.requestHandlers.get(request.method);
-        try {
-          const result = handler ? await handler(request.params) : {};
-          this.writeJsonRpcResponse({ id: request.id, result });
-        } catch (error) {
-          this.writeJsonRpcResponse({
-            id: request.id,
-            error: { message: error instanceof Error ? error.message : String(error) },
-          });
-        }
-        return;
-      }
-    }
-
-    if (typeof (msg as JsonRpcNotification).method === "string") {
-      const notification = msg as JsonRpcNotification;
-      this.notificationHandler?.(notification.method, notification.params);
-    }
-  }
-}
-
-function terminateChildProcessTree(child: ChildProcessWithoutNullStreams): void {
-  if (child.killed) {
-    return;
-  }
-
-  if (process.platform !== "win32" && typeof child.pid === "number" && child.pid > 0) {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-      return;
-    } catch {
-      // Fall back to the direct child when no separate process group exists.
-    }
-  }
-
-  try {
-    child.kill("SIGTERM");
-  } catch {
-    // ignore
-  }
-}
-
-function toAgentUsage(tokenUsage: unknown): AgentUsage | undefined {
-  if (!tokenUsage || typeof tokenUsage !== "object") return undefined;
-  const usage = tokenUsage as {
-    model_context_window?: number;
-    modelContextWindow?: number;
-    last?: {
-      inputTokens?: number;
-      cachedInputTokens?: number;
-      outputTokens?: number;
-      total_tokens?: number;
-      totalTokens?: number;
-    };
-  };
-  const contextWindowMaxTokens =
-    typeof usage.model_context_window === "number" &&
-    Number.isFinite(usage.model_context_window) &&
-    usage.model_context_window > 0
-      ? usage.model_context_window
-      : typeof usage.modelContextWindow === "number" &&
-          Number.isFinite(usage.modelContextWindow) &&
-          usage.modelContextWindow > 0
-        ? usage.modelContextWindow
-        : undefined;
-  const contextWindowUsedTokens =
-    typeof usage.last?.total_tokens === "number" &&
-    Number.isFinite(usage.last.total_tokens) &&
-    usage.last.total_tokens > 0
-      ? usage.last.total_tokens
-      : typeof usage.last?.totalTokens === "number" &&
-          Number.isFinite(usage.last.totalTokens) &&
-          usage.last.totalTokens > 0
-        ? usage.last.totalTokens
-        : undefined;
+export function toAgentUsage(tokenUsage: unknown): AgentUsage | undefined {
+  const usage = toObjectRecord(tokenUsage);
+  if (!usage) return undefined;
+  const last = toObjectRecord(usage.last);
+  const contextWindowMaxTokens = firstPositiveFiniteNumber(
+    usage.model_context_window,
+    usage.modelContextWindow,
+  );
+  const contextWindowUsedTokens = firstPositiveFiniteNumber(last?.total_tokens, last?.totalTokens);
   return {
-    inputTokens: usage.last?.inputTokens,
-    cachedInputTokens: usage.last?.cachedInputTokens,
-    outputTokens: usage.last?.outputTokens,
+    inputTokens: typeof last?.inputTokens === "number" ? last.inputTokens : undefined,
+    cachedInputTokens:
+      typeof last?.cachedInputTokens === "number" ? last.cachedInputTokens : undefined,
+    outputTokens: typeof last?.outputTokens === "number" ? last.outputTokens : undefined,
     ...(contextWindowMaxTokens !== undefined ? { contextWindowMaxTokens } : {}),
     ...(contextWindowUsedTokens !== undefined ? { contextWindowUsedTokens } : {}),
   };
@@ -785,11 +876,12 @@ function extractUserText(content: unknown): string | null {
   if (!Array.isArray(content)) return null;
   const parts: string[] = [];
   for (const item of content) {
-    if (item && typeof item === "object") {
-      const obj = item as { type?: string; text?: string };
-      if (obj.type === "text" && typeof obj.text === "string") {
-        parts.push(obj.text);
-      }
+    const record = toObjectRecord(item);
+    if (!record) {
+      continue;
+    }
+    if (record.type === "text" && typeof record.text === "string") {
+      parts.push(record.text);
     }
   }
   return parts.length > 0 ? parts.join("\n") : null;
@@ -803,7 +895,7 @@ function normalizePlanMarkdown(text: string): string {
     .trim();
 }
 
-function planStepsToMarkdown(steps: Array<{ step: string; status: string }>): string {
+export function planStepsToMarkdown(steps: Array<{ step: string; status: string }>): string {
   const lines = steps
     .map((entry) => entry.step.trim())
     .filter((step) => step.length > 0)
@@ -816,7 +908,7 @@ function planStepsToMarkdown(steps: Array<{ step: string; status: string }>): st
   return normalizePlanMarkdown(lines.join("\n"));
 }
 
-function mapCodexPlanToToolCall(params: {
+export function mapCodexPlanToToolCall(params: {
   callId: string;
   text: string;
 }): ToolCallTimelineItem | null {
@@ -885,12 +977,12 @@ function buildCodexPlanImplementationPrompt(planText: string): string {
   ].join("\n\n");
 }
 
-type CodexQuestionOption = {
+interface CodexQuestionOption {
   label: string;
   description?: string;
-};
+}
 
-type CodexQuestionPrompt = {
+interface CodexQuestionPrompt {
   id: string;
   header: string;
   question: string;
@@ -898,18 +990,18 @@ type CodexQuestionPrompt = {
   multiSelect?: boolean;
   isOther?: boolean;
   isSecret?: boolean;
-};
+}
 
-function normalizeCodexQuestionPrompts(raw: unknown): CodexQuestionPrompt[] {
+export function normalizeCodexQuestionPrompts(raw: unknown): CodexQuestionPrompt[] {
   if (!Array.isArray(raw)) {
     return [];
   }
   const questions: CodexQuestionPrompt[] = [];
   for (const item of raw) {
-    if (!item || typeof item !== "object") {
+    const record = toObjectRecord(item);
+    if (!record) {
       continue;
     }
-    const record = item as Record<string, unknown>;
     const id = nonEmptyString(record.id);
     const header = nonEmptyString(record.header);
     const question = nonEmptyString(record.question);
@@ -918,10 +1010,10 @@ function normalizeCodexQuestionPrompts(raw: unknown): CodexQuestionPrompt[] {
     }
     const options = Array.isArray(record.options)
       ? record.options.flatMap((option): CodexQuestionOption[] => {
-          if (!option || typeof option !== "object") {
+          const optionRecord = toObjectRecord(option);
+          if (!optionRecord) {
             return [];
           }
-          const optionRecord = option as Record<string, unknown>;
           const label = nonEmptyString(optionRecord.label);
           if (!label) {
             return [];
@@ -950,7 +1042,7 @@ function normalizeCodexQuestionPrompts(raw: unknown): CodexQuestionPrompt[] {
   return questions;
 }
 
-function formatCodexQuestionPrompts(questions: CodexQuestionPrompt[]): string {
+export function formatCodexQuestionPrompts(questions: CodexQuestionPrompt[]): string {
   return questions
     .map((question) => {
       const lines = [`${question.header}: ${question.question}`];
@@ -963,7 +1055,7 @@ function formatCodexQuestionPrompts(questions: CodexQuestionPrompt[]): string {
     .trim();
 }
 
-function mapCodexQuestionRequestToToolCall(params: {
+export function mapCodexQuestionRequestToToolCall(params: {
   callId: string;
   questions: CodexQuestionPrompt[];
   status: ToolCallTimelineItem["status"];
@@ -1032,13 +1124,9 @@ function mapCodexQuestionResponseByHeader(params: {
   if (params.response.behavior !== "allow") {
     return null;
   }
-  const answersRecord =
-    params.response.updatedInput && typeof params.response.updatedInput === "object"
-      ? ((params.response.updatedInput as Record<string, unknown>).answers as
-          | Record<string, unknown>
-          | undefined)
-      : undefined;
-  if (!answersRecord || typeof answersRecord !== "object") {
+  const updatedInputRecord = toObjectRecord(params.response.updatedInput);
+  const answersRecord = toObjectRecord(updatedInputRecord?.answers);
+  if (!answersRecord) {
     return null;
   }
 
@@ -1066,17 +1154,17 @@ function mapCodexQuestionResponseByHeader(params: {
   return Object.keys(answers).length > 0 ? answers : null;
 }
 
-type CodexPatchFileChange = {
+interface CodexPatchFileChange {
   path: string;
   kind?: string;
   content?: string;
-};
+}
 
 function extractPatchLikeText(value: unknown): string | undefined {
-  if (!value || typeof value !== "object") {
+  const record = toObjectRecord(value);
+  if (!record) {
     return undefined;
   }
-  const record = value as Record<string, unknown>;
   const candidates = [
     record.diff,
     record.patch,
@@ -1114,6 +1202,12 @@ function normalizeCodexThreadItemType(rawType: string | undefined): string | und
       return "mcpToolCall";
     case "WebSearch":
       return "webSearch";
+    case "CollabAgentToolCall":
+      return "collabAgentToolCall";
+    case "ImageView":
+      return "imageView";
+    case "ImageGeneration":
+      return "imageGeneration";
     default:
       return rawType;
   }
@@ -1179,10 +1273,10 @@ function parseCodexPatchChanges(changes: unknown): CodexPatchFileChange[] {
   if (Array.isArray(changes)) {
     return changes
       .map((entry): CodexPatchFileChange | null => {
-        if (!entry || typeof entry !== "object") {
+        const record = toObjectRecord(entry);
+        if (!record) {
           return null;
         }
-        const record = entry as Record<string, unknown>;
         const pathValue = resolvePathFromRecord(record);
         if (!pathValue) {
           return null;
@@ -1199,7 +1293,10 @@ function parseCodexPatchChanges(changes: unknown): CodexPatchFileChange[] {
       .filter((entry): entry is CodexPatchFileChange => entry !== null);
   }
 
-  const recordChanges = changes as Record<string, unknown>;
+  const recordChanges = toObjectRecord(changes);
+  if (!recordChanges) {
+    return [];
+  }
   const directPathValue = resolvePathFromRecord(recordChanges);
   if (directPathValue) {
     return [
@@ -1215,8 +1312,8 @@ function parseCodexPatchChanges(changes: unknown): CodexPatchFileChange[] {
   }
 
   return Object.entries(recordChanges)
-    .map(([path, value]): CodexPatchFileChange | null => {
-      const normalizedPath = path.trim();
+    .map(([entryPath, value]): CodexPatchFileChange | null => {
+      const normalizedPath = entryPath.trim();
       if (!normalizedPath) {
         return null;
       }
@@ -1320,7 +1417,7 @@ function mapCodexExecNotificationToToolCall(params: {
           ? { exitCode: params.exitCode }
           : {}),
       };
-  const mapped = mapCodexRolloutToolCall({
+  const mapped = mapCodexToolCallEnvelope({
     callId: params.callId ?? null,
     name: "shell",
     input: {
@@ -1337,7 +1434,7 @@ function mapCodexExecNotificationToToolCall(params: {
   return params.running ? toRunningToolCall(mapped) : mapped;
 }
 
-function mapCodexPatchNotificationToToolCall(params: {
+export function mapCodexPatchNotificationToToolCall(params: {
   callId?: string | null;
   changes: unknown;
   cwd?: string | null;
@@ -1353,7 +1450,7 @@ function mapCodexPatchNotificationToToolCall(params: {
     .find((value): value is string => typeof value === "string" && value.length > 0);
   const patchText = firstPatchText;
   const patchFields = codexPatchTextFields(patchText);
-  const mapped = mapCodexRolloutToolCall({
+  const mapped = mapCodexToolCallEnvelope({
     callId: params.callId ?? null,
     name: "apply_patch",
     input: firstPath
@@ -1371,11 +1468,13 @@ function mapCodexPatchNotificationToToolCall(params: {
       : {
           ...(files.length > 0
             ? {
-                files: files.map((file) => ({
-                  path: file.path,
-                  ...(file.kind ? { kind: file.kind } : {}),
-                  ...codexPatchTextFields(file.content ?? patchText),
-                })),
+                files: files.map((file) =>
+                  Object.assign(
+                    { path: file.path },
+                    file.kind ? { kind: file.kind } : {},
+                    codexPatchTextFields(file.content ?? patchText),
+                  ),
+                ),
               }
             : {}),
           ...(params.stdout ? { stdout: params.stdout } : {}),
@@ -1421,58 +1520,260 @@ function mapCodexTerminalInteractionToToolCall(params: {
   };
 }
 
-function threadItemToTimeline(
-  item: any,
+function mapCodexThreadPlanItem(normalizedItem: Record<string, unknown>): AgentTimelineItem | null {
+  const callId =
+    nonEmptyString(normalizedItem.id ?? normalizedItem.itemId ?? undefined) ??
+    `plan:${normalizePlanMarkdown(typeof normalizedItem.text === "string" ? normalizedItem.text : "")}`;
+  return mapCodexPlanToToolCall({
+    callId,
+    text: typeof normalizedItem.text === "string" ? normalizedItem.text : "",
+  });
+}
+
+function mapCodexThreadReasoningItem(
+  normalizedItem: Record<string, unknown>,
+): AgentTimelineItem | null {
+  const summary = Array.isArray(normalizedItem.summary) ? normalizedItem.summary.join("\n") : "";
+  const content = Array.isArray(normalizedItem.content) ? normalizedItem.content.join("\n") : "";
+  const text = summary || content;
+  return text ? { type: "reasoning", text } : null;
+}
+
+function mapCodexThreadUserMessageItem(
+  normalizedItem: Record<string, unknown>,
+  includeUserMessage: boolean,
+): AgentTimelineItem | null {
+  if (!includeUserMessage) {
+    return null;
+  }
+  const text = extractUserText(normalizedItem.content) ?? "";
+  const messageId = nonEmptyString(normalizedItem.id);
+  return {
+    type: "user_message",
+    text,
+    ...(messageId ? { messageId } : {}),
+  };
+}
+
+function firstStringField(
+  record: Record<string, unknown>,
+  fields: readonly string[],
+): string | null {
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "string") {
+      return value;
+    }
+  }
+  return null;
+}
+
+function readCodexHistoryTimestamp(item: unknown): string | null {
+  const record = toObjectRecord(item);
+  if (!record) {
+    return null;
+  }
+  return (
+    normalizeProviderReplayTimestamp(record.timestamp) ??
+    normalizeProviderReplayTimestamp(record.createdAt) ??
+    normalizeProviderReplayTimestamp(record.created_at)
+  );
+}
+
+function readCodexTurnHistoryTimestamp(
+  turn: unknown,
+  timelineItem: AgentTimelineItem,
+): string | null {
+  const record = toObjectRecord(turn);
+  if (!record) {
+    return null;
+  }
+
+  const startedAt =
+    normalizeProviderReplayTimestamp(record.startedAt) ??
+    normalizeProviderReplayTimestamp(record.started_at);
+  const completedAt =
+    normalizeProviderReplayTimestamp(record.completedAt) ??
+    normalizeProviderReplayTimestamp(record.completed_at);
+
+  if (timelineItem.type === "user_message") {
+    return startedAt ?? completedAt;
+  }
+  return completedAt ?? startedAt;
+}
+
+function codexImageOutputFromResult(result: unknown): ProviderImageOutput | null {
+  if (typeof result === "string") {
+    const trimmed = result.trim();
+    if (
+      trimmed.toLowerCase().startsWith("data:image/") ||
+      (/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed) && trimmed.length > 64)
+    ) {
+      return { data: trimmed };
+    }
+    return { url: trimmed };
+  }
+  const resultRecord = toObjectRecord(result);
+  if (!resultRecord) {
+    return null;
+  }
+  return {
+    path: firstStringField(resultRecord, ["path", "savedPath", "saved_path"]),
+    url: firstStringField(resultRecord, ["url"]),
+    data: firstStringField(resultRecord, ["data"]),
+    mimeType: firstStringField(resultRecord, ["mimeType", "mime_type"]),
+  };
+}
+
+function mapCodexThreadImageItem(
+  normalizedType: string,
+  normalizedItem: Record<string, unknown>,
+): AgentTimelineItem | null {
+  if (normalizedType === "imageView") {
+    return renderProviderImageOutputAsAssistantMarkdown({
+      path: firstStringField(normalizedItem, ["path"]),
+    });
+  }
+
+  const savedPath = firstStringField(normalizedItem, ["savedPath", "saved_path"]);
+  const result = codexImageOutputFromResult(normalizedItem.result);
+  return renderProviderImageOutputAsAssistantMarkdown(
+    {
+      path: savedPath ?? result?.path ?? null,
+      url: result?.url ?? null,
+      data: result?.data ?? null,
+      mimeType: result?.mimeType ?? null,
+    },
+    { materialize: materializeProviderImage },
+  );
+}
+
+export function threadItemToTimeline(
+  item: unknown,
   options?: { includeUserMessage?: boolean; cwd?: string | null },
 ): AgentTimelineItem | null {
-  if (!item || typeof item !== "object") return null;
+  const itemRecord = toObjectRecord(item);
+  if (!itemRecord) return null;
   const includeUserMessage = options?.includeUserMessage ?? true;
   const cwd = options?.cwd ?? null;
   const normalizedType = normalizeCodexThreadItemType(
-    typeof item.type === "string" ? item.type : undefined,
+    typeof itemRecord.type === "string" ? itemRecord.type : undefined,
   );
-  const normalizedItem =
-    normalizedType && normalizedType !== item.type
-      ? ({ ...item, type: normalizedType } as typeof item)
-      : item;
+  const normalizedItem: Record<string, unknown> =
+    normalizedType && normalizedType !== itemRecord.type
+      ? { ...itemRecord, type: normalizedType }
+      : itemRecord;
+
+  if (normalizedType === "imageView" || normalizedType === "imageGeneration") {
+    return mapCodexThreadImageItem(normalizedType, normalizedItem);
+  }
+  if (normalizedType && CODEX_TOOL_THREAD_ITEM_TYPES.has(normalizedType)) {
+    return mapCodexToolCallFromThreadItem(normalizedItem, { cwd });
+  }
 
   switch (normalizedType) {
-    case "userMessage": {
-      if (!includeUserMessage) {
-        return null;
-      }
-      const text = extractUserText(normalizedItem.content) ?? "";
-      return { type: "user_message", text };
-    }
+    case "userMessage":
+      return mapCodexThreadUserMessageItem(normalizedItem, includeUserMessage);
     case "agentMessage": {
-      return { type: "assistant_message", text: normalizedItem.text ?? "" };
+      const messageId = nonEmptyString(normalizedItem.id);
+      return {
+        type: "assistant_message",
+        text: typeof normalizedItem.text === "string" ? normalizedItem.text : "",
+        ...(messageId ? { messageId } : {}),
+      };
     }
-    case "plan": {
-      return mapCodexPlanToToolCall({
-        callId:
-          nonEmptyString(normalizedItem.id ?? normalizedItem.itemId ?? undefined) ??
-          `plan:${normalizePlanMarkdown(normalizedItem.text ?? "")}`,
-        text: normalizedItem.text ?? "",
-      });
-    }
-    case "reasoning": {
-      const summary = Array.isArray(normalizedItem.summary)
-        ? normalizedItem.summary.join("\n")
-        : "";
-      const content = Array.isArray(normalizedItem.content)
-        ? normalizedItem.content.join("\n")
-        : "";
-      const text = summary || content;
-      return text ? { type: "reasoning", text } : null;
-    }
-    case "commandExecution":
-    case "fileChange":
-    case "mcpToolCall":
-    case "webSearch":
-      return mapCodexToolCallFromThreadItem(normalizedItem, { cwd });
+    case "plan":
+      return mapCodexThreadPlanItem(normalizedItem);
+    case "reasoning":
+      return mapCodexThreadReasoningItem(normalizedItem);
+    case CODEX_CONTEXT_COMPACTION_TYPE:
+      return {
+        type: "compaction",
+        status: "completed",
+      };
     default:
       return null;
   }
+}
+
+const CodexThreadReadResponseSchema = z
+  .object({
+    thread: z
+      .object({
+        turns: z
+          .array(
+            z
+              .object({
+                items: z.array(z.unknown()).default([]),
+              })
+              .passthrough(),
+          )
+          .default([]),
+      })
+      .passthrough()
+      .default({ turns: [] }),
+  })
+  .passthrough();
+
+type CodexThreadReadResponse = z.infer<typeof CodexThreadReadResponseSchema>;
+type CodexThreadReadRequest = (threadId: string) => Promise<unknown>;
+
+async function requestCodexThreadHistory(
+  requestThread: CodexThreadReadRequest,
+  threadId: string,
+): Promise<CodexThreadReadResponse> {
+  const response = await requestThread(threadId);
+  return CodexThreadReadResponseSchema.parse(response);
+}
+
+async function loadCodexThreadHistoryTimeline(params: {
+  threadId: string;
+  cwd: string | null;
+  requestThread: CodexThreadReadRequest;
+}): Promise<PersistedTimelineEntry[]> {
+  const response = await requestCodexThreadHistory(params.requestThread, params.threadId);
+  const timeline: PersistedTimelineEntry[] = [];
+  for (const turn of response.thread.turns) {
+    for (const item of turn.items) {
+      const timelineItem = threadItemToTimeline(item, { cwd: params.cwd });
+      if (timelineItem) {
+        const timestamp =
+          readCodexHistoryTimestamp(item) ?? readCodexTurnHistoryTimestamp(turn, timelineItem);
+        timeline.push({
+          item: timelineItem,
+          timestamp: timestamp ?? undefined,
+        });
+      }
+    }
+  }
+  return timeline;
+}
+
+function readCodexThread(client: CodexAppServerClientLike, threadId: string): Promise<unknown> {
+  return client.request("thread/read", {
+    threadId,
+    includeTurns: true,
+  });
+}
+
+export async function forkCodexThread(
+  client: CodexAppServerClientLike,
+  params: CodexThreadForkParams,
+): Promise<CodexThreadForkResponse> {
+  if (client.forkThread) {
+    return client.forkThread(params);
+  }
+  return parseCodexThreadForkResponse(await client.request("thread/fork", params));
+}
+
+export async function rollbackCodexThread(
+  client: CodexAppServerClientLike,
+  params: CodexThreadRollbackParams,
+): Promise<CodexThreadRollbackResponse> {
+  if (client.rollbackThread) {
+    return client.rollbackThread(params);
+  }
+  return parseCodexThreadRollbackResponse(await client.request("thread/rollback", params));
 }
 
 function toSandboxPolicy(type: string, networkAccess?: boolean): Record<string, unknown> {
@@ -1488,37 +1789,6 @@ function toSandboxPolicy(type: string, networkAccess?: boolean): Record<string, 
   }
 }
 
-function getImageExtension(mimeType: string): string {
-  switch (mimeType) {
-    case "image/jpeg":
-      return "jpg";
-    case "image/png":
-      return "png";
-    case "image/webp":
-      return "webp";
-    case "image/gif":
-      return "gif";
-    case "image/bmp":
-      return "bmp";
-    case "image/tiff":
-      return "tiff";
-    default:
-      return "bin";
-  }
-}
-
-type ImageDataPayload = { mimeType: string; data: string };
-
-function normalizeImageData(mimeType: string, data: string): ImageDataPayload {
-  if (data.startsWith("data:")) {
-    const match = data.match(/^data:([^;]+);base64,(.*)$/);
-    if (match) {
-      return { mimeType: match[1], data: match[2] };
-    }
-  }
-  return { mimeType, data };
-}
-
 const ThreadStartedNotificationSchema = z
   .object({
     thread: z.object({ id: z.string() }).passthrough(),
@@ -1527,12 +1797,14 @@ const ThreadStartedNotificationSchema = z
 
 const TurnStartedNotificationSchema = z
   .object({
+    threadId: z.string().optional(),
     turn: z.object({ id: z.string() }).passthrough(),
   })
   .passthrough();
 
 const TurnCompletedNotificationSchema = z
   .object({
+    threadId: z.string().optional(),
     turn: z
       .object({
         status: z.string(),
@@ -1575,6 +1847,7 @@ const ThreadTokenUsageUpdatedNotificationSchema = z
 
 const ItemTextDeltaNotificationSchema = z
   .object({
+    threadId: z.string().optional(),
     itemId: z.string(),
     delta: z.string(),
   })
@@ -1582,12 +1855,20 @@ const ItemTextDeltaNotificationSchema = z
 
 const ItemLifecycleNotificationSchema = z
   .object({
+    threadId: z.string().optional(),
     item: z
       .object({
         id: z.string().optional(),
         type: z.string().optional(),
       })
       .passthrough(),
+  })
+  .passthrough();
+
+const ContextCompactedNotificationSchema = z
+  .object({
+    threadId: z.string(),
+    turnId: z.string().optional(),
   })
   .passthrough();
 
@@ -1614,9 +1895,12 @@ const CodexEventTaskCompleteNotificationSchema = z
 
 const CodexEventItemLifecycleNotificationSchema = z
   .object({
+    threadId: z.string().optional(),
     msg: z
       .object({
         type: z.enum(["item_started", "item_completed"]),
+        threadId: z.string().optional(),
+        thread_id: z.string().optional(),
         item: z
           .object({
             id: z.string().optional(),
@@ -1744,23 +2028,42 @@ const CodexEventTurnDiffNotificationSchema = z
   })
   .passthrough();
 
+const CodexEventThreadRolledBackNotificationSchema = z
+  .object({
+    msg: z
+      .object({
+        type: z.literal("thread_rolled_back"),
+        num_turns: z.number().int().nonnegative().optional(),
+        numTurns: z.number().int().nonnegative().optional(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
 type ParsedCodexNotification =
   | { kind: "thread_started"; threadId: string }
-  | { kind: "turn_started"; turnId: string }
-  | { kind: "turn_completed"; status: string; errorMessage: string | null }
+  | { kind: "turn_started"; turnId: string; threadId: string | null }
+  | {
+      kind: "turn_completed";
+      status: string;
+      errorMessage: string | null;
+      threadId: string | null;
+    }
   | { kind: "plan_updated"; plan: Array<{ step: string | null; status: string | null }> }
   | { kind: "diff_updated"; diff: string }
   | { kind: "token_usage_updated"; tokenUsage: unknown }
-  | { kind: "agent_message_delta"; itemId: string; delta: string }
-  | { kind: "reasoning_delta"; itemId: string; delta: string }
+  | { kind: "agent_message_delta"; itemId: string; delta: string; threadId: string | null }
+  | { kind: "reasoning_delta"; itemId: string; delta: string; threadId: string | null }
   | {
       kind: "item_completed";
       source: "item" | "codex_event";
+      threadId: string | null;
       item: { id?: string; type?: string; [key: string]: unknown };
     }
   | {
       kind: "item_started";
       source: "item" | "codex_event";
+      threadId: string | null;
       item: { id?: string; type?: string; [key: string]: unknown };
     }
   | {
@@ -1810,8 +2113,32 @@ type ParsedCodexNotification =
       itemId: string;
       delta: string | null;
     }
+  | { kind: "thread_rolled_back"; numTurns: number }
+  | { kind: "context_compacted"; threadId: string; turnId: string | null }
   | { kind: "invalid_payload"; method: string; params: unknown }
   | { kind: "unknown_method"; method: string; params: unknown };
+
+type CodexDeltaNotification = Extract<
+  ParsedCodexNotification,
+  {
+    kind:
+      | "agent_message_delta"
+      | "reasoning_delta"
+      | "exec_command_output_delta"
+      | "file_change_output_delta";
+  }
+>;
+
+function isCodexDeltaNotification(
+  parsed: ParsedCodexNotification,
+): parsed is CodexDeltaNotification {
+  return (
+    parsed.kind === "agent_message_delta" ||
+    parsed.kind === "reasoning_delta" ||
+    parsed.kind === "exec_command_output_delta" ||
+    parsed.kind === "file_change_output_delta"
+  );
+}
 
 const CodexNotificationSchema = z.union([
   z
@@ -1829,11 +2156,13 @@ const CodexNotificationSchema = z.union([
       params,
     }),
   ),
-  z
-    .object({ method: z.literal("turn/started"), params: TurnStartedNotificationSchema })
-    .transform(
-      ({ params }): ParsedCodexNotification => ({ kind: "turn_started", turnId: params.turn.id }),
-    ),
+  z.object({ method: z.literal("turn/started"), params: TurnStartedNotificationSchema }).transform(
+    ({ params }): ParsedCodexNotification => ({
+      kind: "turn_started",
+      turnId: params.turn.id,
+      threadId: params.threadId ?? null,
+    }),
+  ),
   z.object({ method: z.literal("turn/started"), params: z.unknown() }).transform(
     ({ method, params }): ParsedCodexNotification => ({
       kind: "invalid_payload",
@@ -1848,6 +2177,7 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: params.turn.status,
         errorMessage: params.turn.error?.message ?? null,
+        threadId: params.threadId ?? null,
       }),
     ),
   z.object({ method: z.literal("turn/completed"), params: z.unknown() }).transform(
@@ -1906,6 +2236,22 @@ const CodexNotificationSchema = z.union([
     }),
   ),
   z
+    .object({ method: z.literal("thread/compacted"), params: ContextCompactedNotificationSchema })
+    .transform(
+      ({ params }): ParsedCodexNotification => ({
+        kind: "context_compacted",
+        threadId: params.threadId,
+        turnId: params.turnId ?? null,
+      }),
+    ),
+  z.object({ method: z.literal("thread/compacted"), params: z.unknown() }).transform(
+    ({ method, params }): ParsedCodexNotification => ({
+      kind: "invalid_payload",
+      method,
+      params,
+    }),
+  ),
+  z
     .object({
       method: z.literal("item/agentMessage/delta"),
       params: ItemTextDeltaNotificationSchema,
@@ -1915,6 +2261,7 @@ const CodexNotificationSchema = z.union([
         kind: "agent_message_delta",
         itemId: params.itemId,
         delta: params.delta,
+        threadId: params.threadId ?? null,
       }),
     ),
   z.object({ method: z.literal("item/agentMessage/delta"), params: z.unknown() }).transform(
@@ -1934,6 +2281,7 @@ const CodexNotificationSchema = z.union([
         kind: "reasoning_delta",
         itemId: params.itemId,
         delta: params.delta,
+        threadId: params.threadId ?? null,
       }),
     ),
   z.object({ method: z.literal("item/reasoning/summaryTextDelta"), params: z.unknown() }).transform(
@@ -1949,6 +2297,7 @@ const CodexNotificationSchema = z.union([
       ({ params }): ParsedCodexNotification => ({
         kind: "item_completed",
         source: "item",
+        threadId: params.threadId ?? null,
         item: params.item,
       }),
     ),
@@ -1965,6 +2314,7 @@ const CodexNotificationSchema = z.union([
       ({ params }): ParsedCodexNotification => ({
         kind: "item_started",
         source: "item",
+        threadId: params.threadId ?? null,
         item: params.item,
       }),
     ),
@@ -1984,6 +2334,7 @@ const CodexNotificationSchema = z.union([
       ({ params }): ParsedCodexNotification => ({
         kind: "item_started",
         source: "codex_event",
+        threadId: params.threadId ?? params.msg.threadId ?? params.msg.thread_id ?? null,
         item: params.msg.item,
       }),
     ),
@@ -2003,6 +2354,7 @@ const CodexNotificationSchema = z.union([
       ({ params }): ParsedCodexNotification => ({
         kind: "item_completed",
         source: "codex_event",
+        threadId: params.threadId ?? params.msg.threadId ?? params.msg.thread_id ?? null,
         item: params.msg.item,
       }),
     ),
@@ -2230,6 +2582,7 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: "interrupted",
         errorMessage: null,
+        threadId: null,
       }),
     ),
   z.object({ method: z.literal("codex/event/turn_aborted"), params: z.unknown() }).transform(
@@ -2249,9 +2602,28 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: "completed",
         errorMessage: null,
+        threadId: null,
       }),
     ),
   z.object({ method: z.literal("codex/event/task_complete"), params: z.unknown() }).transform(
+    ({ method, params }): ParsedCodexNotification => ({
+      kind: "invalid_payload",
+      method,
+      params,
+    }),
+  ),
+  z
+    .object({
+      method: z.literal("codex/event/thread_rolled_back"),
+      params: CodexEventThreadRolledBackNotificationSchema,
+    })
+    .transform(
+      ({ params }): ParsedCodexNotification => ({
+        kind: "thread_rolled_back",
+        numTurns: params.msg.num_turns ?? params.msg.numTurns ?? 0,
+      }),
+    ),
+  z.object({ method: z.literal("codex/event/thread_rolled_back"), params: z.unknown() }).transform(
     ({ method, params }): ParsedCodexNotification => ({
       kind: "invalid_payload",
       method,
@@ -2265,34 +2637,20 @@ const CodexNotificationSchema = z.union([
     ),
 ]);
 
-async function writeImageAttachment(mimeType: string, data: string): Promise<string> {
-  const attachmentsDir = path.join(os.tmpdir(), CODEX_IMAGE_ATTACHMENT_DIR);
-  await fs.mkdir(attachmentsDir, { recursive: true });
-  const normalized = normalizeImageData(mimeType, data);
-  const extension = getImageExtension(normalized.mimeType);
-  const filename = `${randomUUID()}.${extension}`;
-  const filePath = path.join(attachmentsDir, filename);
-  await fs.writeFile(filePath, Buffer.from(normalized.data, "base64"));
-  return filePath;
-}
-
 async function readCodexConfiguredDefaults(
   client: CodexAppServerClient,
   logger: Logger,
 ): Promise<CodexConfiguredDefaults> {
   let savedConfigDefaults: CodexConfiguredDefaults = {};
   try {
-    const response = (await client.request("getUserSavedConfig", {})) as {
-      config?: {
-        model?: string | null;
-        modelReasoningEffort?: string | null;
-      };
-    };
+    const response = toObjectRecord(await client.request("getUserSavedConfig", {}));
+    const config = toObjectRecord(response?.config);
+    const modelValue = typeof config?.model === "string" ? config.model : undefined;
+    const thinkingOptionValue =
+      typeof config?.modelReasoningEffort === "string" ? config.modelReasoningEffort : null;
     savedConfigDefaults = {
-      model: normalizeCodexModelId(response?.config?.model),
-      thinkingOptionId: normalizeCodexThinkingOptionId(
-        response?.config?.modelReasoningEffort ?? null,
-      ),
+      model: normalizeCodexModelId(modelValue),
+      thinkingOptionId: normalizeCodexThinkingOptionId(thinkingOptionValue),
     };
   } catch (error) {
     logger.debug({ error }, "Failed to read Codex saved config defaults");
@@ -2304,17 +2662,14 @@ async function readCodexConfiguredDefaults(
 
   let configReadDefaults: CodexConfiguredDefaults = {};
   try {
-    const response = (await client.request("config/read", {})) as {
-      config?: {
-        model?: string | null;
-        model_reasoning_effort?: string | null;
-      };
-    };
+    const response = toObjectRecord(await client.request("config/read", {}));
+    const config = toObjectRecord(response?.config);
+    const modelValue = typeof config?.model === "string" ? config.model : undefined;
+    const thinkingOptionValue =
+      typeof config?.model_reasoning_effort === "string" ? config.model_reasoning_effort : null;
     configReadDefaults = {
-      model: normalizeCodexModelId(response?.config?.model),
-      thinkingOptionId: normalizeCodexThinkingOptionId(
-        response?.config?.model_reasoning_effort ?? null,
-      ),
+      model: normalizeCodexModelId(modelValue),
+      thinkingOptionId: normalizeCodexThinkingOptionId(thinkingOptionValue),
     };
   } catch (error) {
     logger.debug({ error }, "Failed to read Codex config defaults");
@@ -2323,57 +2678,95 @@ async function readCodexConfiguredDefaults(
   return mergeCodexConfiguredDefaults(savedConfigDefaults, configReadDefaults);
 }
 
+interface CodexSkillPromptBlock {
+  type: "skill";
+  name: string;
+  path: string;
+}
+
+type CodexPromptContentBlock = AgentPromptContentBlock | CodexSkillPromptBlock;
+type CodexPromptInput = string | CodexPromptContentBlock[];
+interface CodexTextElement {
+  byteRange: {
+    start: number;
+    end: number;
+  };
+  placeholder: string | null;
+}
+
+type CodexAppServerUserInput =
+  | {
+      type: "text";
+      text: string;
+      text_elements: CodexTextElement[];
+    }
+  | {
+      type: "localImage";
+      path: string;
+    }
+  | CodexSkillPromptBlock;
+
 export async function codexAppServerTurnInputFromPrompt(
-  prompt: AgentPromptInput,
+  prompt: CodexPromptInput,
   logger: Logger,
-): Promise<unknown[]> {
+): Promise<CodexAppServerUserInput[]> {
   if (typeof prompt === "string") {
-    return [{ type: "text", text: prompt }];
+    return [toCodexTextInput(prompt)];
   }
 
-  const blocks = prompt as Array<unknown>;
-  const output: unknown[] = [];
-  for (const block of blocks) {
-    if (!block || typeof block !== "object") {
-      output.push(block);
+  const output: CodexAppServerUserInput[] = [];
+  let previousTextBlock = false;
+  for (const block of prompt) {
+    if (block.type === "text") {
+      output.push(toCodexTextInput(block.text));
+      previousTextBlock = block.text.length > 0;
       continue;
     }
-    const record = block as { type?: unknown; mimeType?: unknown; data?: unknown };
-    if (
-      record.type === "image" &&
-      typeof record.mimeType === "string" &&
-      typeof record.data === "string"
-    ) {
+    if (block.type === "skill") {
+      output.push(block);
+      previousTextBlock = false;
+      continue;
+    }
+    if (block.type === "image") {
       try {
-        const filePath = await writeImageAttachment(record.mimeType, record.data);
+        const filePath = materializeProviderImage({
+          data: block.data,
+          mimeType: block.mimeType,
+        }).path;
         output.push({ type: "localImage", path: filePath });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         logger.warn({ message }, "Failed to write Codex image attachment");
         output.push({
-          type: "text",
-          text: `User attached image (failed to write temp file): ${message}`,
+          ...toCodexTextInput(`User attached image (failed to write temp file): ${message}`),
         });
       }
+      previousTextBlock = false;
       continue;
     }
-    output.push(block);
+    const attachmentText = renderPromptAttachmentAsText(block);
+    output.push(toCodexTextInput(previousTextBlock ? `\n\n${attachmentText}` : attachmentText));
+    previousTextBlock = true;
   }
   return output;
 }
 
-function buildCodexAppServerEnv(
+function toCodexTextInput(text: string): Extract<CodexAppServerUserInput, { type: "text" }> {
+  return {
+    type: "text",
+    text,
+    text_elements: [],
+  };
+}
+
+export function buildCodexAppServerEnv(
   runtimeSettings?: ProviderRuntimeSettings,
   launchEnv?: Record<string, string>,
-): Record<string, string | undefined> {
-  const env = applyProviderEnv(process.env, runtimeSettings);
-  if (!launchEnv) {
-    return env;
-  }
-  return {
-    ...env,
-    ...launchEnv,
-  };
+): NodeJS.ProcessEnv {
+  return createProviderEnv({
+    runtimeSettings,
+    overlays: [launchEnv],
+  });
 }
 
 function buildCodexAppServerInitializeParams(): {
@@ -2381,18 +2774,65 @@ function buildCodexAppServerInitializeParams(): {
   capabilities: { experimentalApi: true };
 } {
   return {
-    clientInfo: {
-      name: "paseo",
-      title: "Paseo",
-      version: "0.0.0",
-    },
+    clientInfo: CODEX_NON_ORIGINATING_APP_SERVER_CLIENT_INFO,
     capabilities: {
       experimentalApi: true,
     },
   };
 }
 
-class CodexAppServerAgentSession implements AgentSession {
+function normalizeOpenAICompatibleBaseUrl(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const withoutTrailingSlashes = trimmed.replace(/\/+$/u, "");
+  if (withoutTrailingSlashes.endsWith("/v1")) {
+    return withoutTrailingSlashes;
+  }
+  return `${withoutTrailingSlashes}/v1`;
+}
+
+function buildCodexCustomProviderConfig(
+  runtimeSettings: ProviderRuntimeSettings | undefined,
+  customProvider: CodexAppServerAgentDeps["customProvider"],
+): Record<string, unknown> | null {
+  if (customProvider?.extends !== CODEX_PROVIDER) {
+    return null;
+  }
+  const baseUrl = runtimeSettings?.env?.OPENAI_BASE_URL;
+  if (typeof baseUrl !== "string") {
+    return null;
+  }
+  const normalizedBaseUrl = normalizeOpenAICompatibleBaseUrl(baseUrl);
+  if (!normalizedBaseUrl) {
+    return null;
+  }
+  const providerConfig: Record<string, unknown> = {
+    name: customProvider.label,
+    base_url: normalizedBaseUrl,
+    wire_api: "responses",
+  };
+  if (runtimeSettings?.env?.OPENAI_API_KEY?.trim()) {
+    providerConfig.env_key = "OPENAI_API_KEY";
+    providerConfig.requires_openai_auth = false;
+  }
+  return {
+    model_provider: customProvider.id,
+    model_providers: {
+      [customProvider.id]: providerConfig,
+    },
+  };
+}
+
+interface CodexSubAgentCallState {
+  callId: string;
+  toolCall: ToolCallTimelineItem;
+  childItemOrder: string[];
+  childItems: Map<string, AgentTimelineItem>;
+}
+
+export class CodexAppServerAgentSession implements AgentSession {
   readonly provider = CODEX_PROVIDER;
   readonly capabilities = CODEX_APP_SERVER_CAPABILITIES;
 
@@ -2409,7 +2849,7 @@ class CodexAppServerAgentSession implements AgentSession {
   private serviceTier: "fast" | null = null;
   private planModeEnabled = false;
   private historyPending = false;
-  private persistedHistory: AgentTimelineItem[] = [];
+  private persistedHistory: PersistedTimelineEntry[] = [];
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
   private pendingPermissionHandlers = new Map<
     string,
@@ -2425,6 +2865,7 @@ class CodexAppServerAgentSession implements AgentSession {
   private pendingReasoning = new Map<string, string[]>();
   private pendingCommandOutputDeltas = new Map<string, string[]>();
   private pendingFileChangeOutputDeltas = new Map<string, string[]>();
+  private pendingAssistantMessageBoundary = false;
   private terminalCommandByProcessId = new Map<string, string>();
   private pendingUnlabeledTerminalInteractions = new Set<string>();
   private emittedTerminalInteractionKeys = new Set<string>();
@@ -2432,11 +2873,21 @@ class CodexAppServerAgentSession implements AgentSession {
   private emittedExecCommandCompletedCallIds = new Set<string>();
   private emittedItemStartedIds = new Set<string>();
   private emittedItemCompletedIds = new Set<string>();
+  private subAgentCallsByCallId = new Map<string, CodexSubAgentCallState>();
+  private subAgentCallIdByChildThreadId = new Map<string, string>();
   private warnedUnknownNotificationMethods = new Set<string>();
   private warnedInvalidNotificationPayloads = new Set<string>();
   private warnedIncompleteEditToolCallIds = new Set<string>();
   private latestUsage: AgentUsage | undefined;
   private latestPlanResult: { callId: string; text: string; turnId: string | null } | null = null;
+  private readonly userMessageTurnIndexes = new Map<string, number>();
+  private readonly userMessageTurnIds: string[] = [];
+  private pendingManualCompactionStarts = 0;
+  private compactionTriggerByItemId = new Map<string, "auto" | "manual">();
+  // Codex can report one completed compaction through both channels:
+  // `thread/compacted` and a completed `contextCompaction` item.
+  private unpairedCompactionNotificationCompletions = 0;
+  private unpairedCompactionItemCompletions = 0;
   private connected = false;
   private collaborationModes: Array<{
     name: string;
@@ -2457,8 +2908,17 @@ class CodexAppServerAgentSession implements AgentSession {
     private readonly resumeHandle: { sessionId: string; metadata?: Record<string, unknown> } | null,
     logger: Logger,
     private readonly spawnAppServer: () => Promise<ChildProcessWithoutNullStreams>,
+    private readonly deps: CodexAppServerAgentDeps = {},
+    private readonly ephemeral: boolean = false,
+    private readonly goalsEnabled: boolean = false,
+    private readonly autoReviewEnabled: boolean = false,
+    private readonly agentId?: string,
   ) {
-    this.logger = logger.child({ module: "agent", provider: CODEX_PROVIDER });
+    this.logger = logger.child({
+      module: "agent",
+      provider: CODEX_PROVIDER,
+      agentId: this.agentId,
+    });
     if (config.modeId === undefined) {
       throw new Error("Codex agent requires modeId to be specified");
     }
@@ -2466,7 +2926,7 @@ class CodexAppServerAgentSession implements AgentSession {
     this.currentMode = config.modeId;
     this.config = config;
     this.config.thinkingOptionId = normalizeCodexThinkingOptionId(this.config.thinkingOptionId);
-    if (this.config.featureValues?.fast_mode) {
+    if (this.config.featureValues?.fast_mode && codexModelSupportsFastMode(this.config.model)) {
       this.serviceTier = "fast";
     }
     if (this.config.featureValues?.plan_mode) {
@@ -2495,7 +2955,7 @@ class CodexAppServerAgentSession implements AgentSession {
   async connect(): Promise<void> {
     if (this.connected) return;
     const child = await this.spawnAppServer();
-    this.client = new CodexAppServerClient(child, this.logger);
+    this.client = new CodexAppServerClient(child, this.logger, () => this.traceContext());
     this.client.setNotificationHandler((method, params) => this.handleNotification(method, params));
     this.registerRequestHandlers();
 
@@ -2506,29 +2966,51 @@ class CodexAppServerAgentSession implements AgentSession {
     await this.loadSkills();
 
     if (this.currentThreadId) {
-      await this.loadPersistedHistory();
       await this.ensureThreadLoaded();
+      await this.loadPersistedHistory();
     }
 
     this.connected = true;
   }
 
+  private traceContext(): CodexAppServerTraceContext {
+    return {
+      agentId: this.agentId,
+      sessionId: this.currentThreadId ?? undefined,
+      turnId: this.activeForegroundTurnId ?? undefined,
+    };
+  }
+
   private async loadCollaborationModes(): Promise<void> {
     if (!this.client) return;
     try {
-      const response = (await this.client.request("collaborationMode/list", {})) as {
-        data?: Array<any>;
-      };
+      const response = toObjectRecord(await this.client.request("collaborationMode/list", {}));
       const data = Array.isArray(response?.data) ? response.data : [];
-      this.collaborationModes = data.map((entry) => ({
-        name: String(entry.name ?? ""),
-        mode: entry.mode ?? null,
-        model: entry.model ?? null,
-        reasoning_effort: entry.reasoning_effort ?? null,
-        developer_instructions: entry.developer_instructions ?? null,
-      }));
+      this.collaborationModes = data.map((entry) => {
+        const record = toObjectRecord(entry);
+        return {
+          name: typeof record?.name === "string" ? record.name : "",
+          mode: typeof record?.mode === "string" ? record.mode : null,
+          model: typeof record?.model === "string" ? record.model : null,
+          reasoning_effort:
+            typeof record?.reasoning_effort === "string" ? record.reasoning_effort : null,
+          developer_instructions:
+            typeof record?.developer_instructions === "string"
+              ? record.developer_instructions
+              : null,
+        };
+      });
     } catch (error) {
-      this.logger.trace({ error }, "Failed to load collaboration modes");
+      this.logger.trace(
+        {
+          agentId: this.agentId,
+          provider: CODEX_PROVIDER,
+          sessionId: this.currentThreadId,
+          turnId: this.activeForegroundTurnId ?? undefined,
+          error,
+        },
+        "provider.codex.metadata.collaboration_modes_failed",
+      );
       this.collaborationModes = [];
     }
     this.refreshResolvedCollaborationMode();
@@ -2537,25 +3019,41 @@ class CodexAppServerAgentSession implements AgentSession {
   private async loadSkills(): Promise<void> {
     if (!this.client) return;
     try {
-      const response = (await this.client.request("skills/list", {
-        cwd: [this.config.cwd],
-      })) as { data?: Array<any> };
+      const response = toObjectRecord(
+        await this.client.request("skills/list", {
+          cwd: [this.config.cwd],
+        }),
+      );
       const entries = Array.isArray(response?.data) ? response.data : [];
-      const skills: Array<{ name: string; description: string; path: string }> = [];
+      const skillsByName = new Map<string, { name: string; description: string; path: string }>();
       for (const entry of entries) {
-        const list = Array.isArray(entry.skills) ? entry.skills : [];
+        const entryRecord = toObjectRecord(entry);
+        const list = Array.isArray(entryRecord?.skills) ? entryRecord.skills : [];
         for (const skill of list) {
-          if (!skill?.name || !skill?.path) continue;
-          skills.push({
-            name: skill.name,
-            description: skill.description ?? skill.shortDescription ?? "Skill",
-            path: skill.path,
-          });
+          const skillRecord = toObjectRecord(skill);
+          if (typeof skillRecord?.name !== "string" || typeof skillRecord?.path !== "string")
+            continue;
+          if (!skillsByName.has(skillRecord.name)) {
+            skillsByName.set(skillRecord.name, {
+              name: skillRecord.name,
+              description: resolveSkillDescription(skillRecord),
+              path: skillRecord.path,
+            });
+          }
         }
       }
-      this.cachedSkills = skills;
+      this.cachedSkills = Array.from(skillsByName.values());
     } catch (error) {
-      this.logger.trace({ error }, "Failed to load skills list");
+      this.logger.trace(
+        {
+          agentId: this.agentId,
+          provider: CODEX_PROVIDER,
+          sessionId: this.currentThreadId,
+          turnId: this.activeForegroundTurnId ?? undefined,
+          error,
+        },
+        "provider.codex.metadata.skills_failed",
+      );
       this.cachedSkills = [];
     }
   }
@@ -2601,12 +3099,11 @@ class CodexAppServerAgentSession implements AgentSession {
     const settings: Record<string, unknown> = {};
     if (match.model) settings.model = match.model;
     if (match.reasoning_effort) settings.reasoning_effort = match.reasoning_effort;
-    const developerInstructions = [
-      match.developer_instructions?.trim(),
-      this.config.systemPrompt?.trim(),
-    ]
-      .filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
-      .join("\n\n");
+    const developerInstructions = composeSystemPromptParts(
+      match.developer_instructions,
+      this.config.systemPrompt,
+      this.config.daemonAppendSystemPrompt,
+    );
     if (developerInstructions) settings.developer_instructions = developerInstructions;
     if (this.config.model) settings.model = this.config.model;
     const thinkingOptionId = normalizeCodexThinkingOptionId(this.config.thinkingOptionId);
@@ -2620,7 +3117,7 @@ class CodexAppServerAgentSession implements AgentSession {
 
   private applyFeatureValue(featureId: "fast_mode" | "plan_mode", value: boolean): void {
     this.config.featureValues = {
-      ...(this.config.featureValues ?? {}),
+      ...this.config.featureValues,
       [featureId]: value,
     };
 
@@ -2674,7 +3171,7 @@ class CodexAppServerAgentSession implements AgentSession {
   }
 
   /**
-   * Prepare the session for plan implementation by disabling plan/fast mode
+   * Prepare the session for plan implementation by disabling plan mode
    * and returning the implementation prompt. The caller is responsible for
    * starting the turn through the normal streamAgent path.
    */
@@ -2683,7 +3180,6 @@ class CodexAppServerAgentSession implements AgentSession {
       typeof params.planText === "string" ? normalizePlanMarkdown(params.planText) : "";
 
     this.applyFeatureValue("plan_mode", false);
-    this.applyFeatureValue("fast_mode", false);
 
     return buildCodexPlanImplementationPrompt(planText);
   }
@@ -2708,63 +3204,43 @@ class CodexAppServerAgentSession implements AgentSession {
 
   private async loadPersistedHistory(): Promise<void> {
     if (!this.client || !this.currentThreadId) return;
-    try {
-      let rolloutTimeline: AgentTimelineItem[] = [];
-      try {
-        rolloutTimeline = await loadCodexPersistedTimeline(
-          this.currentThreadId,
-          undefined,
-          this.logger,
-        );
-      } catch {
-        rolloutTimeline = [];
-      }
+    const client = this.client;
+    const threadId = this.currentThreadId;
 
-      const response = (await this.client.request("thread/read", {
-        threadId: this.currentThreadId,
-        includeTurns: true,
-      })) as { thread?: { turns?: Array<{ items?: any[] }> } };
-      const thread = response?.thread;
-      const threadTimeline: AgentTimelineItem[] = [];
-      if (thread && Array.isArray(thread.turns)) {
-        for (const turn of thread.turns) {
-          const items = Array.isArray(turn.items) ? turn.items : [];
-          for (const item of items) {
-            const timelineItem = threadItemToTimeline(item, {
-              cwd: this.config.cwd ?? null,
-            });
-            if (timelineItem) {
-              if (timelineItem.type === "tool_call") {
-                this.warnOnIncompleteEditToolCall(timelineItem, "thread_read", item);
-              }
-              threadTimeline.push(timelineItem);
-            }
-          }
-        }
+    const timeline = await loadCodexThreadHistoryTimeline({
+      threadId,
+      cwd: this.config.cwd ?? null,
+      requestThread: (threadIdToRead) => {
+        return readCodexThread(client, threadIdToRead);
+      },
+    });
+    this.resetCodexUserMessageTurns();
+    for (const entry of timeline) {
+      if (entry.item.type === "user_message") {
+        this.rememberCodexUserMessageTurn(entry.item.messageId);
       }
-
-      const timeline = rolloutTimeline.length > 0 ? rolloutTimeline : threadTimeline;
-
-      if (timeline.length > 0) {
-        this.persistedHistory = timeline;
-        this.historyPending = true;
-      }
-    } catch (error) {
-      this.logger.warn({ error }, "Failed to load Codex thread history");
+    }
+    if (timeline.length > 0) {
+      this.persistedHistory = timeline;
+      this.historyPending = true;
     }
   }
 
   private async ensureThreadLoaded(): Promise<void> {
     if (!this.client || !this.currentThreadId) return;
     try {
-      const loaded = (await this.client.request("thread/loaded/list", {})) as { data?: string[] };
+      const loaded = toObjectRecord(await this.client.request("thread/loaded/list", {}));
       const ids = Array.isArray(loaded?.data) ? loaded.data : [];
       if (ids.includes(this.currentThreadId)) {
         return;
       }
       const params: Record<string, unknown> = { threadId: this.currentThreadId };
-      if (this.config.systemPrompt?.trim()) {
-        params.developerInstructions = this.config.systemPrompt.trim();
+      const developerInstructions = composeSystemPromptParts(
+        this.config.systemPrompt,
+        this.config.daemonAppendSystemPrompt,
+      );
+      if (developerInstructions) {
+        params.developerInstructions = developerInstructions;
       }
       const codexConfig = this.buildCodexInnerConfig();
       if (codexConfig) {
@@ -2772,9 +3248,10 @@ class CodexAppServerAgentSession implements AgentSession {
       }
       await this.client.request("thread/resume", params);
     } catch (error) {
-      this.logger.warn({ error }, "Failed to resume Codex thread, starting new thread");
-      this.currentThreadId = null;
-      await this.ensureThread();
+      const threadId = this.currentThreadId;
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn({ error, threadId }, "Failed to resume persisted Codex thread");
+      throw new Error(`Failed to resume Codex thread ${threadId}: ${message}`, { cause: error });
     }
   }
 
@@ -2820,7 +3297,7 @@ class CodexAppServerAgentSession implements AgentSession {
   private async buildCommandPromptInput(
     commandName: string,
     args?: string,
-  ): Promise<AgentPromptInput> {
+  ): Promise<CodexPromptInput> {
     if (commandName.startsWith("prompts:")) {
       const promptName = commandName.slice("prompts:".length);
       const codexHome = resolveCodexHomeDir();
@@ -2837,96 +3314,147 @@ class CodexAppServerAgentSession implements AgentSession {
     }
     const skill = this.cachedSkills.find((entry) => entry.name === commandName);
     if (skill) {
-      const input = [
+      const trimmedArgs = args?.trim() ?? "";
+      const text = trimmedArgs ? `$${skill.name} ${trimmedArgs}` : `$${skill.name}`;
+      const input: CodexPromptContentBlock[] = [
         { type: "skill", name: skill.name, path: skill.path },
-      ] as unknown as AgentPromptContentBlock[];
-      if (args && args.trim().length > 0) {
-        input.push({ type: "text", text: args.trim() });
-      } else {
-        input.push({ type: "text", text: `$${skill.name}` });
-      }
+        { type: "text", text },
+      ];
       return input;
     }
 
     return args ? `$${commandName} ${args}` : `$${commandName}`;
   }
 
-  async run(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<AgentRunResult> {
-    const timeline: AgentTimelineItem[] = [];
-    let finalText = "";
-    let usage: AgentUsage | undefined;
-    let turnId: string | null = null;
-    const bufferedEvents: AgentStreamEvent[] = [];
-    let settled = false;
-    let resolveCompletion!: () => void;
-    let rejectCompletion!: (error: Error) => void;
+  private async buildTurnStartParams(
+    prompt: CodexPromptInput,
+    options?: AgentRunOptions,
+  ): Promise<{
+    params: Record<string, unknown>;
+    thinkingOptionId?: string;
+    approvalPolicy: string;
+    sandboxPolicyType: string;
+    hasOutputSchema: boolean;
+    hasDeveloperInstructions: boolean;
+    hasCodexConfig: boolean;
+  }> {
+    const input = await this.buildUserInput(prompt);
+    const preset = MODE_PRESETS[this.currentMode] ?? MODE_PRESETS[DEFAULT_CODEX_MODE_ID];
+    const approvalPolicy = this.config.approvalPolicy ?? preset.approvalPolicy;
+    const sandboxPolicyType = this.config.sandboxMode ?? preset.sandbox;
 
-    const processEvent = (event: AgentStreamEvent) => {
-      if (settled) {
-        return;
-      }
-      const eventTurnId = (event as { turnId?: string }).turnId;
-      if (turnId && eventTurnId && eventTurnId !== turnId) {
-        return;
-      }
-      if (event.type === "timeline") {
-        timeline.push(event.item);
-        if (event.item.type === "assistant_message") {
-          finalText = event.item.text;
-        } else if (event.item.type === "tool_call" && event.item.detail.type === "plan") {
-          finalText = event.item.detail.text;
-        }
-        return;
-      }
-      if (event.type === "turn_completed") {
-        usage = event.usage;
-        settled = true;
-        resolveCompletion();
-        return;
-      }
-      if (event.type === "turn_failed") {
-        settled = true;
-        rejectCompletion(new Error(event.error));
-        return;
-      }
-      if (event.type === "turn_canceled") {
-        settled = true;
-        resolveCompletion();
-      }
+    const params: Record<string, unknown> = {
+      threadId: this.currentThreadId,
+      input,
+      approvalPolicy,
+      sandboxPolicy: toSandboxPolicy(
+        sandboxPolicyType,
+        typeof this.config.networkAccess === "boolean"
+          ? this.config.networkAccess
+          : preset.networkAccess,
+      ),
     };
+    applyApprovalsReviewerParam(params, preset);
 
-    const completion = new Promise<void>((resolve, reject) => {
-      resolveCompletion = resolve;
-      rejectCompletion = reject;
-    });
-    const unsubscribe = this.subscribe((event) => {
-      if (!turnId) {
-        bufferedEvents.push(event);
-        return;
-      }
-      processEvent(event);
-    });
-
-    try {
-      const result = await this.startTurn(prompt, options);
-      turnId = result.turnId;
-      for (const event of bufferedEvents) {
-        processEvent(event);
-      }
-      if (!settled) {
-        await completion;
-      }
-    } finally {
-      unsubscribe();
+    if (this.config.model) {
+      params.model = this.config.model;
+    }
+    const thinkingOptionId = normalizeCodexThinkingOptionId(this.config.thinkingOptionId);
+    if (thinkingOptionId) {
+      params.effort = thinkingOptionId;
+    }
+    if (this.serviceTier) {
+      params.serviceTier = this.serviceTier;
+    }
+    if (this.resolvedCollaborationMode) {
+      params.collaborationMode = {
+        mode: this.resolvedCollaborationMode.mode,
+        settings: this.resolvedCollaborationMode.settings,
+      };
+    }
+    if (this.config.cwd) {
+      params.cwd = this.config.cwd;
+    }
+    if (options?.outputSchema) {
+      params.outputSchema = normalizeCodexOutputSchema(options.outputSchema);
+    }
+    const developerInstructions = composeSystemPromptParts(
+      this.config.systemPrompt,
+      this.config.daemonAppendSystemPrompt,
+    );
+    if (developerInstructions) {
+      params.developerInstructions = developerInstructions;
+    }
+    const codexConfig = this.buildCodexInnerConfig();
+    if (codexConfig) {
+      params.config = codexConfig;
     }
 
-    const info = await this.getRuntimeInfo();
     return {
-      sessionId: info.sessionId ?? "",
-      finalText,
-      usage,
-      timeline,
+      params,
+      thinkingOptionId,
+      approvalPolicy,
+      sandboxPolicyType,
+      hasOutputSchema: Boolean(options?.outputSchema),
+      hasDeveloperInstructions: Boolean(developerInstructions),
+      hasCodexConfig: Boolean(codexConfig),
     };
+  }
+
+  private logTurnStartSummary({
+    turnId,
+    thinkingOptionId,
+    approvalPolicy,
+    sandboxPolicyType,
+    hasOutputSchema,
+    hasDeveloperInstructions,
+    hasCodexConfig,
+  }: {
+    turnId: string;
+    thinkingOptionId?: string;
+    approvalPolicy: string;
+    sandboxPolicyType: string;
+    hasOutputSchema: boolean;
+    hasDeveloperInstructions: boolean;
+    hasCodexConfig: boolean;
+  }): void {
+    this.logger.info(
+      {
+        turnId,
+        threadId: this.currentThreadId,
+        model: this.config.model ?? null,
+        modeId: this.currentMode ?? null,
+        effort: thinkingOptionId ?? null,
+        serviceTier: this.serviceTier,
+        cwd: this.config.cwd ?? null,
+        approvalPolicy,
+        sandboxPolicyType,
+        hasCollaborationMode: Boolean(this.resolvedCollaborationMode),
+        hasOutputSchema,
+        hasDeveloperInstructions,
+        hasCodexConfig,
+      },
+      "Starting Codex app-server turn",
+    );
+  }
+
+  async run(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<AgentRunResult> {
+    return runProviderTurn({
+      prompt,
+      runOptions: options,
+      startTurn: (p, o) => this.startTurn(p, o),
+      subscribe: (callback) => this.subscribe(callback),
+      getSessionId: async () => (await this.getRuntimeInfo()).sessionId ?? "",
+      reduceFinalText: ({ current, item }) => {
+        if (item.type === "assistant_message") {
+          return item.text;
+        }
+        if (item.type === "tool_call" && item.detail.type === "plan") {
+          return item.detail.text;
+        }
+        return current;
+      },
+    });
   }
 
   async startTurn(
@@ -2953,64 +3481,63 @@ class CodexAppServerAgentSession implements AgentSession {
       await this.ensureThread();
     }
 
-    const input = await this.buildUserInput(effectivePrompt);
-    const preset = MODE_PRESETS[this.currentMode] ?? MODE_PRESETS[DEFAULT_CODEX_MODE_ID];
-    const approvalPolicy = this.config.approvalPolicy ?? preset.approvalPolicy;
-    const sandboxPolicyType = this.config.sandboxMode ?? preset.sandbox;
-
-    const params: Record<string, unknown> = {
-      threadId: this.currentThreadId,
-      input,
-      approvalPolicy,
-      sandboxPolicy: toSandboxPolicy(
-        sandboxPolicyType,
-        typeof this.config.networkAccess === "boolean"
-          ? this.config.networkAccess
-          : preset.networkAccess,
-      ),
-    };
-
-    if (this.config.model) {
-      params.model = this.config.model;
-    }
-    const thinkingOptionId = normalizeCodexThinkingOptionId(this.config.thinkingOptionId);
-    if (thinkingOptionId) {
-      params.effort = thinkingOptionId;
-    }
-    if (this.serviceTier) {
-      params.serviceTier = this.serviceTier;
-    }
-    if (this.resolvedCollaborationMode) {
-      params.collaborationMode = {
-        mode: this.resolvedCollaborationMode.mode,
-        settings: this.resolvedCollaborationMode.settings,
-      };
-    }
-    if (this.config.cwd) {
-      params.cwd = this.config.cwd;
-    }
-    if (options?.outputSchema) {
-      params.outputSchema = normalizeCodexOutputSchema(options.outputSchema);
-    }
-    if (this.config.systemPrompt?.trim()) {
-      params.developerInstructions = this.config.systemPrompt.trim();
-    }
-    const codexConfig = this.buildCodexInnerConfig();
-    if (codexConfig) {
-      params.config = codexConfig;
-    }
+    const turnStart = await this.buildTurnStartParams(effectivePrompt, options);
 
     const turnId = this.createTurnId();
     this.activeForegroundTurnId = turnId;
 
     try {
-      await this.client.request("turn/start", params, TURN_START_TIMEOUT_MS);
+      this.logTurnStartSummary({
+        turnId,
+        thinkingOptionId: turnStart.thinkingOptionId,
+        approvalPolicy: turnStart.approvalPolicy,
+        sandboxPolicyType: turnStart.sandboxPolicyType,
+        hasOutputSchema: turnStart.hasOutputSchema,
+        hasDeveloperInstructions: turnStart.hasDeveloperInstructions,
+        hasCodexConfig: turnStart.hasCodexConfig,
+      });
+      await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
     } catch (error) {
       this.activeForegroundTurnId = null;
       throw error;
     }
 
     return { turnId };
+  }
+
+  private rememberCodexUserMessageTurn(messageId: string | null | undefined): boolean {
+    if (typeof messageId !== "string" || messageId.length === 0) {
+      return false;
+    }
+    if (this.userMessageTurnIndexes.has(messageId)) {
+      return false;
+    }
+    this.userMessageTurnIndexes.set(messageId, this.userMessageTurnIds.length);
+    this.userMessageTurnIds.push(messageId);
+    return true;
+  }
+
+  private resetCodexUserMessageTurns(): void {
+    this.userMessageTurnIndexes.clear();
+    this.userMessageTurnIds.length = 0;
+  }
+
+  private truncateCodexUserMessageTurns(numTurns: number): void {
+    if (numTurns <= 0) {
+      return;
+    }
+    this.userMessageTurnIds.length = Math.max(0, this.userMessageTurnIds.length - numTurns);
+    this.userMessageTurnIndexes.clear();
+    this.userMessageTurnIds.forEach((messageId, index) => {
+      this.userMessageTurnIndexes.set(messageId, index);
+    });
+  }
+
+  private codexUserMessageTurns(): CodexUserMessageTurnIndex {
+    return {
+      resolve: (messageId) => this.userMessageTurnIndexes.get(messageId) ?? null,
+      count: () => this.userMessageTurnIds.length,
+    };
   }
 
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
@@ -3027,8 +3554,13 @@ class CodexAppServerAgentSession implements AgentSession {
     const history = this.persistedHistory;
     this.persistedHistory = [];
     this.historyPending = false;
-    for (const item of history) {
-      yield { type: "timeline", provider: CODEX_PROVIDER, item };
+    for (const entry of history) {
+      yield {
+        type: "timeline",
+        provider: CODEX_PROVIDER,
+        item: entry.item,
+        timestamp: entry.timestamp,
+      };
     }
   }
 
@@ -3055,17 +3587,23 @@ class CodexAppServerAgentSession implements AgentSession {
   }
 
   async getAvailableModes(): Promise<AgentMode[]> {
-    return CODEX_MODES;
+    if (this.autoReviewEnabled) {
+      return CODEX_MODES;
+    }
+    return CODEX_MODES.filter((mode) => mode.id !== "auto-review");
   }
 
   async getCurrentMode(): Promise<string | null> {
     return this.currentMode ?? null;
   }
 
-  async setMode(modeId: string): Promise<void> {
+  async setMode(modeId: string): Promise<void | AgentProviderNotice> {
     validateCodexMode(modeId);
     this.currentMode = modeId;
     this.cachedRuntimeInfo = null;
+    if (this.activeForegroundTurnId) {
+      return SETTING_APPLIES_NEXT_TURN_NOTICE;
+    }
   }
 
   async setModel(modelId: string | null): Promise<void> {
@@ -3077,14 +3615,22 @@ class CodexAppServerAgentSession implements AgentSession {
     this.cachedRuntimeInfo = null;
   }
 
-  async setThinkingOption(thinkingOptionId: string | null): Promise<void> {
+  async setThinkingOption(thinkingOptionId: string | null): Promise<void | AgentProviderNotice> {
     this.config.thinkingOptionId = normalizeCodexThinkingOptionId(thinkingOptionId);
     this.refreshResolvedCollaborationMode();
     this.cachedRuntimeInfo = null;
+    if (this.activeForegroundTurnId) {
+      return SETTING_APPLIES_NEXT_TURN_NOTICE;
+    }
   }
 
   async setFeature(featureId: string, value: unknown): Promise<void> {
     if (featureId === "fast_mode") {
+      if (Boolean(value) && !codexModelSupportsFastMode(this.config.model)) {
+        throw new Error(
+          `Codex fast mode is not available for model '${this.config.model ?? "default"}'`,
+        );
+      }
       this.applyFeatureValue("fast_mode", Boolean(value));
       return;
     }
@@ -3110,26 +3656,7 @@ class CodexAppServerAgentSession implements AgentSession {
     const pendingRequest = this.pendingPermissions.get(requestId) ?? null;
 
     if (pending.kind === "plan") {
-      let followUpPrompt: string | undefined;
-      if (response.behavior === "allow") {
-        followUpPrompt = this.preparePlanImplementation({
-          planText: pending.planText ?? pendingRequest?.metadata?.planText,
-        });
-      }
-
-      this.pendingPermissionHandlers.delete(requestId);
-      this.pendingPermissions.delete(requestId);
-      this.resolvedPermissionRequests.add(requestId);
-      this.emitEvent({
-        type: "permission_resolved",
-        provider: CODEX_PROVIDER,
-        requestId,
-        resolution: response,
-      });
-      if (followUpPrompt) {
-        return { followUpPrompt };
-      }
-      return;
+      return this.handlePlanPermissionResponse({ requestId, response, pending, pendingRequest });
     }
 
     this.pendingPermissionHandlers.delete(requestId);
@@ -3137,32 +3664,7 @@ class CodexAppServerAgentSession implements AgentSession {
     this.resolvedPermissionRequests.add(requestId);
 
     if (response.behavior === "deny" && pendingRequest?.kind === "tool") {
-      const fallbackName =
-        pendingRequest.name === "CodexBash"
-          ? "shell"
-          : pendingRequest.name === "CodexFileChange"
-            ? "apply_patch"
-            : pendingRequest.name;
-      this.emitEvent({
-        type: "timeline",
-        provider: CODEX_PROVIDER,
-        item: {
-          type: "tool_call",
-          callId: requestId,
-          name: fallbackName,
-          status: "failed",
-          error: { message: response.message ?? "Permission denied" },
-          detail: pendingRequest.detail ?? {
-            type: "unknown",
-            input: pendingRequest.input ?? null,
-            output: null,
-          },
-          metadata: {
-            permissionRequestId: requestId,
-            denied: true,
-          },
-        },
-      });
+      this.emitDeniedToolCallTimelineEvent({ requestId, response, pendingRequest });
     }
 
     this.emitEvent({
@@ -3173,16 +3675,12 @@ class CodexAppServerAgentSession implements AgentSession {
     });
 
     if (pending.kind === "command") {
-      const decision =
-        response.behavior === "allow" ? "accept" : response.interrupt ? "cancel" : "decline";
-      pending.resolve({ decision });
+      pending.resolve({ decision: resolvePermissionDecision(response) });
       return;
     }
 
     if (pending.kind === "file") {
-      const decision =
-        response.behavior === "allow" ? "accept" : response.interrupt ? "cancel" : "decline";
-      pending.resolve({ decision });
+      pending.resolve({ decision: resolvePermissionDecision(response) });
       return;
     }
 
@@ -3235,6 +3733,75 @@ class CodexAppServerAgentSession implements AgentSession {
     pending.resolve({ answers: {} });
   }
 
+  private handlePlanPermissionResponse(params: {
+    requestId: string;
+    response: AgentPermissionResponse;
+    pending: {
+      resolve: (value: unknown) => void;
+      kind: "command" | "file" | "question" | "plan";
+      questions?: CodexQuestionPrompt[];
+      planText?: string;
+    };
+    pendingRequest: AgentPermissionRequest | null;
+  }): AgentPermissionResult | void {
+    const { requestId, response, pending, pendingRequest } = params;
+    let followUpPrompt: string | undefined;
+    if (response.behavior === "allow") {
+      followUpPrompt = this.preparePlanImplementation({
+        planText: pending.planText ?? pendingRequest?.metadata?.planText,
+      });
+    }
+
+    this.pendingPermissionHandlers.delete(requestId);
+    this.pendingPermissions.delete(requestId);
+    this.resolvedPermissionRequests.add(requestId);
+    this.emitEvent({
+      type: "permission_resolved",
+      provider: CODEX_PROVIDER,
+      requestId,
+      resolution: response,
+    });
+    if (followUpPrompt) {
+      return { followUpPrompt };
+    }
+  }
+
+  private emitDeniedToolCallTimelineEvent(params: {
+    requestId: string;
+    response: Extract<AgentPermissionResponse, { behavior: "deny" }>;
+    pendingRequest: AgentPermissionRequest;
+  }): void {
+    const { requestId, response, pendingRequest } = params;
+    let fallbackName: string;
+    if (pendingRequest.name === "CodexBash") {
+      fallbackName = "shell";
+    } else if (pendingRequest.name === "CodexFileChange") {
+      fallbackName = "apply_patch";
+    } else {
+      fallbackName = pendingRequest.name;
+    }
+    this.emitEvent({
+      type: "timeline",
+      provider: CODEX_PROVIDER,
+      item: {
+        type: "tool_call",
+        callId: requestId,
+        name: fallbackName,
+        status: "failed",
+        error: { message: response.message ?? "Permission denied" },
+        detail: pendingRequest.detail ?? {
+          type: "unknown",
+          input: pendingRequest.input ?? null,
+          output: null,
+        },
+        metadata: {
+          permissionRequestId: requestId,
+          denied: true,
+        },
+      },
+    });
+  }
+
   describePersistence(): {
     provider: typeof CODEX_PROVIDER;
     sessionId: string;
@@ -3262,13 +3829,46 @@ class CodexAppServerAgentSession implements AgentSession {
     };
   }
 
+  async revertConversation(input: { messageId: string }): Promise<void> {
+    await this.connect();
+    if (!this.client) {
+      throw new Error("Codex client is not initialized");
+    }
+    if (this.currentThreadId) {
+      await this.ensureThreadLoaded();
+    } else {
+      await this.ensureThread();
+    }
+
+    await revertCodexConversation({
+      client: this.client,
+      threadId: this.currentThreadId,
+      messageId: input.messageId,
+      cwd: this.config.cwd ?? null,
+      model: this.config.model ?? null,
+      serviceTier: this.serviceTier,
+      userMessageTurns: this.codexUserMessageTurns(),
+      setThreadId: async (threadId) => {
+        this.currentThreadId = threadId;
+        this.cachedRuntimeInfo = null;
+        this.persistedHistory = [];
+        this.historyPending = false;
+        await this.loadPersistedHistory();
+      },
+    });
+  }
+
   async interrupt(): Promise<void> {
     if (!this.client || !this.currentThreadId || !this.currentTurnId) return;
     try {
-      await this.client.request("turn/interrupt", {
-        threadId: this.currentThreadId,
-        turnId: this.currentTurnId,
-      });
+      await this.client.request(
+        "turn/interrupt",
+        {
+          threadId: this.currentThreadId,
+          turnId: this.currentTurnId,
+        },
+        INTERRUPT_TIMEOUT_MS,
+      );
     } catch (error) {
       this.logger.warn({ error }, "Failed to interrupt Codex turn");
     }
@@ -3303,19 +3903,154 @@ class CodexAppServerAgentSession implements AgentSession {
       name: skill.name,
       description: skill.description,
       argumentHint: "",
+      kind: "skill" as const,
     }));
     const fallbackSkills =
-      appServerSkills.length === 0 ? await listCodexSkills(this.config.cwd) : [];
-    return [...appServerSkills, ...fallbackSkills, ...prompts].sort((a, b) =>
+      appServerSkills.length === 0
+        ? await listCodexSkills(this.config.cwd, this.deps.workspaceGitService)
+        : [];
+    const builtin: AgentSlashCommand[] = [
+      {
+        name: "compact",
+        description: "Summarize conversation to prevent hitting the context limit",
+        argumentHint: "",
+        kind: "command",
+      },
+    ];
+    if (this.goalsEnabled) {
+      builtin.push({
+        name: "goal",
+        description: "Set, pause, resume, or clear the agent's goal",
+        argumentHint: "[<objective>|pause|resume|clear]",
+        kind: "command",
+      });
+    }
+    return [...builtin, ...appServerSkills, ...fallbackSkills, ...prompts].sort((a, b) =>
       a.name.localeCompare(b.name),
     );
   }
 
-  private async ensureThread(): Promise<void> {
-    if (!this.client) return;
-    if (this.currentThreadId) return;
+  tryHandleOutOfBand(
+    prompt: AgentPromptInput,
+  ): { run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void> } | null {
+    if (typeof prompt !== "string") return null;
+    const parsed = this.parseSlashCommandInput(prompt);
+    if (!parsed) return null;
 
-    // Resolve model + thinking defaults when omitted.
+    if (parsed.commandName === "compact") {
+      return {
+        run: async ({ emit }) => {
+          const error = await this.executeCompactCommand();
+          if (error) {
+            emit({
+              type: "timeline",
+              provider: CODEX_PROVIDER,
+              item: { type: "assistant_message", text: formatOutOfBandStatusMessage(error) },
+            });
+          }
+        },
+      };
+    }
+
+    if (!this.goalsEnabled || parsed.commandName !== "goal") return null;
+
+    const subcommand = parseGoalSubcommand(parsed.args);
+    return {
+      run: async ({ emit }) => {
+        const text = formatOutOfBandStatusMessage(await this.executeGoalSubcommand(subcommand));
+        emit({
+          type: "timeline",
+          provider: CODEX_PROVIDER,
+          item: { type: "assistant_message", text },
+        });
+      },
+    };
+  }
+
+  private async executeCompactCommand(): Promise<string | null> {
+    try {
+      await this.connect();
+      if (this.currentThreadId) {
+        await this.ensureThreadLoaded();
+      } else {
+        await this.ensureThread();
+      }
+      if (!this.client || !this.currentThreadId) {
+        throw new Error("Codex thread is not available");
+      }
+      this.pendingManualCompactionStarts += 1;
+      try {
+        await this.client.request("thread/compact/start", {
+          threadId: this.currentThreadId,
+        });
+      } catch (error) {
+        this.pendingManualCompactionStarts = Math.max(0, this.pendingManualCompactionStarts - 1);
+        throw error;
+      }
+      return null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown error";
+      return `Failed to compact context: ${message}`;
+    }
+  }
+
+  private async executeGoalSubcommand(subcommand: GoalSubcommand): Promise<string> {
+    if (subcommand.kind === "usage") {
+      return "Usage: /goal <objective>|pause|resume|clear";
+    }
+    try {
+      await this.connect();
+      if (this.currentThreadId) {
+        await this.ensureThreadLoaded();
+      } else {
+        await this.ensureThread();
+      }
+      if (!this.client || !this.currentThreadId) {
+        throw new Error("Codex thread is not available");
+      }
+      switch (subcommand.kind) {
+        case "set": {
+          await this.client.request("thread/goal/set", {
+            threadId: this.currentThreadId,
+            objective: subcommand.objective,
+            status: "active",
+          });
+          return `Goal set: ${subcommand.objective}`;
+        }
+        case "pause": {
+          await this.client.request("thread/goal/set", {
+            threadId: this.currentThreadId,
+            status: "paused",
+          });
+          return "Goal paused.";
+        }
+        case "resume": {
+          await this.client.request("thread/goal/set", {
+            threadId: this.currentThreadId,
+            status: "active",
+          });
+          return "Goal resumed.";
+        }
+        case "clear": {
+          await this.client.request("thread/goal/clear", {
+            threadId: this.currentThreadId,
+          });
+          return "Goal cleared.";
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown error";
+      return `Failed to update goal: ${message}`;
+    }
+  }
+
+  private async resolveModelAndThinking(): Promise<{
+    model: string;
+    thinkingOptionId: string | undefined;
+  }> {
+    if (!this.client) {
+      throw new Error("Codex client is not initialized");
+    }
     let configuredDefaults: CodexConfiguredDefaults = {};
     let model = this.config.model;
     let thinkingOptionId = normalizeCodexThinkingOptionId(this.config.thinkingOptionId);
@@ -3330,8 +4065,21 @@ class CodexAppServerAgentSession implements AgentSession {
     }
 
     if (!model || !thinkingOptionId) {
-      const modelResponse = (await this.client.request("model/list", {})) as CodexModelListResponse;
-      const models = modelResponse?.data ?? [];
+      const modelResponse = toObjectRecord(await this.client.request("model/list", {}));
+      const modelData = Array.isArray(modelResponse?.data) ? modelResponse.data : [];
+      const models = modelData
+        .map((m) => {
+          const record = toObjectRecord(m);
+          return {
+            id: typeof record?.id === "string" ? record.id : "",
+            isDefault: !!record?.isDefault,
+            defaultReasoningEffort:
+              typeof record?.defaultReasoningEffort === "string"
+                ? record.defaultReasoningEffort
+                : undefined,
+          };
+        })
+        .filter((m) => m.id);
       const defaultModel = models.find((m) => m.isDefault) ?? models[0];
       if (!defaultModel) {
         throw new Error("No models available from Codex app-server");
@@ -3346,6 +4094,17 @@ class CodexAppServerAgentSession implements AgentSession {
       }
     }
 
+    if (!model) {
+      throw new Error("Unable to resolve Codex model");
+    }
+    return { model, thinkingOptionId };
+  }
+
+  private async ensureThread(): Promise<void> {
+    if (!this.client) return;
+    if (this.currentThreadId) return;
+
+    const { model, thinkingOptionId } = await this.resolveModelAndThinking();
     this.config.model = model;
     this.config.thinkingOptionId = thinkingOptionId;
 
@@ -3353,19 +4112,38 @@ class CodexAppServerAgentSession implements AgentSession {
     const approvalPolicy = this.config.approvalPolicy ?? preset.approvalPolicy;
     const sandbox = this.config.sandboxMode ?? preset.sandbox;
     const innerConfig = this.buildCodexInnerConfig();
-    const response = (await this.client.request("thread/start", {
+    const developerInstructions = composeSystemPromptParts(
+      this.config.systemPrompt,
+      this.config.daemonAppendSystemPrompt,
+    );
+    const params: Record<string, unknown> = {
       model,
       cwd: this.config.cwd ?? null,
       approvalPolicy,
       sandbox,
-      ...(this.config.systemPrompt?.trim()
-        ? { developerInstructions: this.config.systemPrompt.trim() }
-        : {}),
+      ...(developerInstructions ? { developerInstructions } : {}),
       ...(innerConfig ? { config: innerConfig } : {}),
-    })) as CodexThreadStartResponse;
-    const threadId = response?.thread?.id;
+      ...(this.ephemeral ? { ephemeral: true } : {}),
+    };
+    applyApprovalsReviewerParam(params, preset);
+    const rawResponse = await this.client.request("thread/start", params);
+    const response = toObjectRecord(rawResponse);
+    const threadRecord = toObjectRecord(response?.thread);
+    const threadId = typeof threadRecord?.id === "string" ? threadRecord.id : undefined;
     if (!threadId) {
       throw new Error("Codex app-server did not return thread id");
+    }
+    const responseApprovalsReviewer =
+      typeof response?.approvalsReviewer === "string" ? response.approvalsReviewer : undefined;
+    if (
+      shouldPromoteThreadResponseToAutoReview({
+        approvalsReviewer: responseApprovalsReviewer,
+        approvalPolicy,
+        sandbox,
+      })
+    ) {
+      this.currentMode = "auto-review";
+      this.cachedRuntimeInfo = null;
     }
     this.currentThreadId = threadId;
   }
@@ -3382,29 +4160,36 @@ class CodexAppServerAgentSession implements AgentSession {
     if (this.config.extra?.codex) {
       Object.assign(innerConfig, this.config.extra.codex);
     }
+    if (this.deps.customCodexConfig) {
+      Object.assign(innerConfig, this.deps.customCodexConfig);
+    }
     return Object.keys(innerConfig).length > 0 ? innerConfig : null;
   }
 
-  private async buildUserInput(prompt: AgentPromptInput): Promise<unknown[]> {
+  private async buildUserInput(prompt: CodexPromptInput): Promise<CodexAppServerUserInput[]> {
     if (typeof prompt === "string") {
-      return [{ type: "text", text: prompt }];
+      return [toCodexTextInput(prompt)];
     }
-    const blocks = prompt as AgentPromptContentBlock[];
-    return await codexAppServerTurnInputFromPrompt(blocks, this.logger);
+    return await codexAppServerTurnInputFromPrompt(prompt, this.logger);
   }
 
   private emitEvent(event: AgentStreamEvent): void {
-    if (event.type === "timeline") {
-      if (event.item.type === "assistant_message") {
-        this.pendingAgentMessages.clear();
-      }
-    }
     this.notifySubscribers(event);
   }
 
   private notifySubscribers(event: AgentStreamEvent): void {
     const turnId = this.activeForegroundTurnId;
     const tagged = turnId ? { ...event, turnId } : event;
+    this.logger.trace(
+      {
+        agentId: this.agentId,
+        provider: CODEX_PROVIDER,
+        sessionId: this.currentThreadId,
+        turnId: getAgentStreamEventTurnId(tagged),
+        event: tagged,
+      },
+      "provider.codex.event_emit",
+    );
     for (const callback of this.subscribers) {
       try {
         callback(tagged);
@@ -3420,329 +4205,810 @@ class CodexAppServerAgentSession implements AgentSession {
 
   private handleNotification(method: string, params: unknown): void {
     const parsed = CodexNotificationSchema.parse({ method, params });
+    this.traceParsedNotification(method, params, parsed);
+    if (isCodexDeltaNotification(parsed)) {
+      this.handleCodexDeltaNotification(parsed);
+      return;
+    }
+    if (this.handleThreadStateNotification(parsed)) {
+      return;
+    }
+    switch (parsed.kind) {
+      case "thread_started":
+        this.handleThreadStartedNotification(parsed);
+        return;
+      case "turn_started":
+        this.handleTurnStartedNotification(parsed);
+        return;
+      case "turn_completed":
+        this.handleTurnCompletedNotification(parsed);
+        return;
+      case "plan_updated":
+        this.handlePlanUpdatedNotification(parsed);
+        return;
+      case "diff_updated":
+        // NOTE: Codex app-server emits frequent `turn/diff/updated` notifications
+        // containing a full accumulated unified diff for the *entire turn*.
+        // This is not a concrete file-change tool call; it is progress telemetry.
+        return;
+      case "token_usage_updated":
+        this.handleTokenUsageUpdatedNotification(parsed);
+        return;
+      case "exec_command_started":
+        this.handleExecCommandStartedNotification(parsed);
+        return;
+      case "exec_command_completed":
+        this.handleExecCommandCompletedNotification(parsed);
+        return;
+      case "terminal_interaction":
+        this.handleTerminalInteractionNotification(parsed);
+        return;
+      case "patch_apply_started":
+        this.handlePatchApplyStartedNotification(parsed);
+        return;
+      case "patch_apply_completed":
+        this.handlePatchApplyCompletedNotification(parsed);
+        return;
+      case "item_completed":
+        this.handleItemCompletedNotification(parsed);
+        return;
+      case "item_started":
+        this.handleItemStartedNotification(parsed);
+        return;
+      case "invalid_payload":
+        this.warnInvalidNotificationPayload(parsed.method, parsed.params);
+        return;
+      case "unknown_method":
+        this.warnUnknownNotificationMethod(parsed.method, parsed.params);
+        return;
+      default:
+        return;
+    }
+  }
 
-    if (parsed.kind === "thread_started") {
-      this.currentThreadId = parsed.threadId;
-      this.emitEvent({
-        type: "thread_started",
+  private handleThreadStateNotification(parsed: ParsedCodexNotification): boolean {
+    switch (parsed.kind) {
+      case "context_compacted":
+        this.handleContextCompactedNotification(parsed);
+        return true;
+      case "thread_rolled_back":
+        this.handleThreadRolledBackNotification(parsed);
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private traceParsedNotification(
+    method: string,
+    params: unknown,
+    parsed: z.infer<typeof CodexNotificationSchema>,
+  ): void {
+    this.logger.trace(
+      {
+        agentId: this.agentId,
         provider: CODEX_PROVIDER,
-        sessionId: parsed.threadId,
-      });
+        sessionId: this.currentThreadId,
+        turnId: this.activeForegroundTurnId ?? undefined,
+        method,
+        params,
+        parsed,
+      },
+      "provider.codex.parsed_event",
+    );
+  }
+
+  private getSubAgentCallIdForThread(threadId: string | null | undefined): string | null {
+    if (!threadId || threadId === this.currentThreadId) {
+      return null;
+    }
+    return this.subAgentCallIdByChildThreadId.get(threadId) ?? null;
+  }
+
+  private registerSubAgentToolCall(
+    timelineItem: ToolCallTimelineItem,
+    rawItem: { [key: string]: unknown },
+  ): void {
+    if (timelineItem.detail.type !== "sub_agent") {
       return;
     }
 
-    if (parsed.kind === "turn_started") {
-      this.currentTurnId = parsed.turnId;
-      this.latestPlanResult = null;
-      this.emittedItemStartedIds.clear();
-      this.emittedItemCompletedIds.clear();
-      this.emittedExecCommandStartedCallIds.clear();
-      this.emittedExecCommandCompletedCallIds.clear();
-      this.pendingCommandOutputDeltas.clear();
-      this.pendingFileChangeOutputDeltas.clear();
-      this.warnedIncompleteEditToolCallIds.clear();
-      this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER });
+    const existing = this.subAgentCallsByCallId.get(timelineItem.callId);
+    const state: CodexSubAgentCallState =
+      existing ??
+      ({
+        callId: timelineItem.callId,
+        toolCall: timelineItem,
+        childItemOrder: [],
+        childItems: new Map<string, AgentTimelineItem>(),
+      } satisfies CodexSubAgentCallState);
+
+    state.toolCall = {
+      ...timelineItem,
+      detail: {
+        ...timelineItem.detail,
+        log:
+          timelineItem.detail.log ||
+          (state.toolCall.detail.type === "sub_agent" ? state.toolCall.detail.log : ""),
+      },
+    };
+    this.subAgentCallsByCallId.set(timelineItem.callId, state);
+
+    const receiverThreadIds = Array.isArray(rawItem.receiverThreadIds)
+      ? rawItem.receiverThreadIds.filter((value): value is string => typeof value === "string")
+      : [];
+    for (const receiverThreadId of receiverThreadIds) {
+      this.subAgentCallIdByChildThreadId.set(receiverThreadId, timelineItem.callId);
+    }
+  }
+
+  private upsertSubAgentChildItem(callId: string, itemId: string, item: AgentTimelineItem): void {
+    const state = this.subAgentCallsByCallId.get(callId);
+    if (!state) {
       return;
     }
+    if (!state.childItems.has(itemId)) {
+      state.childItemOrder.push(itemId);
+    }
+    state.childItems.set(itemId, item);
+  }
 
-    if (parsed.kind === "turn_completed") {
-      if (parsed.status === "failed") {
-        this.emitEvent({
-          type: "turn_failed",
-          provider: CODEX_PROVIDER,
-          error: parsed.errorMessage ?? "Codex turn failed",
-        });
-      } else if (parsed.status === "interrupted") {
-        this.emitEvent({ type: "turn_canceled", provider: CODEX_PROVIDER, reason: "interrupted" });
-      } else {
-        if (this.planModeEnabled && this.latestPlanResult?.text) {
-          this.emitSyntheticPlanApprovalRequest(this.latestPlanResult.text);
-        }
-        this.emitEvent({
-          type: "turn_completed",
-          provider: CODEX_PROVIDER,
-          usage: this.latestUsage,
-        });
-      }
-      this.activeForegroundTurnId = null;
-      this.latestPlanResult = null;
-      this.emittedItemStartedIds.clear();
-      this.emittedItemCompletedIds.clear();
-      this.emittedExecCommandStartedCallIds.clear();
-      this.emittedExecCommandCompletedCallIds.clear();
-      this.pendingCommandOutputDeltas.clear();
-      this.pendingFileChangeOutputDeltas.clear();
-      this.warnedIncompleteEditToolCallIds.clear();
+  private getSubAgentChildTimeline(state: CodexSubAgentCallState): AgentTimelineItem[] {
+    return state.childItemOrder
+      .map((itemId) => state.childItems.get(itemId))
+      .filter((item): item is AgentTimelineItem => Boolean(item));
+  }
+
+  private emitSubAgentActivityUpdate(
+    callId: string,
+    status?: ToolCallTimelineItem["status"],
+  ): void {
+    const state = this.subAgentCallsByCallId.get(callId);
+    if (!state || state.toolCall.detail.type !== "sub_agent") {
       return;
     }
+    const childTimeline = this.getSubAgentChildTimeline(state);
+    const log =
+      childTimeline.length > 0
+        ? curateAgentActivity(childTimeline, { labelAssistantMessages: true })
+        : "";
+    const resolvedStatus = status ?? state.toolCall.status;
+    const baseToolCall = {
+      ...state.toolCall,
+      detail: {
+        ...state.toolCall.detail,
+        log,
+      },
+    };
+    const nextToolCall: ToolCallTimelineItem =
+      resolvedStatus === "failed"
+        ? {
+            ...baseToolCall,
+            status: "failed",
+            error: state.toolCall.error ?? { message: "Sub-agent failed" },
+          }
+        : {
+            ...baseToolCall,
+            status: resolvedStatus,
+            error: null,
+          };
+    state.toolCall = nextToolCall;
+    this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: nextToolCall });
+  }
 
-    if (parsed.kind === "plan_updated") {
-      const timelineItem = mapCodexPlanToToolCall({
-        callId: `plan:${this.currentTurnId ?? this.currentThreadId ?? "current"}`,
-        text: planStepsToMarkdown(
-          parsed.plan.map((entry) => ({
-            step: entry.step ?? "",
-            status: entry.status ?? "pending",
-          })),
-        ),
-      });
-      if (timelineItem) {
-        this.rememberPlanResult(timelineItem);
-        this.emitEvent({
-          type: "timeline",
-          provider: CODEX_PROVIDER,
-          item: timelineItem,
-        });
-      }
-      return;
+  private handleSubAgentChildItemCompleted(
+    callId: string,
+    itemId: string | undefined,
+    timelineItem: AgentTimelineItem,
+  ): void {
+    this.applyBufferedDeltaTextToTimelineItem(timelineItem, itemId);
+    if (itemId) {
+      this.upsertSubAgentChildItem(callId, itemId, timelineItem);
+      this.pendingAgentMessages.delete(itemId);
+      this.pendingReasoning.delete(itemId);
+      this.pendingCommandOutputDeltas.delete(itemId);
+      this.pendingFileChangeOutputDeltas.delete(itemId);
     }
+    this.emitSubAgentActivityUpdate(callId, "running");
+  }
 
-    if (parsed.kind === "diff_updated") {
-      // NOTE: Codex app-server emits frequent `turn/diff/updated` notifications
-      // containing a full accumulated unified diff for the *entire turn*.
-      // This is not a concrete file-change tool call; it is progress telemetry.
-      // We intentionally do NOT store every diff update in the timeline.
-      return;
+  private shouldSkipCompletedThreadItem(
+    timelineItem: AgentTimelineItem,
+    normalizedItemType: string | undefined,
+    itemId: string | undefined,
+  ): boolean {
+    // For commandExecution items, codex/event/exec_command_* is authoritative.
+    if (timelineItem.type === "tool_call" && normalizedItemType === "commandExecution") {
+      const callId = timelineItem.callId || itemId;
+      return Boolean(callId && this.emittedExecCommandCompletedCallIds.has(callId));
     }
+    return Boolean(itemId && this.emittedItemCompletedIds.has(itemId));
+  }
 
-    if (parsed.kind === "token_usage_updated") {
-      this.latestUsage = toAgentUsage(parsed.tokenUsage);
-      if (this.latestUsage) {
-        this.notifySubscribers({
-          type: "usage_updated",
-          provider: CODEX_PROVIDER,
-          usage: this.latestUsage,
-        });
-      }
-      return;
-    }
-
+  private handleCodexDeltaNotification(parsed: CodexDeltaNotification): void {
     if (parsed.kind === "agent_message_delta") {
       const prev = this.pendingAgentMessages.get(parsed.itemId) ?? "";
-      this.pendingAgentMessages.set(parsed.itemId, prev + parsed.delta);
+      const text = prev + parsed.delta;
+      this.pendingAgentMessages.set(parsed.itemId, text);
+      const subAgentCallId = this.getSubAgentCallIdForThread(parsed.threadId);
+      if (subAgentCallId) {
+        this.upsertSubAgentChildItem(subAgentCallId, parsed.itemId, {
+          type: "assistant_message",
+          messageId: parsed.itemId,
+          text,
+        });
+        this.emitSubAgentActivityUpdate(subAgentCallId, "running");
+        return;
+      }
+      const isFirstDeltaForItem = prev.length === 0;
+      this.emitEvent({
+        type: "timeline",
+        provider: CODEX_PROVIDER,
+        item: {
+          type: "assistant_message",
+          messageId: parsed.itemId,
+          text:
+            isFirstDeltaForItem && this.pendingAssistantMessageBoundary
+              ? `${ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN}${parsed.delta}`
+              : parsed.delta,
+        },
+      });
+      if (isFirstDeltaForItem) {
+        this.pendingAssistantMessageBoundary = false;
+      }
       return;
     }
-
     if (parsed.kind === "reasoning_delta") {
       const prev = this.pendingReasoning.get(parsed.itemId) ?? [];
       prev.push(parsed.delta);
       this.pendingReasoning.set(parsed.itemId, prev);
+      const subAgentCallId = this.getSubAgentCallIdForThread(parsed.threadId);
+      if (subAgentCallId) {
+        this.upsertSubAgentChildItem(subAgentCallId, parsed.itemId, {
+          type: "reasoning",
+          text: prev.join(""),
+        });
+        this.emitSubAgentActivityUpdate(subAgentCallId, "running");
+        return;
+      }
+      this.emitEvent({
+        type: "timeline",
+        provider: CODEX_PROVIDER,
+        item: { type: "reasoning", text: parsed.delta },
+      });
       return;
     }
-
     if (parsed.kind === "exec_command_output_delta") {
       this.appendOutputDeltaChunk(this.pendingCommandOutputDeltas, parsed.callId, parsed.chunk, {
         decodeBase64: true,
       });
       return;
     }
+    this.appendOutputDeltaChunk(this.pendingFileChangeOutputDeltas, parsed.itemId, parsed.delta);
+  }
 
-    if (parsed.kind === "file_change_output_delta") {
-      this.appendOutputDeltaChunk(this.pendingFileChangeOutputDeltas, parsed.itemId, parsed.delta);
+  private handleThreadStartedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "thread_started" }>,
+  ): void {
+    this.currentThreadId = parsed.threadId;
+    this.emitEvent({
+      type: "thread_started",
+      provider: CODEX_PROVIDER,
+      sessionId: parsed.threadId,
+    });
+  }
+
+  private handleTurnStartedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "turn_started" }>,
+  ): void {
+    const subAgentCallId = this.getSubAgentCallIdForThread(parsed.threadId);
+    if (subAgentCallId) {
+      this.emitSubAgentActivityUpdate(subAgentCallId, "running");
       return;
     }
+    this.currentTurnId = parsed.turnId;
+    this.resetTurnTrackingState();
+    this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER });
+  }
 
-    if (parsed.kind === "exec_command_started") {
-      if (parsed.callId) {
-        this.emittedExecCommandStartedCallIds.add(parsed.callId);
-        this.pendingCommandOutputDeltas.delete(parsed.callId);
+  private handleTurnCompletedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "turn_completed" }>,
+  ): void {
+    const subAgentCallId = this.getSubAgentCallIdForThread(parsed.threadId);
+    if (subAgentCallId) {
+      let status: ToolCallTimelineItem["status"] = "completed";
+      if (parsed.status === "failed") {
+        status = "failed";
+      } else if (parsed.status === "interrupted") {
+        status = "canceled";
       }
-      const timelineItem = mapCodexExecNotificationToToolCall({
-        callId: parsed.callId,
-        command: parsed.command,
-        cwd: parsed.cwd ?? this.config.cwd ?? null,
-        running: true,
+      this.emitSubAgentActivityUpdate(subAgentCallId, status);
+      return;
+    }
+    if (parsed.status === "failed") {
+      this.emitEvent({
+        type: "turn_failed",
+        provider: CODEX_PROVIDER,
+        error: parsed.errorMessage ?? "Codex turn failed",
       });
-      if (timelineItem) {
-        this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
+    } else if (parsed.status === "interrupted") {
+      this.emitEvent({ type: "turn_canceled", provider: CODEX_PROVIDER, reason: "interrupted" });
+    } else {
+      if (this.planModeEnabled && this.latestPlanResult?.text) {
+        this.emitSyntheticPlanApprovalRequest(this.latestPlanResult.text);
       }
-      return;
-    }
-
-    if (parsed.kind === "exec_command_completed") {
-      const bufferedOutput = this.consumeOutputDelta(
-        this.pendingCommandOutputDeltas,
-        parsed.callId,
-      );
-      const resolvedOutput = parsed.output ?? bufferedOutput;
-      this.rememberTerminalProcessForCommand(parsed.command, resolvedOutput);
-      const timelineItem = mapCodexExecNotificationToToolCall({
-        callId: parsed.callId,
-        command: parsed.command,
-        cwd: parsed.cwd ?? this.config.cwd ?? null,
-        output: resolvedOutput,
-        exitCode: parsed.exitCode,
-        success: parsed.success,
-        stderr: parsed.stderr,
-        running: false,
+      this.emitEvent({
+        type: "turn_completed",
+        provider: CODEX_PROVIDER,
+        usage: this.latestUsage,
       });
-      if (timelineItem) {
-        this.emittedExecCommandCompletedCallIds.add(timelineItem.callId);
-        this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
-      }
-      return;
     }
+    this.activeForegroundTurnId = null;
+    this.resetTurnTrackingState();
+  }
 
-    if (parsed.kind === "terminal_interaction") {
-      const interactionKey = [parsed.processId ?? "", parsed.stdin ?? ""].join("\u0000");
-      if (!this.shouldEmitTerminalInteractionKey(interactionKey)) {
+  private resetTurnTrackingState(): void {
+    this.latestPlanResult = null;
+    this.emittedItemStartedIds.clear();
+    this.emittedItemCompletedIds.clear();
+    this.emittedExecCommandStartedCallIds.clear();
+    this.emittedExecCommandCompletedCallIds.clear();
+    this.pendingAgentMessages.clear();
+    this.pendingReasoning.clear();
+    this.pendingCommandOutputDeltas.clear();
+    this.pendingFileChangeOutputDeltas.clear();
+    this.pendingAssistantMessageBoundary = false;
+    this.warnedIncompleteEditToolCallIds.clear();
+    this.unpairedCompactionNotificationCompletions = 0;
+    this.unpairedCompactionItemCompletions = 0;
+  }
+
+  private handlePlanUpdatedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "plan_updated" }>,
+  ): void {
+    const timelineItem = mapCodexPlanToToolCall({
+      callId: `plan:${this.currentTurnId ?? this.currentThreadId ?? "current"}`,
+      text: planStepsToMarkdown(
+        parsed.plan.map((entry) => ({
+          step: entry.step ?? "",
+          status: entry.status ?? "pending",
+        })),
+      ),
+    });
+    if (timelineItem) {
+      this.rememberPlanResult(timelineItem);
+      // In plan mode, the same plan is rendered through the synthetic approval
+      // permission. Keep the remembered text for that card, but do not also
+      // emit a static timeline plan panel.
+      if (this.planModeEnabled) {
         return;
       }
-      const command =
-        (parsed.processId ? this.terminalCommandByProcessId.get(parsed.processId) : undefined) ??
-        null;
-      if (!command && parsed.processId) {
-        this.pendingUnlabeledTerminalInteractions.add(parsed.processId);
-      }
-      const timelineItem = mapCodexTerminalInteractionToToolCall({
-        processId: parsed.processId,
-        fallbackCallId: parsed.callId,
-        command,
+      this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
+    }
+  }
+
+  private handleTokenUsageUpdatedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "token_usage_updated" }>,
+  ): void {
+    this.latestUsage = toAgentUsage(parsed.tokenUsage);
+    if (this.latestUsage) {
+      this.notifySubscribers({
+        type: "usage_updated",
+        provider: CODEX_PROVIDER,
+        usage: this.latestUsage,
       });
+    }
+  }
+
+  private resolveContextCompactionTrigger(itemId?: string): "auto" | "manual" | undefined {
+    if (itemId) {
+      const known = this.compactionTriggerByItemId.get(itemId);
+      if (known) {
+        return known;
+      }
+    }
+    if (this.pendingManualCompactionStarts > 0) {
+      this.pendingManualCompactionStarts -= 1;
+      return "manual";
+    }
+    return undefined;
+  }
+
+  private createContextCompactionTimelineItem(
+    status: "loading" | "completed",
+    itemId?: string,
+  ): Extract<AgentTimelineItem, { type: "compaction" }> {
+    const trigger = this.resolveContextCompactionTrigger(itemId);
+    if (itemId && trigger) {
+      if (status === "loading") {
+        this.compactionTriggerByItemId.set(itemId, trigger);
+      } else {
+        this.compactionTriggerByItemId.delete(itemId);
+      }
+    }
+    return {
+      type: "compaction",
+      status,
+      ...(trigger ? { trigger } : {}),
+    };
+  }
+
+  private isContextCompactionItem(item: { type?: string; [key: string]: unknown }): boolean {
+    return (
+      normalizeCodexThreadItemType(typeof item.type === "string" ? item.type : undefined) ===
+      CODEX_CONTEXT_COMPACTION_TYPE
+    );
+  }
+
+  private isUserMessageItem(item: { type?: string; [key: string]: unknown }): boolean {
+    return (
+      normalizeCodexThreadItemType(typeof item.type === "string" ? item.type : undefined) ===
+      "userMessage"
+    );
+  }
+
+  private handleThreadRolledBackNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "thread_rolled_back" }>,
+  ): void {
+    this.truncateCodexUserMessageTurns(parsed.numTurns);
+  }
+
+  private handleContextCompactedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "context_compacted" }>,
+  ): void {
+    if (parsed.threadId !== this.currentThreadId) {
+      return;
+    }
+    if (this.unpairedCompactionItemCompletions > 0) {
+      this.unpairedCompactionItemCompletions -= 1;
+      return;
+    }
+    this.unpairedCompactionNotificationCompletions += 1;
+    this.emitEvent({
+      type: "timeline",
+      provider: CODEX_PROVIDER,
+      item: this.createContextCompactionTimelineItem("completed"),
+      ...(parsed.turnId ? { turnId: parsed.turnId } : {}),
+    });
+  }
+
+  private handleExecCommandStartedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "exec_command_started" }>,
+  ): void {
+    if (parsed.callId) {
+      this.emittedExecCommandStartedCallIds.add(parsed.callId);
+      this.pendingCommandOutputDeltas.delete(parsed.callId);
+    }
+    const timelineItem = mapCodexExecNotificationToToolCall({
+      callId: parsed.callId,
+      command: parsed.command,
+      cwd: parsed.cwd ?? this.config.cwd ?? null,
+      running: true,
+    });
+    if (timelineItem) {
+      this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
+    }
+  }
+
+  private handleExecCommandCompletedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "exec_command_completed" }>,
+  ): void {
+    const bufferedOutput = this.consumeOutputDelta(this.pendingCommandOutputDeltas, parsed.callId);
+    const resolvedOutput = parsed.output ?? bufferedOutput;
+    this.rememberTerminalProcessForCommand(parsed.command, resolvedOutput);
+    const timelineItem = mapCodexExecNotificationToToolCall({
+      callId: parsed.callId,
+      command: parsed.command,
+      cwd: parsed.cwd ?? this.config.cwd ?? null,
+      output: resolvedOutput,
+      exitCode: parsed.exitCode,
+      success: parsed.success,
+      stderr: parsed.stderr,
+      running: false,
+    });
+    if (timelineItem) {
+      this.emittedExecCommandCompletedCallIds.add(timelineItem.callId);
+      this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
+    }
+  }
+
+  private handleTerminalInteractionNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "terminal_interaction" }>,
+  ): void {
+    const interactionKey = [parsed.processId ?? "", parsed.stdin ?? ""].join("\u0000");
+    if (!this.shouldEmitTerminalInteractionKey(interactionKey)) {
+      return;
+    }
+    const command =
+      (parsed.processId ? this.terminalCommandByProcessId.get(parsed.processId) : undefined) ??
+      null;
+    if (!command && parsed.processId) {
+      this.pendingUnlabeledTerminalInteractions.add(parsed.processId);
+    }
+    const timelineItem = mapCodexTerminalInteractionToToolCall({
+      processId: parsed.processId,
+      fallbackCallId: parsed.callId,
+      command,
+    });
+    this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
+  }
+
+  private handlePatchApplyStartedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "patch_apply_started" }>,
+  ): void {
+    if (parsed.callId) {
+      this.pendingFileChangeOutputDeltas.delete(parsed.callId);
+    }
+    const timelineItem = mapCodexPatchNotificationToToolCall({
+      callId: parsed.callId,
+      changes: parsed.changes,
+      cwd: this.config.cwd ?? null,
+      running: true,
+    });
+    if (timelineItem) {
+      this.warnOnIncompleteEditToolCall(timelineItem, "patch_apply_started", {
+        callId: parsed.callId,
+        changes: parsed.changes,
+      });
+      this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
+    }
+  }
+
+  private handlePatchApplyCompletedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "patch_apply_completed" }>,
+  ): void {
+    const bufferedOutput = this.consumeOutputDelta(
+      this.pendingFileChangeOutputDeltas,
+      parsed.callId,
+    );
+    const timelineItem = mapCodexPatchNotificationToToolCall({
+      callId: parsed.callId,
+      changes: parsed.changes,
+      cwd: this.config.cwd ?? null,
+      stdout: parsed.stdout ?? bufferedOutput,
+      stderr: parsed.stderr,
+      success: parsed.success,
+      running: false,
+    });
+    if (timelineItem) {
+      this.warnOnIncompleteEditToolCall(timelineItem, "patch_apply_completed", {
+        callId: parsed.callId,
+        changes: parsed.changes,
+        stdout: parsed.stdout,
+      });
+      this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
+    }
+  }
+
+  private handleItemCompletedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "item_completed" }>,
+  ): void {
+    // Codex emits mirrored lifecycle notifications via both `codex/event/item_*`
+    // and canonical `item/*`. We render only the canonical channel to avoid
+    // duplicated assistant/reasoning rows.
+    if (parsed.source === "codex_event") {
+      return;
+    }
+    if (this.isUserMessageItem(parsed.item)) {
+      this.handleUserMessageItem(parsed);
+      return;
+    }
+    if (this.isContextCompactionItem(parsed.item)) {
+      if (this.unpairedCompactionNotificationCompletions > 0) {
+        this.unpairedCompactionNotificationCompletions -= 1;
+        return;
+      }
+      this.emitEvent({
+        type: "timeline",
+        provider: CODEX_PROVIDER,
+        item: this.createContextCompactionTimelineItem("completed", parsed.item.id),
+      });
+      this.unpairedCompactionItemCompletions += 1;
+      return;
+    }
+    const timelineItem = threadItemToTimeline(parsed.item, {
+      includeUserMessage: false,
+      cwd: this.config.cwd ?? null,
+    });
+    if (!timelineItem) {
+      return;
+    }
+    const childSubAgentCallId = this.getSubAgentCallIdForThread(parsed.threadId);
+    if (childSubAgentCallId) {
+      this.handleSubAgentChildItemCompleted(childSubAgentCallId, parsed.item.id, timelineItem);
+      return;
+    }
+    const normalizedItemType = normalizeCodexThreadItemType(
+      typeof parsed.item.type === "string" ? parsed.item.type : undefined,
+    );
+    const itemId = parsed.item.id;
+    if (this.shouldSkipCompletedThreadItem(timelineItem, normalizedItemType, itemId)) {
+      return;
+    }
+    if (this.consumeStreamedTextCompletion(timelineItem, itemId)) {
+      if (timelineItem.type === "assistant_message") {
+        this.pendingAssistantMessageBoundary = true;
+      }
+      if (itemId) {
+        this.emittedItemCompletedIds.add(itemId);
+        this.emittedItemStartedIds.delete(itemId);
+      }
+      return;
+    }
+    this.applyBufferedDeltaTextToTimelineItem(timelineItem, itemId);
+    if (timelineItem.type === "tool_call") {
+      this.registerSubAgentToolCall(timelineItem, parsed.item);
+      if (timelineItem.detail.type === "plan") {
+        this.rememberPlanResult(timelineItem);
+        // Codex can surface plans both as turn/plan updates and as completed
+        // thread items. In plan mode, approval owns the visible plan card.
+        if (this.planModeEnabled) {
+          return;
+        }
+      }
+      this.warnOnIncompleteEditToolCall(timelineItem, "item_completed", parsed.item);
+    }
+    this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
+    if (timelineItem.type === "assistant_message") {
+      this.pendingAssistantMessageBoundary = true;
+    }
+    if (itemId) {
+      this.emittedItemCompletedIds.add(itemId);
+      this.emittedItemStartedIds.delete(itemId);
+      this.pendingCommandOutputDeltas.delete(itemId);
+      this.pendingFileChangeOutputDeltas.delete(itemId);
+    }
+  }
+
+  private consumeStreamedTextCompletion(
+    timelineItem: AgentTimelineItem,
+    itemId: string | null | undefined,
+  ): boolean {
+    if (!itemId) {
+      return false;
+    }
+    if (timelineItem.type === "assistant_message" && this.pendingAgentMessages.has(itemId)) {
+      const streamedText = this.pendingAgentMessages.get(itemId) ?? "";
+      this.pendingAgentMessages.delete(itemId);
+      this.emitMissingFinalTextSuffix(timelineItem, streamedText);
+      return true;
+    }
+    if (timelineItem.type === "reasoning" && this.pendingReasoning.has(itemId)) {
+      const streamedText = this.pendingReasoning.get(itemId)?.join("") ?? "";
+      this.pendingReasoning.delete(itemId);
+      this.emitMissingFinalTextSuffix(timelineItem, streamedText);
+      return true;
+    }
+    return false;
+  }
+
+  private emitMissingFinalTextSuffix(
+    timelineItem: Extract<AgentTimelineItem, { type: "assistant_message" | "reasoning" }>,
+    streamedText: string,
+  ): void {
+    if (!timelineItem.text.startsWith(streamedText)) {
       this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
       return;
     }
+    const suffix = timelineItem.text.slice(streamedText.length);
+    if (!suffix) {
+      return;
+    }
+    this.emitEvent({
+      type: "timeline",
+      provider: CODEX_PROVIDER,
+      item:
+        timelineItem.type === "assistant_message"
+          ? {
+              type: timelineItem.type,
+              text: suffix,
+              ...(timelineItem.messageId ? { messageId: timelineItem.messageId } : {}),
+            }
+          : { type: timelineItem.type, text: suffix },
+    });
+  }
 
-    if (parsed.kind === "patch_apply_started") {
-      if (parsed.callId) {
-        this.pendingFileChangeOutputDeltas.delete(parsed.callId);
-      }
-      const timelineItem = mapCodexPatchNotificationToToolCall({
-        callId: parsed.callId,
-        changes: parsed.changes,
-        cwd: this.config.cwd ?? null,
-        running: true,
-      });
-      if (timelineItem) {
-        this.warnOnIncompleteEditToolCall(timelineItem, "patch_apply_started", {
-          callId: parsed.callId,
-          changes: parsed.changes,
-        });
-        this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
+  private applyBufferedDeltaTextToTimelineItem(
+    timelineItem: AgentTimelineItem,
+    itemId: string | null | undefined,
+  ): void {
+    if (!itemId) {
+      return;
+    }
+    if (timelineItem.type === "assistant_message") {
+      const buffered = this.pendingAgentMessages.get(itemId);
+      if (buffered && buffered.length > 0) {
+        timelineItem.text = buffered;
       }
       return;
     }
-
-    if (parsed.kind === "patch_apply_completed") {
-      const bufferedOutput = this.consumeOutputDelta(
-        this.pendingFileChangeOutputDeltas,
-        parsed.callId,
-      );
-      const timelineItem = mapCodexPatchNotificationToToolCall({
-        callId: parsed.callId,
-        changes: parsed.changes,
-        cwd: this.config.cwd ?? null,
-        stdout: parsed.stdout ?? bufferedOutput,
-        stderr: parsed.stderr,
-        success: parsed.success,
-        running: false,
-      });
-      if (timelineItem) {
-        this.warnOnIncompleteEditToolCall(timelineItem, "patch_apply_completed", {
-          callId: parsed.callId,
-          changes: parsed.changes,
-          stdout: parsed.stdout,
-        });
-        this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
+    if (timelineItem.type === "reasoning") {
+      const buffered = this.pendingReasoning.get(itemId);
+      if (buffered && buffered.length > 0) {
+        timelineItem.text = buffered.join("");
       }
+    }
+  }
+
+  private handleItemStartedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "item_started" }>,
+  ): void {
+    if (parsed.source === "codex_event") {
       return;
     }
-
-    if (parsed.kind === "item_completed") {
-      // Codex emits mirrored lifecycle notifications via both `codex/event/item_*`
-      // and canonical `item/*`. We render only the canonical channel to avoid
-      // duplicated assistant/reasoning rows.
-      if (parsed.source === "codex_event") {
+    if (this.isUserMessageItem(parsed.item)) {
+      this.handleUserMessageItem(parsed);
+      return;
+    }
+    if (this.isContextCompactionItem(parsed.item)) {
+      this.emitEvent({
+        type: "timeline",
+        provider: CODEX_PROVIDER,
+        item: this.createContextCompactionTimelineItem("loading", parsed.item.id),
+      });
+      return;
+    }
+    const timelineItem = threadItemToTimeline(parsed.item, {
+      includeUserMessage: false,
+      cwd: this.config.cwd ?? null,
+    });
+    if (!timelineItem || timelineItem.type !== "tool_call") {
+      return;
+    }
+    const childSubAgentCallId = this.getSubAgentCallIdForThread(parsed.threadId);
+    if (childSubAgentCallId) {
+      if (parsed.item.id) {
+        this.upsertSubAgentChildItem(childSubAgentCallId, parsed.item.id, timelineItem);
+      }
+      this.emitSubAgentActivityUpdate(childSubAgentCallId, "running");
+      return;
+    }
+    const normalizedItemType = normalizeCodexThreadItemType(
+      typeof parsed.item.type === "string" ? parsed.item.type : undefined,
+    );
+    const itemId = parsed.item.id;
+    if (normalizedItemType === "commandExecution") {
+      const callId = timelineItem.callId || itemId;
+      if (callId && this.emittedExecCommandStartedCallIds.has(callId)) {
         return;
       }
-      const timelineItem = threadItemToTimeline(parsed.item, {
-        includeUserMessage: false,
-        cwd: this.config.cwd ?? null,
-      });
-      if (timelineItem) {
-        const normalizedItemType = normalizeCodexThreadItemType(
-          typeof parsed.item.type === "string" ? parsed.item.type : undefined,
-        );
-        const itemId = parsed.item.id;
-        // For commandExecution items, codex/event/exec_command_* is authoritative.
-        // Keep item/completed as fallback only when no exec_command completion was seen.
-        if (timelineItem.type === "tool_call" && normalizedItemType === "commandExecution") {
-          const callId = timelineItem.callId || itemId;
-          if (callId && this.emittedExecCommandCompletedCallIds.has(callId)) {
-            return;
-          }
-        }
-        if (itemId && this.emittedItemCompletedIds.has(itemId)) {
-          return;
-        }
-        if (timelineItem.type === "assistant_message" && itemId) {
-          const buffered = this.pendingAgentMessages.get(itemId);
-          if (buffered && buffered.length > 0) {
-            timelineItem.text = buffered;
-          }
-        }
-        if (timelineItem.type === "reasoning" && itemId) {
-          const buffered = this.pendingReasoning.get(itemId);
-          if (buffered && buffered.length > 0) {
-            timelineItem.text = buffered.join("");
-          }
-        }
-        if (timelineItem.type === "tool_call") {
-          if (timelineItem.detail.type === "plan") {
-            this.rememberPlanResult(timelineItem);
-          }
-          this.warnOnIncompleteEditToolCall(timelineItem, "item_completed", parsed.item);
-        }
-        this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
-        if (itemId) {
-          this.emittedItemCompletedIds.add(itemId);
-          this.emittedItemStartedIds.delete(itemId);
-          this.pendingCommandOutputDeltas.delete(itemId);
-          this.pendingFileChangeOutputDeltas.delete(itemId);
-        }
-      }
+    }
+    if (itemId && this.emittedItemStartedIds.has(itemId)) {
       return;
     }
+    this.warnOnIncompleteEditToolCall(timelineItem, "item_started", parsed.item);
+    this.registerSubAgentToolCall(timelineItem, parsed.item);
+    this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
+    if (itemId) {
+      this.emittedItemStartedIds.add(itemId);
+      this.pendingCommandOutputDeltas.delete(itemId);
+      this.pendingFileChangeOutputDeltas.delete(itemId);
+    }
+  }
 
-    if (parsed.kind === "item_started") {
-      if (parsed.source === "codex_event") {
-        return;
-      }
-      const timelineItem = threadItemToTimeline(parsed.item, {
-        includeUserMessage: false,
-        cwd: this.config.cwd ?? null,
-      });
-      if (timelineItem && timelineItem.type === "tool_call") {
-        const normalizedItemType = normalizeCodexThreadItemType(
-          typeof parsed.item.type === "string" ? parsed.item.type : undefined,
-        );
-        const itemId = parsed.item.id;
-        if (normalizedItemType === "commandExecution") {
-          const callId = timelineItem.callId || itemId;
-          if (callId && this.emittedExecCommandStartedCallIds.has(callId)) {
-            return;
-          }
-        }
-        if (itemId && this.emittedItemStartedIds.has(itemId)) {
-          return;
-        }
-        this.warnOnIncompleteEditToolCall(timelineItem, "item_started", parsed.item);
-        this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
-        if (itemId) {
-          this.emittedItemStartedIds.add(itemId);
-          this.pendingCommandOutputDeltas.delete(itemId);
-          this.pendingFileChangeOutputDeltas.delete(itemId);
-        }
-      }
+  private handleUserMessageItem(
+    parsed: Extract<ParsedCodexNotification, { kind: "item_started" | "item_completed" }>,
+  ): void {
+    const itemId = parsed.item.id;
+    const timelineItem = threadItemToTimeline(parsed.item, {
+      includeUserMessage: true,
+      cwd: this.config.cwd ?? null,
+    });
+    if (!timelineItem || timelineItem.type !== "user_message") {
       return;
     }
-
-    if (parsed.kind === "invalid_payload") {
-      this.warnInvalidNotificationPayload(parsed.method, parsed.params);
+    const childSubAgentCallId = this.getSubAgentCallIdForThread(parsed.threadId);
+    if (childSubAgentCallId) {
+      if (itemId) {
+        this.upsertSubAgentChildItem(childSubAgentCallId, itemId, timelineItem);
+      }
+      this.emitSubAgentActivityUpdate(childSubAgentCallId, "running");
       return;
     }
-
-    this.warnUnknownNotificationMethod(parsed.method, parsed.params);
+    if (!this.rememberCodexUserMessageTurn(timelineItem.messageId)) {
+      return;
+    }
+    this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: timelineItem });
   }
 
   private warnUnknownNotificationMethod(method: string, params: unknown): void {
@@ -3750,7 +5016,17 @@ class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     this.warnedUnknownNotificationMethods.add(method);
-    this.logger.trace({ method, params }, "Unhandled Codex app-server notification method");
+    this.logger.trace(
+      {
+        agentId: this.agentId,
+        provider: CODEX_PROVIDER,
+        sessionId: this.currentThreadId,
+        turnId: this.activeForegroundTurnId ?? undefined,
+        method,
+        params,
+      },
+      "provider.codex.event_unhandled",
+    );
   }
 
   private warnInvalidNotificationPayload(method: string, params: unknown): void {
@@ -3861,14 +5137,16 @@ class CodexAppServerAgentSession implements AgentSession {
   }
 
   private handleCommandApprovalRequest(params: unknown): Promise<unknown> {
-    const parsed = params as {
-      itemId: string;
-      threadId: string;
-      turnId: string;
-      command?: string | null;
-      cwd?: string | null;
-      reason?: string | null;
-    };
+    const parsed = z
+      .object({
+        itemId: z.string(),
+        threadId: z.string(),
+        turnId: z.string(),
+        command: z.string().nullable().optional(),
+        cwd: z.string().nullable().optional(),
+        reason: z.string().nullable().optional(),
+      })
+      .parse(params);
     const commandPreview = mapCodexExecNotificationToToolCall({
       callId: parsed.itemId,
       command: parsed.command,
@@ -3910,12 +5188,14 @@ class CodexAppServerAgentSession implements AgentSession {
   }
 
   private handleFileChangeApprovalRequest(params: unknown): Promise<unknown> {
-    const parsed = params as {
-      itemId: string;
-      threadId: string;
-      turnId: string;
-      reason?: string | null;
-    };
+    const parsed = z
+      .object({
+        itemId: z.string(),
+        threadId: z.string(),
+        turnId: z.string(),
+        reason: z.string().nullable().optional(),
+      })
+      .parse(params);
     const requestId = `permission-${parsed.itemId}`;
     const request: AgentPermissionRequest = {
       id: requestId,
@@ -3945,7 +5225,14 @@ class CodexAppServerAgentSession implements AgentSession {
   }
 
   private handleToolApprovalRequest(params: unknown): Promise<unknown> {
-    const parsed = params as { itemId: string; threadId: string; turnId: string; questions: any[] };
+    const parsed = z
+      .object({
+        itemId: z.string(),
+        threadId: z.string(),
+        turnId: z.string(),
+        questions: z.array(z.unknown()),
+      })
+      .parse(params);
     const requestId = `permission-${parsed.itemId}`;
     const questions = normalizeCodexQuestionPrompts(parsed.questions);
     const request: AgentPermissionRequest = {
@@ -3992,36 +5279,131 @@ class CodexAppServerAgentSession implements AgentSession {
 export class CodexAppServerAgentClient implements AgentClient {
   readonly provider = CODEX_PROVIDER;
   readonly capabilities = CODEX_APP_SERVER_CAPABILITIES;
+  private goalsEnabledPromise: Promise<boolean> | null = null;
+  private autoReviewEnabledPromise: Promise<boolean> | null = null;
 
   constructor(
     private readonly logger: Logger,
     private readonly runtimeSettings?: ProviderRuntimeSettings,
+    private readonly deps: CodexAppServerAgentDeps = {},
   ) {}
+
+  private sessionDeps(): CodexAppServerAgentDeps {
+    return {
+      ...this.deps,
+      customCodexConfig: buildCodexCustomProviderConfig(
+        this.runtimeSettings,
+        this.deps.customProvider,
+      ),
+    };
+  }
+
+  private resolveGoalsEnabled(): Promise<boolean> {
+    if (!this.goalsEnabledPromise) {
+      this.goalsEnabledPromise = (async () => {
+        try {
+          const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
+          const versionOutput = await resolveBinaryVersion(launchPrefix.command);
+          const enabled = codexVersionAtLeast(versionOutput, CODEX_GOALS_MIN_VERSION);
+          this.logger.trace(
+            {
+              provider: CODEX_PROVIDER,
+              versionOutput,
+              enabled,
+            },
+            "provider.codex.config.goals_resolved",
+          );
+          return enabled;
+        } catch (error) {
+          this.logger.warn({ err: error }, "Failed to probe codex version for goals gate");
+          return false;
+        }
+      })();
+    }
+    return this.goalsEnabledPromise;
+  }
+
+  private resolveAutoReviewEnabled(): Promise<boolean> {
+    if (!this.autoReviewEnabledPromise) {
+      this.autoReviewEnabledPromise = (async () => {
+        try {
+          const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
+          const versionOutput = await resolveBinaryVersion(launchPrefix.command);
+          const enabled = codexVersionAtLeast(versionOutput, CODEX_AUTO_REVIEW_MIN_VERSION);
+          this.logger.trace(
+            {
+              provider: CODEX_PROVIDER,
+              versionOutput,
+              enabled,
+            },
+            "provider.codex.config.auto_review_resolved",
+          );
+          return enabled;
+        } catch (error) {
+          this.logger.warn({ err: error }, "Failed to probe codex version for auto-review gate");
+          return false;
+        }
+      })();
+    }
+    return this.autoReviewEnabledPromise;
+  }
 
   private async spawnAppServer(
     launchEnv?: Record<string, string>,
+    options?: { goalsEnabled?: boolean; agentId?: string },
   ): Promise<ChildProcessWithoutNullStreams> {
     const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
+    const args = [...launchPrefix.args, "app-server"];
+    if (options?.goalsEnabled) {
+      args.push("--enable", "goals");
+    }
     this.logger.trace(
       {
+        agentId: options?.agentId,
+        provider: CODEX_PROVIDER,
         launchPrefix,
+        goalsEnabled: options?.goalsEnabled === true,
       },
-      "Spawning Codex app server",
+      "provider.codex.spawn",
     );
-    return spawnProcess(launchPrefix.command, [...launchPrefix.args, "app-server"], {
+    const child = spawnProcess(launchPrefix.command, args, {
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
-      env: buildCodexAppServerEnv(this.runtimeSettings, launchEnv),
-    }) as ChildProcessWithoutNullStreams;
+      ...createProviderEnvSpec({
+        runtimeSettings: this.runtimeSettings,
+        overlays: [launchEnv],
+      }),
+    });
+    assertChildWithPipes(child);
+    return child;
   }
 
   async createSession(
     config: AgentSessionConfig,
     launchContext?: AgentLaunchContext,
+    options?: AgentCreateSessionOptions,
   ): Promise<AgentSession> {
+    if (options?.persistSession === false) {
+      this.logger.debug(
+        "Codex app-server does not expose an ephemeral-session option; persistSession=false is currently a no-op",
+      );
+      // TODO: Honor persistSession=false if app-server adds support, or route
+      // utility generations through `codex exec --ephemeral` in a larger change.
+    }
     const sessionConfig: AgentSessionConfig = { ...config, provider: CODEX_PROVIDER };
-    const session = new CodexAppServerAgentSession(sessionConfig, null, this.logger, () =>
-      this.spawnAppServer(launchContext?.env),
+    const goalsEnabled = await this.resolveGoalsEnabled();
+    const autoReviewEnabled = await this.resolveAutoReviewEnabled();
+    const session = new CodexAppServerAgentSession(
+      sessionConfig,
+      null,
+      this.logger,
+      () =>
+        this.spawnAppServer(launchContext?.env, { goalsEnabled, agentId: launchContext?.agentId }),
+      this.sessionDeps(),
+      options?.persistSession === false,
+      goalsEnabled,
+      autoReviewEnabled,
+      launchContext?.agentId,
     );
     await session.connect();
     return session;
@@ -4032,167 +5414,73 @@ export class CodexAppServerAgentClient implements AgentClient {
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
-    const storedConfig = (handle.metadata ?? {}) as AgentSessionConfig;
+    const storedConfig = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
     const merged: AgentSessionConfig = {
       ...storedConfig,
       ...overrides,
       provider: CODEX_PROVIDER,
       cwd: overrides?.cwd ?? storedConfig.cwd ?? process.cwd(),
     };
-    const session = new CodexAppServerAgentSession(merged, handle, this.logger, () =>
-      this.spawnAppServer(launchContext?.env),
+    const goalsEnabled = await this.resolveGoalsEnabled();
+    const autoReviewEnabled = await this.resolveAutoReviewEnabled();
+    const session = new CodexAppServerAgentSession(
+      merged,
+      handle,
+      this.logger,
+      () =>
+        this.spawnAppServer(launchContext?.env, { goalsEnabled, agentId: launchContext?.agentId }),
+      this.sessionDeps(),
+      false,
+      goalsEnabled,
+      autoReviewEnabled,
+      launchContext?.agentId,
     );
     await session.connect();
     return session;
   }
 
-  async listPersistedAgents(
-    options?: ListPersistedAgentsOptions,
-  ): Promise<PersistedAgentDescriptor[]> {
+  async listImportableSessions(
+    options?: ListImportableSessionsOptions,
+  ): Promise<ImportableProviderSession[]> {
     const child = await this.spawnAppServer();
-    const client = new CodexAppServerClient(child, this.logger);
+    const client =
+      this.deps._createCodexClient?.(child, this.logger, () => ({})) ??
+      new CodexAppServerClient(child, this.logger);
 
     try {
       await client.request("initialize", buildCodexAppServerInitializeParams());
       client.notify("initialized", {});
 
       const limit = options?.limit ?? 20;
-      const response = (await client.request("thread/list", { limit })) as {
-        data?: Array<any>;
-      };
-      const threads = Array.isArray(response?.data) ? response.data : [];
-      const descriptors: PersistedAgentDescriptor[] = [];
-
-      for (const thread of threads.slice(0, limit)) {
-        const threadId = thread.id;
-        const cwd = thread.cwd ?? process.cwd();
-        const title = thread.preview ?? null;
-        let timeline: AgentTimelineItem[] = [];
-        try {
-          const rolloutTimeline = await loadCodexPersistedTimeline(
-            threadId,
-            undefined,
-            this.logger,
-          );
-          const read = (await client.request("thread/read", {
-            threadId,
-            includeTurns: true,
-          })) as { thread?: { turns?: Array<{ items?: any[] }> } };
-          const turns = read.thread?.turns ?? [];
-          const itemsFromThreadRead: AgentTimelineItem[] = [];
-          for (const turn of turns) {
-            for (const item of turn.items ?? []) {
-              const timelineItem = threadItemToTimeline(item, { cwd });
-              if (timelineItem) itemsFromThreadRead.push(timelineItem);
-            }
-          }
-          timeline = rolloutTimeline.length > 0 ? rolloutTimeline : itemsFromThreadRead;
-        } catch {
-          timeline = [];
-        }
-
-        descriptors.push({
-          provider: CODEX_PROVIDER,
-          sessionId: threadId,
-          cwd,
-          title,
-          lastActivityAt: new Date((thread.updatedAt ?? thread.createdAt ?? 0) * 1000),
-          persistence: {
-            provider: CODEX_PROVIDER,
-            sessionId: threadId,
-            nativeHandle: threadId,
-            metadata: {
-              provider: CODEX_PROVIDER,
-              cwd,
-              title,
-              threadId,
-            },
-          },
-          timeline,
-        });
-      }
-
-      return descriptors;
-    } finally {
-      await client.dispose();
-    }
-  }
-
-  async listModels(_options?: ListModelsOptions): Promise<AgentModelDefinition[]> {
-    const child = await this.spawnAppServer();
-    const client = new CodexAppServerClient(child, this.logger);
-
-    try {
-      await client.request("initialize", buildCodexAppServerInitializeParams());
-      client.notify("initialized", {});
-
-      const response = (await client.request("model/list", {})) as { data?: Array<any> };
-      const models = Array.isArray(response?.data) ? response.data : [];
-      const configuredDefaults = await readCodexConfiguredDefaults(client, this.logger);
-      const configuredDefaultModelId = configuredDefaults.model;
-      const configuredDefaultThinkingOptionId = configuredDefaults.thinkingOptionId;
-      const hasConfiguredDefaultModel =
-        typeof configuredDefaultModelId === "string"
-          ? models.some((model) => model?.id === configuredDefaultModelId)
-          : false;
-      return models.map((model) => {
-        const defaultReasoningEffort = normalizeCodexThinkingOptionId(
-          typeof model.defaultReasoningEffort === "string" ? model.defaultReasoningEffort : null,
-        );
-        const resolvedDefaultReasoningEffort =
-          configuredDefaultThinkingOptionId ?? defaultReasoningEffort;
-
-        const thinkingById = new Map<string, { id: string; label: string; description?: string }>();
-        if (Array.isArray(model.supportedReasoningEfforts)) {
-          for (const entry of model.supportedReasoningEfforts) {
-            const id = normalizeCodexThinkingOptionId(
-              typeof entry?.reasoningEffort === "string" ? entry.reasoningEffort : null,
-            );
-            if (!id) continue;
-            const description =
-              typeof entry?.description === "string" && entry.description.trim().length > 0
-                ? entry.description
-                : undefined;
-            thinkingById.set(id, { id, label: id, description });
-          }
-        }
-
-        if (resolvedDefaultReasoningEffort && !thinkingById.has(resolvedDefaultReasoningEffort)) {
-          thinkingById.set(resolvedDefaultReasoningEffort, {
-            id: resolvedDefaultReasoningEffort,
-            label: resolvedDefaultReasoningEffort,
-            description:
-              configuredDefaultThinkingOptionId === resolvedDefaultReasoningEffort
-                ? "Configured default reasoning effort"
-                : "Model default reasoning effort",
-          });
-        }
-
-        const thinkingOptions = Array.from(thinkingById.values()).map((option) => ({
-          ...option,
-          isDefault: option.id === resolvedDefaultReasoningEffort,
-        }));
-        const defaultThinkingOptionId =
-          resolvedDefaultReasoningEffort ??
-          thinkingOptions.find((option) => option.isDefault)?.id ??
-          thinkingOptions[0]?.id;
-        const isDefaultModel = hasConfiguredDefaultModel
-          ? model.id === configuredDefaultModelId
-          : model.isDefault;
+      // thread/list returns the cheap `cwd` field. Fetch a wider window when
+      // filtering since most threads will be from other cwds, then keep the
+      // local realpath-aware filter for symlink-equivalent workspace paths.
+      const listLimit = options?.cwd ? Math.max(limit, 50) : limit;
+      const response = toObjectRecord(
+        await client.request("thread/list", {
+          limit: listLimit,
+          ...(options?.cwd ? { cwd: options.cwd } : {}),
+        }),
+      );
+      const allThreads = Array.isArray(response?.data) ? response.data.filter(isRecord) : [];
+      const threads = filterCodexThreadsByCwd(allThreads, options?.cwd);
+      return threads.slice(0, limit).map((thread) => {
+        const threadId = typeof thread.id === "string" ? thread.id : "";
+        const cwd = typeof thread.cwd === "string" ? thread.cwd : process.cwd();
+        const preview = typeof thread.preview === "string" ? thread.preview : null;
+        const title = typeof thread.name === "string" && thread.name.trim() ? thread.name : preview;
 
         return {
-          provider: CODEX_PROVIDER,
-          id: model.id,
-          label: normalizeCodexModelLabel(model.displayName),
-          description: model.description,
-          isDefault: isDefaultModel,
-          thinkingOptions: thinkingOptions.length > 0 ? thinkingOptions : undefined,
-          defaultThinkingOptionId,
-          metadata: {
-            model: model.model,
-            defaultReasoningEffort: model.defaultReasoningEffort,
-            supportedReasoningEfforts: model.supportedReasoningEfforts,
-          },
+          providerHandleId: threadId,
+          cwd,
+          title,
+          firstPromptPreview: preview,
+          lastPromptPreview: preview,
+          lastActivityAt: new Date(
+            ((typeof thread.updatedAt === "number" ? thread.updatedAt : undefined) ??
+              (typeof thread.createdAt === "number" ? thread.createdAt : undefined) ??
+              0) * 1000,
+          ),
         };
       });
     } finally {
@@ -4200,49 +5488,110 @@ export class CodexAppServerAgentClient implements AgentClient {
     }
   }
 
-  async isAvailable(): Promise<boolean> {
-    const command = this.runtimeSettings?.command;
-    if (command?.mode === "replace") {
-      return await isCommandAvailable(command.argv[0]);
+  async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
+    return importSessionFromPersistence({
+      provider: CODEX_PROVIDER,
+      request: input,
+      context,
+      resumeSession: this.resumeSession.bind(this),
+    });
+  }
+
+  async fetchCatalog(_options: FetchCatalogOptions): Promise<ProviderCatalog> {
+    const models = await this.fetchModelsFromAppServer();
+    return { models, modes: CODEX_MODES };
+  }
+
+  private async fetchModelsFromAppServer(): Promise<AgentModelDefinition[]> {
+    // Codex model/list is global to the app server in this flow; cwd/force are intentionally ignored.
+    const child = await this.spawnAppServer();
+    const client = new CodexAppServerClient(child, this.logger);
+
+    try {
+      await client.request("initialize", buildCodexAppServerInitializeParams());
+      client.notify("initialized", {});
+
+      const rawResponse = await client.request("model/list", {});
+      const parsedResponse = CodexModelListResponseSchema.safeParse(rawResponse);
+      const models = parsedResponse.success ? (parsedResponse.data.data ?? []) : [];
+      const configuredDefaults = await readCodexConfiguredDefaults(client, this.logger);
+      const configuredDefaultModelId = configuredDefaults.model;
+      const configuredDefaultThinkingOptionId = configuredDefaults.thinkingOptionId;
+      const hasConfiguredDefaultModel =
+        typeof configuredDefaultModelId === "string"
+          ? models.some((model) => model?.id === configuredDefaultModelId)
+          : false;
+      return models.map((model) =>
+        buildCodexModelDefinition(model, {
+          configuredDefaultModelId,
+          configuredDefaultThinkingOptionId,
+          hasConfiguredDefaultModel,
+        }),
+      );
+    } finally {
+      await client.dispose();
     }
-    return true;
+  }
+
+  async archiveNativeSession(handle: AgentPersistenceHandle): Promise<void> {
+    const threadId = handle.nativeHandle ?? handle.sessionId;
+    if (!threadId) return;
+
+    const child = await this.spawnAppServer();
+    const client = new CodexAppServerClient(child, this.logger);
+
+    try {
+      await client.request("initialize", buildCodexAppServerInitializeParams());
+      client.notify("initialized", {});
+      await client.request("thread/archive", { threadId });
+    } finally {
+      await client.dispose();
+    }
+  }
+
+  async unarchiveNativeSession(handle: AgentPersistenceHandle): Promise<void> {
+    const threadId = handle.nativeHandle ?? handle.sessionId;
+    if (!threadId) return;
+
+    const child = await this.spawnAppServer();
+    const client = new CodexAppServerClient(child, this.logger);
+
+    try {
+      await client.request("initialize", buildCodexAppServerInitializeParams());
+      client.notify("initialized", {});
+      try {
+        await client.request("thread/unarchive", { threadId });
+      } catch (error) {
+        if (!isCodexAlreadyUnarchivedError(error, threadId)) {
+          throw error;
+        }
+        try {
+          await client.request("thread/read", { threadId });
+        } catch {
+          throw error;
+        }
+      }
+    } finally {
+      await client.dispose();
+    }
+  }
+
+  async isAvailable(): Promise<boolean> {
+    const launch = await resolveCodexLaunch(this.runtimeSettings);
+    const availability = await checkCodexLaunchAvailable(launch);
+    return availability.available;
   }
 
   async getDiagnostic(): Promise<{ diagnostic: string }> {
     try {
-      const available = await this.isAvailable();
-      const resolvedBinary = await findExecutable("codex");
+      const launch = await resolveCodexLaunch(this.runtimeSettings);
+      const availability = await checkCodexLaunchAvailable(launch);
       const entries: Array<{ label: string; value: string }> = [
-        {
-          label: "Binary",
-          value: resolvedBinary ?? "not found",
-        },
-        {
-          label: "Version",
-          value: resolvedBinary ? await resolveBinaryVersion(resolvedBinary) : "unknown",
-        },
+        ...(await buildCommandResolutionDiagnosticRows(launch, {
+          knownBinaryNames: ["codex"],
+        })),
+        ...(await buildBinaryDiagnosticRows(launch, availability)),
       ];
-      let status = formatDiagnosticStatus(available);
-
-      if (!available) {
-        entries.push({ label: "Models", value: "Not checked" });
-      } else {
-        try {
-          const models = await this.listModels();
-          entries.push({ label: "Models", value: String(models.length) });
-        } catch (error) {
-          entries.push({
-            label: "Models",
-            value: `Error - ${toDiagnosticErrorMessage(error)}`,
-          });
-          status = formatDiagnosticStatus(available, {
-            source: "model fetch",
-            cause: error,
-          });
-        }
-      }
-
-      entries.push({ label: "Status", value: status });
 
       return {
         diagnostic: formatProviderDiagnostic("Codex", entries),
@@ -4255,17 +5604,96 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 }
 
-export const __codexAppServerInternals = {
-  buildCodexAppServerEnv,
-  codexModelSupportsFastMode,
-  CodexAppServerAgentSession,
-  formatCodexQuestionPrompts,
-  mapCodexQuestionRequestToToolCall,
-  mapCodexPatchNotificationToToolCall,
-  planStepsToMarkdown,
-  mapCodexPlanToToolCall,
-  normalizeCodexOutputSchema,
-  normalizeCodexQuestionPrompts,
-  toAgentUsage,
-  threadItemToTimeline,
-};
+interface CodexModelBuildContext {
+  configuredDefaultModelId: string | undefined;
+  configuredDefaultThinkingOptionId: string | undefined;
+  hasConfiguredDefaultModel: boolean;
+}
+
+function buildCodexModelDefinition(
+  model: CodexModel,
+  ctx: CodexModelBuildContext,
+): AgentModelDefinition {
+  const defaultReasoningEffort = normalizeCodexThinkingOptionId(
+    typeof model.defaultReasoningEffort === "string" ? model.defaultReasoningEffort : null,
+  );
+  const resolvedDefaultReasoningEffort =
+    ctx.configuredDefaultThinkingOptionId ?? defaultReasoningEffort;
+
+  const thinkingById = buildCodexThinkingOptionMap(
+    model.supportedReasoningEfforts,
+    resolvedDefaultReasoningEffort,
+    ctx.configuredDefaultThinkingOptionId,
+  );
+
+  const thinkingOptions = Array.from(thinkingById.values()).map((option) =>
+    Object.assign({}, option, {
+      isDefault: option.id === resolvedDefaultReasoningEffort,
+    }),
+  );
+  const defaultThinkingOptionId =
+    resolvedDefaultReasoningEffort ??
+    thinkingOptions.find((option) => option.isDefault)?.id ??
+    thinkingOptions[0]?.id;
+  const isDefaultModel = ctx.hasConfiguredDefaultModel
+    ? model.id === ctx.configuredDefaultModelId
+    : model.isDefault;
+
+  return {
+    provider: CODEX_PROVIDER,
+    id: model.id,
+    label: normalizeCodexModelLabel(model.displayName ?? ""),
+    description: model.description,
+    isDefault: isDefaultModel,
+    thinkingOptions: thinkingOptions.length > 0 ? thinkingOptions : undefined,
+    defaultThinkingOptionId,
+    metadata: {
+      model: model.model,
+      defaultReasoningEffort: model.defaultReasoningEffort,
+      supportedReasoningEfforts: model.supportedReasoningEfforts,
+    },
+  };
+}
+
+function buildCodexThinkingOptionMap(
+  supportedReasoningEfforts: CodexReasoningEffortEntry[] | undefined,
+  resolvedDefaultReasoningEffort: string | undefined,
+  configuredDefaultThinkingOptionId: string | undefined,
+): Map<string, { id: string; label: string; description?: string }> {
+  const thinkingById = new Map<string, { id: string; label: string; description?: string }>();
+  if (Array.isArray(supportedReasoningEfforts)) {
+    for (const entry of supportedReasoningEfforts) {
+      const id = normalizeCodexThinkingOptionId(
+        typeof entry?.reasoningEffort === "string" ? entry.reasoningEffort : null,
+      );
+      if (!id) continue;
+      const description =
+        typeof entry?.description === "string" && entry.description.trim().length > 0
+          ? entry.description
+          : undefined;
+      thinkingById.set(id, { id, label: id, description });
+    }
+  }
+
+  if (resolvedDefaultReasoningEffort && !thinkingById.has(resolvedDefaultReasoningEffort)) {
+    thinkingById.set(resolvedDefaultReasoningEffort, {
+      id: resolvedDefaultReasoningEffort,
+      label: resolvedDefaultReasoningEffort,
+      description:
+        configuredDefaultThinkingOptionId === resolvedDefaultReasoningEffort
+          ? "Configured default reasoning effort"
+          : "Model default reasoning effort",
+    });
+  }
+  return thinkingById;
+}
+
+function resolveSkillDescription(skill: Record<string, unknown>): string {
+  if (typeof skill.description === "string") {
+    return skill.description;
+  }
+  if (typeof skill.shortDescription === "string") {
+    return skill.shortDescription;
+  }
+  return "Skill";
+}

@@ -1,4 +1,4 @@
-import type { ReactElement } from "react";
+import React, { useMemo, type ReactElement } from "react";
 import { Text, View, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { formatShortcut, type ShortcutKey } from "@/utils/format-shortcut";
@@ -19,24 +19,28 @@ export function Shortcut({
   const shortcutOs = getShortcutOs();
   const singleCombo = displayChord[0];
 
+  const badgeStyle = useMemo(() => [styles.badge, style], [style]);
+  const textCombinedStyle = useMemo(() => [styles.text, textStyle], [textStyle]);
+  const sequenceStyle = useMemo(() => [styles.sequence, style], [style]);
+
   if (!singleCombo) {
     return <View style={style} />;
   }
 
   if (displayChord.length === 1) {
     return (
-      <View style={[styles.badge, style]}>
-        <Text style={[styles.text, textStyle]}>{formatShortcut(singleCombo, shortcutOs)}</Text>
+      <View style={badgeStyle}>
+        <Text style={textCombinedStyle}>{formatShortcut(singleCombo, shortcutOs)}</Text>
       </View>
     );
   }
 
   return (
-    <View style={[styles.sequence, style]}>
-      {displayChord.map(function (combo, index) {
+    <View style={sequenceStyle}>
+      {displayChord.map(function (combo) {
         return (
-          <View key={`${combo.join("+")}-${index}`} style={styles.badge}>
-            <Text style={[styles.text, textStyle]}>{formatShortcut(combo, shortcutOs)}</Text>
+          <View key={combo.join("+")} style={styles.badge}>
+            <Text style={textCombinedStyle}>{formatShortcut(combo, shortcutOs)}</Text>
           </View>
         );
       })}
@@ -50,8 +54,7 @@ const styles = StyleSheet.create((theme) => ({
     paddingVertical: 2,
     borderRadius: theme.borderRadius.md,
     backgroundColor: theme.colors.surface2,
-    borderWidth: theme.borderWidth[1],
-    borderColor: theme.colors.borderAccent,
+    borderWidth: 0,
   },
   sequence: {
     flexDirection: "row",

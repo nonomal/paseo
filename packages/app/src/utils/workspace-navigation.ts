@@ -1,42 +1,32 @@
+import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
-import { generateDraftId } from "@/stores/draft-keys";
 import {
-  buildWorkspaceTabPersistenceKey,
-  type WorkspaceTabTarget,
-} from "@/stores/workspace-tabs-store";
-import { buildHostWorkspaceRoute } from "@/utils/host-routes";
+  prepareWorkspaceTab as prepareWorkspaceTabPure,
+  navigateToPreparedWorkspaceTab as navigateToPreparedWorkspaceTabPure,
+  type PrepareWorkspaceTabInput,
+  type NavigateToPreparedWorkspaceTabInput,
+} from "./prepare-workspace-tab";
 
-interface PrepareWorkspaceTabInput {
-  serverId: string;
-  workspaceId: string;
-  target: WorkspaceTabTarget;
-  pin?: boolean;
+export type {
+  PrepareWorkspaceTabInput,
+  NavigateToPreparedWorkspaceTabInput,
+} from "./prepare-workspace-tab";
+
+function layoutStoreDeps() {
+  const store = useWorkspaceLayoutStore.getState();
+  return {
+    openTabFocused: store.openTabFocused,
+    pinAgent: store.pinAgent,
+  };
 }
 
-function getPreparedTarget(target: WorkspaceTabTarget): WorkspaceTabTarget {
-  if (target.kind !== "draft" || target.draftId.trim() !== "new") {
-    return target;
-  }
-  return { kind: "draft", draftId: generateDraftId() };
+export function prepareWorkspaceTab(input: PrepareWorkspaceTabInput): string {
+  return prepareWorkspaceTabPure(input, layoutStoreDeps());
 }
 
-export function prepareWorkspaceTab(input: PrepareWorkspaceTabInput) {
-  const target = getPreparedTarget(input.target);
-  const key =
-    buildWorkspaceTabPersistenceKey({
-      serverId: input.serverId,
-      workspaceId: input.workspaceId,
-    }) ?? "";
-
-  const tabId = useWorkspaceLayoutStore.getState().openTab(key, target);
-
-  if (tabId) {
-    useWorkspaceLayoutStore.getState().focusTab(key, tabId);
-  }
-
-  if (input.pin && target.kind === "agent") {
-    useWorkspaceLayoutStore.getState().pinAgent(key, target.agentId);
-  }
-
-  return buildHostWorkspaceRoute(input.serverId, input.workspaceId);
+export function navigateToPreparedWorkspaceTab(input: NavigateToPreparedWorkspaceTabInput): string {
+  return navigateToPreparedWorkspaceTabPure(input, {
+    ...layoutStoreDeps(),
+    navigateToWorkspace,
+  });
 }

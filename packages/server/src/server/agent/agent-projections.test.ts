@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import { AGENT_LIFECYCLE_STATUSES, type AgentLifecycleStatus } from "./agent-manager.js";
-import { toAgentPayload, toStoredAgentRecord, type ManagedAgent } from "./agent-projections.js";
+import { AGENT_LIFECYCLE_STATUSES } from "./agent-manager.js";
+import {
+  toAgentPayload,
+  toRecentProviderSessionDescriptorPayload,
+  toStoredAgentRecord,
+  type ManagedAgent,
+} from "./agent-projections.js";
+import type { AgentSession } from "./agent-sdk-types.js";
 import type {
   AgentFeature,
+  ImportableProviderSession,
   AgentPermissionRequest,
   AgentPersistenceHandle,
   AgentSessionConfig,
@@ -40,7 +47,8 @@ function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent
     ...restOverrides
   } = overrides;
 
-  const sessionValue = lifecycle === "closed" ? null : (restOverrides.session ?? ({} as any));
+  const sessionValue =
+    lifecycle === "closed" ? null : (restOverrides.session ?? ({} as AgentSession));
   const activeForegroundTurnIdValue =
     restOverrides.activeForegroundTurnId ?? (lifecycle === "running" ? "test-turn-id" : null);
   const lastErrorValue =
@@ -201,7 +209,7 @@ describe("toStoredAgentRecord", () => {
 
   it("propagates lifecycle status for all states", () => {
     for (const status of AGENT_LIFECYCLE_STATUSES) {
-      const agent = createManagedAgent({ lifecycle: status as AgentLifecycleStatus });
+      const agent = createManagedAgent({ lifecycle: status });
       const record = toStoredAgentRecord(agent);
       expect(record.lastStatus).toBe(status);
     }
@@ -250,7 +258,7 @@ describe("toAgentPayload", () => {
     expect(payload.lastUsage).toEqual(agent.lastUsage);
     expect(payload.lastUsage).not.toBe(agent.lastUsage);
     expect(payload.lastError).toBe("boom");
-    expect((payload as any).session).toBeUndefined();
+    expect((payload as unknown as { session?: unknown }).session).toBeUndefined();
 
     payload.availableModes[0].label = "Changed";
     expect(agent.availableModes[0].label).toBe("Planning");
@@ -299,7 +307,7 @@ describe("toAgentPayload", () => {
 
   it("propagates lifecycle status for all states", () => {
     for (const status of AGENT_LIFECYCLE_STATUSES) {
-      const agent = createManagedAgent({ lifecycle: status as AgentLifecycleStatus });
+      const agent = createManagedAgent({ lifecycle: status });
       const payload = toAgentPayload(agent);
       expect(payload.status).toBe(status);
     }
@@ -310,7 +318,7 @@ describe("toAgentPayload", () => {
       persistence: {
         provider: "codex",
         sessionId: "persist-99",
-        nativeHandle: { id: "native" } as any,
+        nativeHandle: { id: "native" } as unknown,
         metadata: { restored: new Date("2025-03-01T00:00:00.000Z"), empty: {} },
       },
     });
@@ -388,5 +396,61 @@ describe("toAgentPayload", () => {
     const payload = toAgentPayload(agent);
 
     expect(payload.features).toEqual(features);
+  });
+});
+
+describe("toRecentProviderSessionDescriptorPayload", () => {
+  it("projects provider import rows to provider-opaque public recent sessions", () => {
+    const session: ImportableProviderSession & { provider: string } = {
+      provider: "codex-custom",
+      providerHandleId: "provider-native-handle",
+      cwd: "/tmp/project",
+      title: "Import me",
+      firstPromptPreview: "First prompt with spacing",
+      lastPromptPreview: "Second prompt",
+      lastActivityAt: new Date("2026-04-30T12:34:56.000Z"),
+    };
+
+    const payload = toRecentProviderSessionDescriptorPayload(session, {
+      providerLabel: "Custom Codex",
+    });
+
+    expect(payload).toEqual({
+      providerId: "codex-custom",
+      providerLabel: "Custom Codex",
+      providerHandleId: "provider-native-handle",
+      cwd: "/tmp/project",
+      title: "Import me",
+      firstPromptPreview: "First prompt with spacing",
+      lastPromptPreview: "Second prompt",
+      lastActivityAt: "2026-04-30T12:34:56.000Z",
+    });
+    expect(payload).not.toHaveProperty("providerKind");
+    expect(payload).not.toHaveProperty("sessionId");
+    expect(payload).not.toHaveProperty("nativeHandle");
+  });
+
+  it("preserves null prompt previews", () => {
+    const session: ImportableProviderSession & { provider: string } = {
+      provider: "claude-custom",
+      providerHandleId: "provider-session-id",
+      cwd: "/tmp/project",
+      title: null,
+      lastActivityAt: new Date("2026-04-30T12:34:56.000Z"),
+      firstPromptPreview: null,
+      lastPromptPreview: null,
+    };
+
+    expect(
+      toRecentProviderSessionDescriptorPayload(session, {
+        providerLabel: "Custom Claude",
+      }),
+    ).toMatchObject({
+      providerId: "claude-custom",
+      providerLabel: "Custom Claude",
+      providerHandleId: "provider-session-id",
+      firstPromptPreview: null,
+      lastPromptPreview: null,
+    });
   });
 });

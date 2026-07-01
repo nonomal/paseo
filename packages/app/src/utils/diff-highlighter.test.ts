@@ -6,7 +6,6 @@ import {
   highlightDiffFile,
   parseAndHighlightDiff,
   type ParsedDiffFile,
-  type DiffHunk,
 } from "./diff-highlighter";
 
 const SIMPLE_DIFF = `diff --git a/example.ts b/example.ts
@@ -186,6 +185,58 @@ describe("parseDiff", () => {
     expect(hunk.lines[3].content).toBe("const bar = 3;");
   });
 
+  it("parses no-prefix git diff headers", () => {
+    const files = parseDiff(
+      SIMPLE_DIFF.replace("a/example.ts b/example.ts", "example.ts example.ts")
+        .replace("--- a/example.ts", "--- example.ts")
+        .replace("+++ b/example.ts", "+++ example.ts"),
+    );
+
+    expect(files).toHaveLength(1);
+    expect(files[0].path).toBe("example.ts");
+    expect(files[0].additions).toBe(1);
+    expect(files[0].deletions).toBe(1);
+    expect(files[0].hunks).toHaveLength(1);
+  });
+
+  it("parses paths with spaces", () => {
+    const files = parseDiff(SIMPLE_DIFF.replaceAll("example.ts", "file with space.ts"));
+
+    expect(files).toHaveLength(1);
+    expect(files[0].path).toBe("file with space.ts");
+    expect(files[0].hunks).toHaveLength(1);
+  });
+
+  it("parses no-prefix paths with spaces", () => {
+    const files = parseDiff(
+      SIMPLE_DIFF.replaceAll("example.ts", "file with space.ts")
+        .replace(
+          "a/file with space.ts b/file with space.ts",
+          "file with space.ts file with space.ts",
+        )
+        .replace("--- a/file with space.ts", "--- file with space.ts")
+        .replace("+++ b/file with space.ts", "+++ file with space.ts"),
+    );
+
+    expect(files).toHaveLength(1);
+    expect(files[0].path).toBe("file with space.ts");
+    expect(files[0].hunks).toHaveLength(1);
+  });
+
+  it("preserves no-prefix paths that start with a or b", () => {
+    const files = parseDiff(
+      `${SIMPLE_DIFF.replace(
+        "diff --git a/example.ts b/example.ts",
+        "diff --git a/example.ts a/example.ts",
+      ).replace("--- a/example.ts\n+++ b/example.ts", "--- a/example.ts\n+++ a/example.ts")}
+${SIMPLE_DIFF.replaceAll("example.ts", "other.ts")
+  .replace("diff --git a/other.ts b/other.ts", "diff --git b/other.ts b/other.ts")
+  .replace("--- a/other.ts\n+++ b/other.ts", "--- b/other.ts\n+++ b/other.ts")}`,
+    );
+
+    expect(files.map((file) => file.path)).toEqual(["a/example.ts", "b/other.ts"]);
+  });
+
   it("parses a diff with multiple hunks", () => {
     const files = parseDiff(MULTI_HUNK_DIFF);
 
@@ -286,18 +337,12 @@ describe("highlightDiffFile", () => {
 
     // First content line: "const foo = 1;"
     const constLine = hunk.lines[1];
-    expect(constLine.tokens).toBeDefined();
-    expect(constLine.tokens!.length).toBeGreaterThan(0);
-
-    // Should have a "keyword" token for "const"
-    const constToken = constLine.tokens!.find((t) => t.text === "const");
-    expect(constToken).toBeDefined();
-    expect(constToken!.style).toBe("keyword");
-
-    // Should have a "number" token for "1"
-    const numberToken = constLine.tokens!.find((t) => t.text === "1");
-    expect(numberToken).toBeDefined();
-    expect(numberToken!.style).toBe("number");
+    expect(constLine.tokens).toContainEqual(
+      expect.objectContaining({ text: "const", style: "keyword" }),
+    );
+    expect(constLine.tokens).toContainEqual(
+      expect.objectContaining({ text: "1", style: "number" }),
+    );
   });
 
   it("highlights both added and removed lines correctly", () => {
@@ -307,15 +352,15 @@ describe("highlightDiffFile", () => {
 
     // Removed line: "const bar = 2;"
     const removedLine = hunk.lines.find((l) => l.type === "remove" && l.content.includes("bar"));
-    expect(removedLine?.tokens).toBeDefined();
-    const removedNumber = removedLine!.tokens!.find((t) => t.text === "2");
-    expect(removedNumber?.style).toBe("number");
+    expect(removedLine?.tokens).toContainEqual(
+      expect.objectContaining({ text: "2", style: "number" }),
+    );
 
     // Added line: "const bar = 3;"
     const addedLine = hunk.lines.find((l) => l.type === "add" && l.content.includes("bar"));
-    expect(addedLine?.tokens).toBeDefined();
-    const addedNumber = addedLine!.tokens!.find((t) => t.text === "3");
-    expect(addedNumber?.style).toBe("number");
+    expect(addedLine?.tokens).toContainEqual(
+      expect.objectContaining({ text: "3", style: "number" }),
+    );
   });
 
   it("does not modify unsupported file types", () => {
@@ -352,15 +397,16 @@ describe("highlightDiffFile", () => {
     const highlighted = highlightDiffFile(files[0]);
     const hunk = highlighted.hunks[0];
 
-    const fnLine = hunk.lines[1];
-    expect(fnLine.tokens).toBeDefined();
-    expect(fnLine.tokens!.some((t) => t.text === "fn" && t.style === "keyword")).toBe(true);
+    expect(hunk.lines[1].tokens).toContainEqual(
+      expect.objectContaining({ text: "fn", style: "keyword" }),
+    );
 
     const addedLine = hunk.lines.find(
       (line) => line.type === "add" && line.content.includes("version"),
     );
-    expect(addedLine?.tokens).toBeDefined();
-    expect(addedLine!.tokens!.some((t) => t.text === "2" && t.style === "number")).toBe(true);
+    expect(addedLine?.tokens).toContainEqual(
+      expect.objectContaining({ text: "2", style: "number" }),
+    );
   });
 
   it("adds syntax highlighting tokens to C code", () => {
@@ -368,15 +414,14 @@ describe("highlightDiffFile", () => {
     const highlighted = highlightDiffFile(files[0]);
     const hunk = highlighted.hunks[0];
 
-    const mainLine = hunk.lines[1];
-    expect(mainLine.tokens).toBeDefined();
-    expect(mainLine.tokens!.length).toBeGreaterThan(0);
+    expect(hunk.lines[1].tokens?.length).toBeGreaterThan(0);
 
     const addedLine = hunk.lines.find(
       (line) => line.type === "add" && line.content.includes("version"),
     );
-    expect(addedLine?.tokens).toBeDefined();
-    expect(addedLine!.tokens!.some((t) => t.text === "2" && t.style === "number")).toBe(true);
+    expect(addedLine?.tokens).toContainEqual(
+      expect.objectContaining({ text: "2", style: "number" }),
+    );
   });
 
   it("adds syntax highlighting tokens to Java code", () => {
@@ -384,15 +429,16 @@ describe("highlightDiffFile", () => {
     const highlighted = highlightDiffFile(files[0]);
     const hunk = highlighted.hunks[0];
 
-    const classLine = hunk.lines[1];
-    expect(classLine.tokens).toBeDefined();
-    expect(classLine.tokens!.some((t) => t.text === "public" && t.style === "keyword")).toBe(true);
+    expect(hunk.lines[1].tokens).toContainEqual(
+      expect.objectContaining({ text: "public", style: "keyword" }),
+    );
 
     const addedLine = hunk.lines.find(
       (line) => line.type === "add" && line.content.includes("version"),
     );
-    expect(addedLine?.tokens).toBeDefined();
-    expect(addedLine!.tokens!.some((t) => t.text === "2" && t.style === "number")).toBe(true);
+    expect(addedLine?.tokens).toContainEqual(
+      expect.objectContaining({ text: "2", style: "number" }),
+    );
   });
 
   it("adds syntax highlighting tokens to Objective-C file extensions", () => {
@@ -403,8 +449,9 @@ describe("highlightDiffFile", () => {
     const addedLine = hunk.lines.find(
       (line) => line.type === "add" && line.content.includes("version"),
     );
-    expect(addedLine?.tokens).toBeDefined();
-    expect(addedLine!.tokens!.some((t) => t.text === "2" && t.style === "number")).toBe(true);
+    expect(addedLine?.tokens).toContainEqual(
+      expect.objectContaining({ text: "2", style: "number" }),
+    );
   });
 
   it("adds syntax highlighting tokens to Go code", () => {
@@ -414,8 +461,9 @@ describe("highlightDiffFile", () => {
       (line) => line.type === "add" && line.content.includes("version"),
     );
 
-    expect(addedLine?.tokens).toBeDefined();
-    expect(addedLine!.tokens!.some((t) => t.text === "2" && t.style === "number")).toBe(true);
+    expect(addedLine?.tokens).toContainEqual(
+      expect.objectContaining({ text: "2", style: "number" }),
+    );
   });
 
   it("adds syntax highlighting tokens to PHP code", () => {
@@ -425,8 +473,9 @@ describe("highlightDiffFile", () => {
       (line) => line.type === "add" && line.content.includes("$version"),
     );
 
-    expect(addedLine?.tokens).toBeDefined();
-    expect(addedLine!.tokens!.some((t) => t.text === "2" && t.style === "number")).toBe(true);
+    expect(addedLine?.tokens).toContainEqual(
+      expect.objectContaining({ text: "2", style: "number" }),
+    );
   });
 
   it("adds syntax highlighting tokens to YAML code", () => {
@@ -436,8 +485,7 @@ describe("highlightDiffFile", () => {
       (line) => line.type === "add" && line.content.includes("count"),
     );
 
-    expect(addedLine?.tokens).toBeDefined();
-    expect(addedLine!.tokens!.length).toBeGreaterThan(0);
+    expect(addedLine?.tokens?.length).toBeGreaterThan(0);
   });
 
   it("adds syntax highlighting tokens to XML code", () => {
@@ -447,8 +495,7 @@ describe("highlightDiffFile", () => {
       (line) => line.type === "add" && line.content.includes("<count>"),
     );
 
-    expect(addedLine?.tokens).toBeDefined();
-    expect(addedLine!.tokens!.some((t) => t.style === "tag")).toBe(true);
+    expect(addedLine?.tokens).toContainEqual(expect.objectContaining({ style: "tag" }));
   });
 });
 
@@ -457,7 +504,9 @@ describe("parseAndHighlightDiff", () => {
     const files = parseAndHighlightDiff(SIMPLE_DIFF);
 
     expect(files).toHaveLength(1);
-    expect(files[0].hunks[0].lines[1].tokens).toBeDefined();
+    expect(files[0].hunks[0].lines[1].tokens).toContainEqual(
+      expect.objectContaining({ text: "const", style: "keyword" }),
+    );
   });
 
   it("handles multiple files", () => {

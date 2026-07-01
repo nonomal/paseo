@@ -21,8 +21,11 @@ export function startCommand(): Command {
     .option("--home <path>", "Paseo home directory (default: ~/.paseo)")
     .option("--foreground", "Run in foreground (don't daemonize)")
     .option("--no-relay", "Disable relay connection")
+    .option("--relay-use-tls", "Use wss:// for the relay connection and pairing offers")
     .option("--no-mcp", "Disable the Agent MCP HTTP endpoint")
     .option("--no-inject-mcp", "Disable auto-injecting the Paseo MCP into created agents")
+    .option("--web-ui", "Enable the bundled daemon web UI")
+    .option("--no-web-ui", "Disable the bundled daemon web UI")
     .option(
       "--hostnames <hosts>",
       'Daemon hostnames (comma-separated, e.g. "myhost,.example.com" or "true" for any)',

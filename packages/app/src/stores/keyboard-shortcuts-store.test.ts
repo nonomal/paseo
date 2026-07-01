@@ -4,13 +4,11 @@ import { useKeyboardShortcutsStore } from "./keyboard-shortcuts-store";
 beforeEach(() => {
   useKeyboardShortcutsStore.setState({
     commandCenterOpen: false,
-    projectPickerOpen: false,
     shortcutsDialogOpen: false,
     capturingShortcut: false,
     altDown: false,
     cmdOrCtrlDown: false,
     sidebarShortcutWorkspaceTargets: [],
-    visibleWorkspaceTargets: [],
   });
 });
 

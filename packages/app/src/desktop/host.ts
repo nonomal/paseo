@@ -1,5 +1,15 @@
 import { Platform } from "react-native";
 import { getElectronHost } from "@/desktop/electron/host";
+import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
+
+type BrowserAutomationExecuteRequest = Extract<
+  SessionOutboundMessage,
+  { type: "browser.automation.execute.request" }
+>;
+type BrowserAutomationExecuteResponse = Extract<
+  SessionInboundMessage,
+  { type: "browser.automation.execute.response" }
+>;
 
 export type DesktopNotificationPermission = "granted" | "denied" | "default";
 
@@ -21,8 +31,22 @@ export interface DesktopDialogOpenOptions {
   }>;
 }
 
+export interface DesktopDialogAskWithCheckboxOptions extends DesktopDialogAskOptions {
+  checkboxLabel: string;
+  checkboxChecked?: boolean;
+}
+
+export interface DesktopDialogAskWithCheckboxResult {
+  confirmed: boolean;
+  dontAskAgain: boolean;
+}
+
 export interface DesktopDialogBridge {
   ask?: (message: string, options?: DesktopDialogAskOptions) => Promise<boolean>;
+  askWithCheckbox?: (
+    message: string,
+    options: DesktopDialogAskWithCheckboxOptions,
+  ) => Promise<DesktopDialogAskWithCheckboxResult>;
   open?: (options?: DesktopDialogOpenOptions) => Promise<string | string[] | null>;
 }
 
@@ -35,6 +59,28 @@ export interface DesktopNotificationBridge {
 
 export interface DesktopOpenerBridge {
   openUrl?: (url: string) => Promise<void>;
+}
+
+export interface DesktopEditorTargetDescriptor {
+  id: string;
+  label: string;
+  kind: "editor" | "file-manager";
+}
+
+export interface DesktopEditorOpenTargetInput {
+  editorId: string;
+  path: string;
+  cwd?: string;
+  mode?: "open" | "reveal";
+}
+
+export interface DesktopEditorBridge {
+  listTargets?: () => Promise<DesktopEditorTargetDescriptor[]>;
+  openTarget?: (input: DesktopEditorOpenTargetInput) => Promise<void>;
+}
+
+export interface DesktopWebUtilsBridge {
+  getPathForFile?: (file: File) => string;
 }
 
 export interface DesktopMenuBridge {
@@ -62,11 +108,43 @@ export interface DesktopWindowBridge {
 }
 
 export interface DesktopWindowModuleBridge {
+  openNew?: (options?: { pendingOpenProjectPath?: string | null }) => Promise<void>;
   getCurrentWindow?: () => DesktopWindowBridge;
 }
 
 export interface DesktopEventsBridge {
   on?: (event: string, handler: (payload: unknown) => void) => Promise<() => void> | (() => void);
+}
+
+export interface DesktopBrowserShortcutEvent {
+  browserId?: string;
+  action: "focus-url";
+}
+
+export interface DesktopBrowserNewTabRequestEvent {
+  sourceBrowserId: string;
+  url: string;
+}
+
+export interface DesktopBrowserBridge {
+  registerWorkspaceBrowser?: (input: { browserId: string; workspaceId: string }) => Promise<void>;
+  setWorkspaceActiveBrowser?: (input: {
+    workspaceId: string;
+    browserId: string | null;
+  }) => Promise<void>;
+  setAgentActiveBrowser?: (input: { agentId: string; browserId: string | null }) => Promise<void>;
+  openDevTools?: (browserId: string) => Promise<unknown>;
+  clearPartition?: (browserId: string) => Promise<void>;
+  executeAutomationCommand?: (
+    request: BrowserAutomationExecuteRequest,
+  ) => Promise<BrowserAutomationExecuteResponse["payload"]>;
+  /** Capture a PNG screenshot of the guest viewport cropped to `rect`. */
+  captureElement?: (
+    browserId: string,
+    rect: { x: number; y: number; width: number; height: number },
+  ) => Promise<string | null>;
+  /** Copy element text and/or an image to the system clipboard from main. */
+  copyElement?: (payload: { text?: string; imageDataUrl?: string }) => Promise<boolean>;
 }
 
 export interface DesktopInvokeBridge {
@@ -82,7 +160,10 @@ export interface DesktopHostBridge {
   dialog?: DesktopDialogBridge;
   notification?: DesktopNotificationBridge;
   opener?: DesktopOpenerBridge;
+  editor?: DesktopEditorBridge;
+  webUtils?: DesktopWebUtilsBridge;
   menu?: DesktopMenuBridge;
+  browser?: DesktopBrowserBridge;
 }
 
 declare global {

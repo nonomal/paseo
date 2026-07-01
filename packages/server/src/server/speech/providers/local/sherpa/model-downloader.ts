@@ -3,16 +3,16 @@ import { mkdir, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { spawn } from "node:child_process";
 import type pino from "pino";
 
 import { getSherpaOnnxModelSpec, type SherpaOnnxModelId } from "./model-catalog.js";
+import { spawnProcess } from "../../../../../utils/spawn.js";
 
-export type EnsureSherpaOnnxModelOptions = {
+export interface EnsureSherpaOnnxModelOptions {
   modelsDir: string;
   modelId: SherpaOnnxModelId;
   logger: pino.Logger;
-};
+}
 
 export function getSherpaOnnxModelDir(modelsDir: string, modelId: SherpaOnnxModelId): string {
   const spec = getSherpaOnnxModelSpec(modelId);
@@ -20,28 +20,27 @@ export function getSherpaOnnxModelDir(modelsDir: string, modelId: SherpaOnnxMode
 }
 
 async function hasRequiredFiles(modelDir: string, requiredFiles: string[]): Promise<boolean> {
-  for (const rel of requiredFiles) {
-    const abs = path.join(modelDir, rel);
-    try {
-      const s = await stat(abs);
-      if (s.isDirectory()) {
-        continue;
+  const results = await Promise.all(
+    requiredFiles.map(async (rel) => {
+      const abs = path.join(modelDir, rel);
+      try {
+        const s = await stat(abs);
+        if (s.isDirectory()) {
+          return true;
+        }
+        return s.isFile() && s.size > 0;
+      } catch {
+        return false;
       }
-      if (s.isFile() && s.size > 0) {
-        continue;
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  }
-  return true;
+    }),
+  );
+  return results.every((present) => present);
 }
 
-type DownloadToFileOptions = {
+interface DownloadToFileOptions {
   url: string;
   outputPath: string;
-};
+}
 
 async function downloadToFile(options: DownloadToFileOptions): Promise<void> {
   const { url, outputPath } = options;
@@ -56,6 +55,8 @@ async function downloadToFile(options: DownloadToFileOptions): Promise<void> {
   const tmpPath = `${outputPath}.tmp-${Date.now()}`;
   await mkdir(path.dirname(outputPath), { recursive: true });
 
+  // The fetch ReadableStream type is slightly different from what Readable.fromWeb expects
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const nodeStream = Readable.fromWeb(res.body as any);
 
   try {
@@ -71,7 +72,9 @@ async function extractTarArchive(archivePath: string, destDir: string): Promise<
   await mkdir(destDir, { recursive: true });
 
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("tar", ["xf", archivePath, "-C", destDir], { stdio: "inherit" });
+    const child = spawnProcess("tar", ["xf", archivePath, "-C", destDir], {
+      stdio: "inherit",
+    });
     child.on("error", reject);
     child.on("exit", (code) => {
       if (code === 0) resolve();
@@ -108,90 +111,55 @@ export async function ensureSherpaOnnxModel(
   logger.info({ modelsDir: options.modelsDir }, "Starting model download");
 
   try {
-    if (spec.archiveUrl) {
-      const downloadsDir = path.join(options.modelsDir, ".downloads");
-      const archiveFilename = path.basename(new URL(spec.archiveUrl).pathname);
-      const archivePath = path.join(downloadsDir, archiveFilename);
+    const downloadsDir = path.join(options.modelsDir, ".downloads");
+    const archiveFilename = path.basename(new URL(spec.archiveUrl).pathname);
+    const archivePath = path.join(downloadsDir, archiveFilename);
 
-      if (!(await isNonEmptyFile(archivePath))) {
-        await downloadToFile({
-          url: spec.archiveUrl,
-          outputPath: archivePath,
-        });
-      }
-
-      logger.info(
-        {
-          modelId: options.modelId,
-          archivePath,
-          modelDir,
-        },
-        "Extracting model archive",
-      );
-      await extractTarArchive(archivePath, options.modelsDir);
-
-      logger.info(
-        {
-          modelId: options.modelId,
-          modelDir,
-        },
-        "Verifying downloaded model files",
-      );
-      if (!(await hasRequiredFiles(modelDir, spec.requiredFiles))) {
-        throw new Error(
-          `Downloaded and extracted ${archiveFilename}, but required files are still missing in ${modelDir}.`,
-        );
-      }
-
-      logger.info(
-        {
-          modelId: options.modelId,
-          archivePath,
-        },
-        "Finalizing model artifacts",
-      );
-      try {
-        await rm(archivePath, { force: true });
-      } catch {
-        // ignore
-      }
-
-      logger.info({ modelDir }, "Model download completed");
-      return modelDir;
+    if (!(await isNonEmptyFile(archivePath))) {
+      await downloadToFile({
+        url: spec.archiveUrl,
+        outputPath: archivePath,
+      });
     }
 
-    if (spec.downloadFiles && spec.downloadFiles.length > 0) {
-      await mkdir(modelDir, { recursive: true });
+    logger.info(
+      {
+        modelId: options.modelId,
+        archivePath,
+        modelDir,
+      },
+      "Extracting model archive",
+    );
+    await extractTarArchive(archivePath, options.modelsDir);
 
-      for (const file of spec.downloadFiles) {
-        const dst = path.join(modelDir, file.relPath);
-        if (await isNonEmptyFile(dst)) {
-          continue;
-        }
-        await downloadToFile({
-          url: file.url,
-          outputPath: dst,
-        });
-      }
-
-      logger.info(
-        {
-          modelId: options.modelId,
-          modelDir,
-        },
-        "Verifying downloaded model files",
+    logger.info(
+      {
+        modelId: options.modelId,
+        modelDir,
+      },
+      "Verifying downloaded model files",
+    );
+    if (!(await hasRequiredFiles(modelDir, spec.requiredFiles))) {
+      throw new Error(
+        `Downloaded and extracted ${archiveFilename}, but required files are still missing in ${modelDir}.`,
       );
-      if (!(await hasRequiredFiles(modelDir, spec.requiredFiles))) {
-        throw new Error(
-          `Downloaded files for ${options.modelId}, but required files are still missing in ${modelDir}.`,
-        );
-      }
-
-      logger.info({ modelDir }, "Model download completed");
-      return modelDir;
     }
 
-    throw new Error(`Model spec for ${options.modelId} has no archiveUrl or downloadFiles`);
+    logger.info(
+      {
+        modelId: options.modelId,
+        archivePath,
+      },
+      "Finalizing model artifacts",
+    );
+    try {
+      await rm(archivePath, { force: true });
+    } catch {
+      // ignore
+    }
+
+    logger.info({ modelDir }, "Model download completed");
+    return modelDir;
   } catch (error) {
     logger.error({ err: error }, "Model download failed");
     throw error;
@@ -204,13 +172,16 @@ export async function ensureSherpaOnnxModels(options: {
   logger: pino.Logger;
 }): Promise<Record<SherpaOnnxModelId, string>> {
   const uniq = Array.from(new Set(options.modelIds));
-  const out: Partial<Record<SherpaOnnxModelId, string>> = {};
-  for (const id of uniq) {
-    out[id] = await ensureSherpaOnnxModel({
-      modelsDir: options.modelsDir,
-      modelId: id,
-      logger: options.logger,
-    });
-  }
-  return out as Record<SherpaOnnxModelId, string>;
+  const entries: Array<[SherpaOnnxModelId, string]> = await Promise.all(
+    uniq.map(async (id) => {
+      const modelPath = await ensureSherpaOnnxModel({
+        modelsDir: options.modelsDir,
+        modelId: id,
+        logger: options.logger,
+      });
+      return [id, modelPath] as [SherpaOnnxModelId, string];
+    }),
+  );
+  // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+  return Object.fromEntries(entries) as Record<SherpaOnnxModelId, string>;
 }

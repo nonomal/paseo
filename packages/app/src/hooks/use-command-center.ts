@@ -1,25 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { TextInput } from "react-native";
 import { router, usePathname, type Href } from "expo-router";
+import { useTranslation } from "react-i18next";
 import { useKeyboardShortcutsStore } from "@/stores/keyboard-shortcuts-store";
 import { keyboardActionDispatcher } from "@/keyboard/keyboard-action-dispatcher";
-import { useHosts } from "@/runtime/host-runtime";
-import { useAllAgentsList } from "@/hooks/use-all-agents-list";
-import type { AggregatedAgent } from "@/hooks/use-aggregated-agents";
+import { useAggregatedAgents, type AggregatedAgent } from "@/hooks/use-aggregated-agents";
 import { useOpenProjectPicker } from "@/hooks/use-open-project-picker";
 import {
   clearCommandCenterFocusRestoreElement,
   takeCommandCenterFocusRestoreElement,
 } from "@/utils/command-center-focus-restore";
-import { buildHostSettingsRoute, parseServerIdFromPathname } from "@/utils/host-routes";
+import { buildOpenProjectRoute, buildSettingsRoute } from "@/utils/host-routes";
 import type { ShortcutKey } from "@/utils/format-shortcut";
 import { chordStringToShortcutKeys } from "@/keyboard/shortcut-string";
 import { getBindingIdForAction, getDefaultKeysForAction } from "@/keyboard/keyboard-shortcuts";
 import { useKeyboardShortcutOverrides } from "@/hooks/use-keyboard-shortcut-overrides";
 import { getShortcutOs } from "@/utils/shortcut-platform";
 import { getIsElectronRuntime } from "@/constants/layout";
-import { prepareWorkspaceTab } from "@/utils/workspace-navigation";
+import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { focusWithRetries } from "@/utils/web-focus";
+import { isWeb } from "@/constants/platform";
 
 const EMPTY_AGENTS: AggregatedAgent[] = [];
 const EMPTY_ACTION_ITEMS: CommandCenterActionItem[] = [];
@@ -49,50 +49,64 @@ function sortAgents(left: AggregatedAgent, right: AggregatedAgent): number {
   return right.lastActivityAt.getTime() - left.lastActivityAt.getTime();
 }
 
-type CommandCenterActionDefinition = {
+interface CommandCenterActionDefinition {
   id: string;
-  title: string;
-  icon?: "plus" | "settings";
+  titleKey:
+    | "shell.commandCenter.openProject"
+    | "shell.commandCenter.home"
+    | "sidebar.actions.settings";
+  icon?: "plus" | "settings" | "home";
   actionId?: string;
   keywords: string[];
-  routeKind: "settings" | "none";
-};
+  routeKind: "settings" | "home" | "none";
+}
 
 const COMMAND_CENTER_ACTIONS: readonly CommandCenterActionDefinition[] = [
   {
     id: "new-agent",
-    title: "Open project",
+    titleKey: "shell.commandCenter.openProject",
     icon: "plus",
     actionId: "new-agent",
     keywords: ["open", "project", "folder", "workspace", "repo"],
     routeKind: "none",
   },
   {
+    id: "home",
+    titleKey: "shell.commandCenter.home",
+    icon: "home",
+    keywords: ["home", "start", "import", "session", "pair", "device", "providers"],
+    routeKind: "home",
+  },
+  {
     id: "settings",
-    title: "Settings",
+    titleKey: "sidebar.actions.settings",
     icon: "settings",
     keywords: ["settings", "preferences", "config", "configuration"],
     routeKind: "settings",
   },
 ];
 
-function matchesActionQuery(query: string, action: CommandCenterActionDefinition): boolean {
+function matchesActionQuery(
+  query: string,
+  action: CommandCenterActionDefinition,
+  title: string,
+): boolean {
   const normalized = query.trim().toLowerCase();
   if (!normalized) return true;
-  if (action.title.toLowerCase().includes(normalized)) {
+  if (title.toLowerCase().includes(normalized)) {
     return true;
   }
   return action.keywords.some((keyword) => keyword.includes(normalized));
 }
 
-export type CommandCenterActionItem = {
+export interface CommandCenterActionItem {
   kind: "action";
   id: string;
   title: string;
-  icon?: "plus" | "settings";
+  icon?: "plus" | "settings" | "home";
   route?: Href;
   shortcutKeys?: ShortcutKey[][];
-};
+}
 
 export type CommandCenterItem =
   | {
@@ -121,8 +135,8 @@ function resolveActionShortcutKeys(
 }
 
 export function useCommandCenter() {
+  const { t } = useTranslation();
   const pathname = usePathname();
-  const daemons = useHosts();
   const { overrides } = useKeyboardShortcutOverrides();
   const open = useKeyboardShortcutsStore((s) => s.commandCenterOpen);
   const setOpen = useKeyboardShortcutsStore((s) => s.setCommandCenterOpen);
@@ -136,23 +150,7 @@ export function useCommandCenter() {
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
 
-  const activeServerId = useMemo(() => {
-    if (!open) {
-      return null;
-    }
-    const serverIdFromPath = parseServerIdFromPathname(pathname);
-    if (serverIdFromPath) {
-      const routeMatch = daemons.find((entry) => entry.serverId === serverIdFromPath);
-      if (routeMatch) {
-        return routeMatch.serverId;
-      }
-    }
-    return daemons[0]?.serverId ?? null;
-  }, [daemons, open, pathname]);
-
-  const { agents } = useAllAgentsList({
-    serverId: activeServerId,
-  });
+  const { agents } = useAggregatedAgents();
 
   const agentResults = useMemo(() => {
     if (!open || agents.length === 0) {
@@ -164,25 +162,32 @@ export function useCommandCenter() {
   }, [agents, open, query]);
 
   const settingsRoute = useMemo<Href>(() => {
-    const serverIdFromPath = activeServerId;
-    return serverIdFromPath ? buildHostSettingsRoute(serverIdFromPath) : "/";
-  }, [activeServerId]);
+    return buildSettingsRoute();
+  }, []);
+
+  const homeRoute = useMemo<Href>(() => buildOpenProjectRoute() as Href, []);
 
   const actionItems = useMemo(() => {
     if (!open) {
       return EMPTY_ACTION_ITEMS;
     }
-    return COMMAND_CENTER_ACTIONS.filter((action) =>
-      matchesActionQuery(query, action),
-    ).map<CommandCenterActionItem>((action) => ({
-      kind: "action",
-      id: action.id,
-      title: action.title,
-      icon: action.icon,
-      route: action.routeKind === "settings" ? settingsRoute : undefined,
-      shortcutKeys: resolveActionShortcutKeys(action.actionId, overrides),
-    }));
-  }, [open, query, settingsRoute, overrides]);
+    return COMMAND_CENTER_ACTIONS.filter((action) => {
+      if (action.routeKind === "home" && !homeRoute) return false;
+      return matchesActionQuery(query, action, t(action.titleKey));
+    }).map<CommandCenterActionItem>((action) => {
+      let route: Href | undefined;
+      if (action.routeKind === "settings") route = settingsRoute;
+      else if (action.routeKind === "home") route = homeRoute;
+      return {
+        kind: "action",
+        id: action.id,
+        title: t(action.titleKey),
+        icon: action.icon,
+        route,
+        shortcutKeys: resolveActionShortcutKeys(action.actionId, overrides),
+      };
+    });
+  }, [open, query, settingsRoute, homeRoute, overrides, t]);
 
   const items = useMemo(() => {
     if (!open) {
@@ -215,17 +220,16 @@ export function useCommandCenter() {
       // Don't restore focus back to the prior element after we navigate.
       clearCommandCenterFocusRestoreElement();
       setOpen(false);
-      const route = prepareWorkspaceTab({
+      navigateToAgent({
         serverId: agent.serverId,
-        workspaceId: agent.cwd,
-        target: { kind: "agent", agentId: agent.id },
+        agentId: agent.id,
+        currentPathname: pathname,
       });
-      router.navigate(route);
     },
-    [setOpen],
+    [pathname, setOpen],
   );
 
-  const openProjectPicker = useOpenProjectPicker(activeServerId);
+  const openProjectPicker = useOpenProjectPicker();
 
   const handleSelectAction = useCallback(
     (action: CommandCenterActionItem) => {
@@ -315,33 +319,25 @@ export function useCommandCenter() {
     }
   }, [activeIndex, items.length, open]);
 
-  useEffect(() => {
-    if (!open) return;
-
-    const handler = (event: KeyboardEvent) => {
+  const handleKeyEvent = useCallback(
+    (key: string): boolean => {
+      if (!open) return false;
       const currentItems = itemsRef.current;
-      const key = event.key;
-      if (key !== "ArrowDown" && key !== "ArrowUp" && key !== "Enter" && key !== "Escape") {
-        return;
-      }
 
       if (key === "Escape") {
-        event.preventDefault();
         handleCloseRef.current();
-        return;
+        return true;
       }
 
       if (key === "Enter") {
-        if (currentItems.length === 0) return;
-        event.preventDefault();
+        if (currentItems.length === 0) return false;
         const index = Math.max(0, Math.min(activeIndexRef.current, currentItems.length - 1));
-        handleSelectItemRef.current(currentItems[index]!);
-        return;
+        handleSelectItemRef.current(currentItems[index]);
+        return true;
       }
 
       if (key === "ArrowDown" || key === "ArrowUp") {
-        if (currentItems.length === 0) return;
-        event.preventDefault();
+        if (currentItems.length === 0) return false;
         setActiveIndex((current) => {
           const delta = key === "ArrowDown" ? 1 : -1;
           const next = current + delta;
@@ -349,13 +345,35 @@ export function useCommandCenter() {
           if (next >= currentItems.length) return 0;
           return next;
         });
+        return true;
+      }
+
+      return false;
+    },
+    [open],
+  );
+
+  useEffect(() => {
+    if (!open || !isWeb) return;
+
+    const handler = (event: KeyboardEvent) => {
+      if (
+        event.key !== "ArrowDown" &&
+        event.key !== "ArrowUp" &&
+        event.key !== "Enter" &&
+        event.key !== "Escape"
+      ) {
+        return;
+      }
+      if (handleKeyEvent(event.key)) {
+        event.preventDefault();
       }
     };
 
     // react-native-web can stop propagation on key events, so listen in capture phase.
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, [open]);
+  }, [open, handleKeyEvent]);
 
   return {
     open,
@@ -367,5 +385,6 @@ export function useCommandCenter() {
     items,
     handleClose,
     handleSelectItem,
+    handleKeyEvent,
   };
 }

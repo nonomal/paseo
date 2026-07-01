@@ -1,7 +1,8 @@
-import type { AgentProvider, ToolCallDetail } from "@server/server/agent/agent-sdk-types";
-import type { AgentStreamEventPayload } from "@server/shared/messages";
+import type { AgentProvider, ToolCallDetail } from "@getpaseo/protocol/agent-types";
+import type { AgentAttachment, AgentStreamEventPayload } from "@getpaseo/protocol/messages";
 import type { AttachmentMetadata } from "@/attachments/types";
 import { extractTaskEntriesFromToolCall } from "../utils/tool-call-parsers";
+import { splitMarkdownBlocks } from "@/utils/split-markdown-blocks";
 
 /**
  * Simple hash function for deterministic ID generation
@@ -58,14 +59,29 @@ export interface UserMessageItem {
   id: string;
   text: string;
   timestamp: Date;
+  optimistic?: true;
   images?: UserMessageImageAttachment[];
+  attachments?: AgentAttachment[];
 }
+
+export interface OptimisticUserMessageInput {
+  id: string;
+  text: string;
+  timestamp: Date;
+  images?: UserMessageImageAttachment[];
+  attachments?: AgentAttachment[];
+}
+
+export type OptimisticUserMessagePlacement = "tail" | "active-head";
 
 export interface AssistantMessageItem {
   kind: "assistant_message";
   id: string;
+  messageId?: string;
   text: string;
   timestamp: Date;
+  blockGroupId?: string;
+  blockIndex?: number;
 }
 
 export type ThoughtStatus = "loading" | "ready";
@@ -95,7 +111,7 @@ export interface AgentToolCallData {
   callId: string;
   name: string;
   status: AgentToolCallStatus;
-  error: unknown | null;
+  error: unknown;
   detail: ToolCallDetail;
   metadata?: Record<string, unknown>;
 }
@@ -139,7 +155,10 @@ export interface CompactionItem {
   preTokens?: number;
 }
 
-export type TodoEntry = { text: string; completed: boolean };
+export interface TodoEntry {
+  text: string;
+  completed: boolean;
+}
 
 export interface TodoListItem {
   kind: "todo_list";
@@ -176,6 +195,86 @@ function markThoughtReady(item: ThoughtItem): ThoughtItem {
   };
 }
 
+function buildUserMessageItem(input: {
+  id: string;
+  text: string;
+  timestamp: Date;
+  optimistic?: UserMessageItem | null;
+}): UserMessageItem {
+  if (input.optimistic) {
+    return {
+      kind: "user_message",
+      id: input.id,
+      text: input.optimistic.text,
+      timestamp: input.optimistic.timestamp,
+      ...(input.optimistic.images && input.optimistic.images.length > 0
+        ? { images: input.optimistic.images }
+        : {}),
+      ...(input.optimistic.attachments && input.optimistic.attachments.length > 0
+        ? { attachments: input.optimistic.attachments }
+        : {}),
+    };
+  }
+
+  return {
+    kind: "user_message",
+    id: input.id,
+    text: input.text,
+    timestamp: input.timestamp,
+  };
+}
+
+export function buildOptimisticUserMessage(input: OptimisticUserMessageInput): UserMessageItem {
+  return {
+    kind: "user_message",
+    id: input.id,
+    text: input.text,
+    timestamp: input.timestamp,
+    optimistic: true,
+    ...(input.images && input.images.length > 0 ? { images: input.images } : {}),
+    ...(input.attachments && input.attachments.length > 0
+      ? { attachments: input.attachments }
+      : {}),
+  };
+}
+
+function hasUserMessage(state: StreamItem[]): boolean {
+  return state.some((item) => item.kind === "user_message");
+}
+
+export function appendOptimisticUserMessageToStream(params: {
+  tail: StreamItem[];
+  head: StreamItem[];
+  message: UserMessageItem;
+  placement: OptimisticUserMessagePlacement;
+  skipIfUserMessageExists?: boolean;
+}): ApplyStreamEventResult {
+  const { tail, head, message, placement } = params;
+  if (
+    tail.some((item) => item.id === message.id) ||
+    head.some((item) => item.id === message.id) ||
+    (params.skipIfUserMessageExists && (hasUserMessage(tail) || hasUserMessage(head)))
+  ) {
+    return { tail, head, changedTail: false, changedHead: false };
+  }
+
+  if (placement === "active-head" && head.length > 0) {
+    return {
+      tail,
+      head: [...head, message],
+      changedTail: false,
+      changedHead: true,
+    };
+  }
+
+  return {
+    tail: [...tail, message],
+    head,
+    changedTail: true,
+    changedHead: false,
+  };
+}
+
 function appendUserMessage(
   state: StreamItem[],
   text: string,
@@ -189,30 +288,30 @@ function appendUserMessage(
 
   const chunkSeed = chunk.trim() || chunk;
   const entryId = messageId ?? createUniqueTimelineId(state, "user", chunkSeed, timestamp);
-  const existingIndex = state.findIndex(
-    (entry) => entry.kind === "user_message" && entry.id === entryId,
+  const optimisticIndex = state.findIndex(
+    (entry) => entry.kind === "user_message" && entry.optimistic,
   );
-  const existing =
-    existingIndex >= 0 && state[existingIndex]?.kind === "user_message"
-      ? state[existingIndex]
-      : null;
-  const preservedImages = existing?.images;
+  const optimistic = optimisticIndex >= 0 ? (state[optimisticIndex] as UserMessageItem) : null;
 
-  const nextItem: UserMessageItem = {
-    kind: "user_message",
+  const nextItem = buildUserMessageItem({
     id: entryId,
     text: chunk,
     timestamp,
-    ...(preservedImages && preservedImages.length > 0 ? { images: preservedImages } : {}),
-  };
+    optimistic,
+  });
 
-  if (existingIndex >= 0) {
+  if (optimisticIndex >= 0) {
     const next = [...state];
-    next[existingIndex] = nextItem;
+    next[optimisticIndex] = nextItem;
     return next;
   }
 
   return [...state, nextItem];
+}
+
+export function clearOptimisticUserMessages(state: StreamItem[]): StreamItem[] {
+  const next = state.filter((item) => item.kind !== "user_message" || !item.optimistic);
+  return next.length === state.length ? state : next;
 }
 
 function appendAssistantMessage(
@@ -220,6 +319,7 @@ function appendAssistantMessage(
   text: string,
   timestamp: Date,
   source: StreamUpdateSource,
+  messageId?: string,
 ): StreamItem[] {
   const { chunk, hasContent } = normalizeChunk(text);
   if (!chunk) {
@@ -227,7 +327,11 @@ function appendAssistantMessage(
   }
 
   const last = state[state.length - 1];
-  if (last && last.kind === "assistant_message") {
+  const shouldAppendToLast =
+    last &&
+    last.kind === "assistant_message" &&
+    (messageId === undefined || last.messageId === messageId);
+  if (shouldAppendToLast) {
     const updated: AssistantMessageItem = {
       ...last,
       text: `${last.text}${chunk}`,
@@ -242,7 +346,8 @@ function appendAssistantMessage(
   if (
     source === "live" &&
     last?.kind === "user_message" &&
-    secondLast?.kind === "assistant_message"
+    secondLast?.kind === "assistant_message" &&
+    (messageId === undefined || secondLast.messageId === messageId)
   ) {
     const updated: AssistantMessageItem = {
       ...secondLast,
@@ -257,9 +362,11 @@ function appendAssistantMessage(
   }
 
   const idSeed = chunk.trim() || chunk;
+  const entryId = messageId ?? createUniqueTimelineId(state, "assistant", idSeed, timestamp);
   const item: AssistantMessageItem = {
     kind: "assistant_message",
-    id: createUniqueTimelineId(state, "assistant", idSeed, timestamp),
+    id: entryId,
+    ...(messageId ? { messageId } : {}),
     text: chunk,
     timestamp,
   };
@@ -324,7 +431,7 @@ function hasNonEmptyObject(value: unknown): boolean {
   return isRecord(value) && Object.keys(value).length > 0;
 }
 
-function mergeUnknownValue(existing: unknown | null, incoming: unknown | null): unknown | null {
+function mergeUnknownValue(existing: unknown, incoming: unknown): unknown {
   if (incoming === null) {
     return existing;
   }
@@ -336,7 +443,36 @@ function mergeUnknownValue(existing: unknown | null, incoming: unknown | null): 
   return incoming;
 }
 
-function mergeToolCallDetail(existing: ToolCallDetail, incoming: ToolCallDetail): ToolCallDetail {
+function hasSameIncomingFields<T extends Record<string, unknown>>(
+  existing: T,
+  incoming: T,
+): boolean {
+  return Object.entries(incoming).every(([key, value]) => existing[key] === value);
+}
+
+function mergeToolCallMetadata(
+  existing: Record<string, unknown> | undefined,
+  incoming: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!incoming) {
+    return existing;
+  }
+
+  if (!existing) {
+    return incoming;
+  }
+
+  if (hasSameIncomingFields(existing, incoming)) {
+    return existing;
+  }
+
+  return { ...existing, ...incoming };
+}
+
+export function mergeToolCallDetail(
+  existing: ToolCallDetail,
+  incoming: ToolCallDetail,
+): ToolCallDetail {
   if (existing.type === "unknown" && incoming.type !== "unknown") {
     return incoming;
   }
@@ -346,21 +482,31 @@ function mergeToolCallDetail(existing: ToolCallDetail, incoming: ToolCallDetail)
   }
 
   if (existing.type === "unknown" && incoming.type === "unknown") {
+    const input = mergeUnknownValue(existing.input, incoming.input);
+    const output = mergeUnknownValue(existing.output, incoming.output);
+    if (input === existing.input && output === existing.output) {
+      return existing;
+    }
+
     return {
       type: "unknown",
-      input: mergeUnknownValue(existing.input, incoming.input),
-      output: mergeUnknownValue(existing.output, incoming.output),
+      input,
+      output,
     };
   }
 
   if (existing.type === incoming.type) {
+    if (hasSameIncomingFields(existing, incoming)) {
+      return existing;
+    }
+
     return { ...existing, ...incoming } as ToolCallDetail;
   }
 
   return incoming;
 }
 
-function inputFromUnknownDetail(detail: ToolCallDetail): unknown | null {
+function inputFromUnknownDetail(detail: ToolCallDetail): unknown {
   return detail.type === "unknown" ? detail.input : null;
 }
 
@@ -383,6 +529,36 @@ function mergeAgentToolCallStatus(
   return "running";
 }
 
+export function mergeAgentToolCallItem(
+  existing: AgentToolCallItem,
+  data: AgentToolCallData,
+  timestamp: Date,
+): AgentToolCallItem {
+  const mergedStatus = mergeAgentToolCallStatus(existing.payload.data.status, data.status);
+  const mergedError =
+    mergedStatus === "failed"
+      ? (data.error ?? existing.payload.data.error ?? { message: "Tool call failed" })
+      : null;
+  const mergedMetadata = mergeToolCallMetadata(existing.payload.data.metadata, data.metadata);
+  const mergedDetail = mergeToolCallDetail(existing.payload.data.detail, data.detail);
+
+  return {
+    ...existing,
+    timestamp,
+    payload: {
+      source: "agent",
+      data: {
+        ...existing.payload.data,
+        ...data,
+        status: mergedStatus,
+        error: mergedError,
+        detail: mergedDetail,
+        metadata: mergedMetadata,
+      },
+    },
+  };
+}
+
 function appendAgentToolCall(
   state: StreamItem[],
   data: AgentToolCallData,
@@ -391,37 +567,26 @@ function appendAgentToolCall(
   const existingIndex = findExistingAgentToolCallIndex(state, data.callId);
 
   if (existingIndex >= 0) {
-    const next = [...state];
-    const existing = next[existingIndex];
+    const existing = state[existingIndex];
     if (!existing || !isAgentToolCallItem(existing)) {
       return state;
     }
-    const mergedStatus = mergeAgentToolCallStatus(existing.payload.data.status, data.status);
-    const mergedError =
-      mergedStatus === "failed"
-        ? (data.error ?? existing.payload.data.error ?? { message: "Tool call failed" })
-        : null;
-    const mergedMetadata =
-      data.metadata || existing.payload.data.metadata
-        ? { ...existing.payload.data.metadata, ...data.metadata }
-        : undefined;
-    const mergedDetail = mergeToolCallDetail(existing.payload.data.detail, data.detail);
+    const merged = mergeAgentToolCallItem(existing, data, timestamp);
 
-    next[existingIndex] = {
-      ...existing,
-      timestamp,
-      payload: {
-        source: "agent",
-        data: {
-          ...existing.payload.data,
-          ...data,
-          status: mergedStatus,
-          error: mergedError,
-          detail: mergedDetail,
-          metadata: mergedMetadata,
-        },
-      },
-    };
+    if (
+      merged.payload.data.provider === existing.payload.data.provider &&
+      merged.payload.data.callId === existing.payload.data.callId &&
+      merged.payload.data.name === existing.payload.data.name &&
+      merged.payload.data.status === existing.payload.data.status &&
+      merged.payload.data.error === existing.payload.data.error &&
+      merged.payload.data.detail === existing.payload.data.detail &&
+      merged.payload.data.metadata === existing.payload.data.metadata
+    ) {
+      return state;
+    }
+
+    const next = [...state];
+    next[existingIndex] = merged;
     return next;
   }
 
@@ -459,7 +624,7 @@ function appendTodoList(
 ): StreamItem[] {
   const normalizedItems = items.map((item) => ({
     text: item.text,
-    completed: Boolean(item.completed),
+    completed: item.completed,
   }));
 
   const lastItem = state[state.length - 1];
@@ -488,8 +653,142 @@ function appendTodoList(
   return [...state, entry];
 }
 
-function formatErrorMessage(message: string): string {
-  return `Agent error\n${message}`;
+function reduceTimelineToolCall(
+  state: StreamItem[],
+  event: Extract<AgentStreamEventPayload, { type: "timeline" }>,
+  item: Extract<
+    Extract<AgentStreamEventPayload, { type: "timeline" }>["item"],
+    { type: "tool_call" }
+  >,
+  timestamp: Date,
+): StreamItem[] {
+  const normalizedToolName = item.name
+    .trim()
+    .replace(/[.\s-]+/g, "_")
+    .toLowerCase();
+  if (event.provider === "claude" && normalizedToolName === "exitplanmode") {
+    return state;
+  }
+
+  if (
+    event.provider === "claude" &&
+    (normalizedToolName === "todowrite" || normalizedToolName === "todo_write")
+  ) {
+    const tasks = extractTaskEntriesFromToolCall(item.name, inputFromUnknownDetail(item.detail));
+    if (!tasks) {
+      return state;
+    }
+    return appendTodoList(
+      state,
+      event.provider,
+      tasks.map((entry) => ({ text: entry.text, completed: entry.completed })),
+      timestamp,
+    );
+  }
+
+  const tasks = extractTaskEntriesFromToolCall(item.name, inputFromUnknownDetail(item.detail));
+  if (tasks) {
+    return appendTodoList(
+      state,
+      event.provider,
+      tasks.map((entry) => ({ text: entry.text, completed: entry.completed })),
+      timestamp,
+    );
+  }
+
+  return appendAgentToolCall(
+    state,
+    {
+      provider: event.provider,
+      callId: item.callId,
+      name: item.name,
+      status: item.status,
+      error: item.error,
+      detail: item.detail,
+      metadata: item.metadata,
+    },
+    timestamp,
+  );
+}
+
+function reduceTimelineCompaction(
+  state: StreamItem[],
+  item: Extract<
+    Extract<AgentStreamEventPayload, { type: "timeline" }>["item"],
+    { type: "compaction" }
+  >,
+  timestamp: Date,
+): StreamItem[] {
+  if (item.status === "completed") {
+    const loadingIdx = state.findIndex((s) => s.kind === "compaction" && s.status === "loading");
+    const existing = loadingIdx >= 0 ? state[loadingIdx] : undefined;
+    if (loadingIdx >= 0 && existing && existing.kind === "compaction") {
+      const updated: CompactionItem = {
+        ...existing,
+        status: "completed",
+        trigger: item.trigger ?? existing.trigger,
+        preTokens: item.preTokens ?? existing.preTokens,
+      };
+      return [...state.slice(0, loadingIdx), updated, ...state.slice(loadingIdx + 1)];
+    }
+    if (loadingIdx >= 0) {
+      return state;
+    }
+  }
+  const compaction: CompactionItem = {
+    kind: "compaction",
+    id: createTimelineId("compaction", item.status, timestamp),
+    timestamp,
+    status: item.status,
+    trigger: item.trigger,
+    preTokens: item.preTokens,
+  };
+  return [...state, compaction];
+}
+
+function reduceTimelineEvent(
+  state: StreamItem[],
+  event: Extract<AgentStreamEventPayload, { type: "timeline" }>,
+  timestamp: Date,
+  source: StreamUpdateSource,
+): StreamItem[] {
+  const item = event.item;
+  switch (item.type) {
+    case "user_message":
+      return finalizeActiveThoughts(appendUserMessage(state, item.text, timestamp, item.messageId));
+    case "assistant_message":
+      return finalizeActiveThoughts(
+        appendAssistantMessage(state, item.text, timestamp, source, item.messageId),
+      );
+    case "reasoning":
+      return appendThought(state, item.text, timestamp);
+    case "tool_call":
+      return finalizeActiveThoughts(reduceTimelineToolCall(state, event, item, timestamp));
+    case "todo": {
+      if (event.provider === "claude") {
+        return finalizeActiveThoughts(state);
+      }
+      const items: TodoEntry[] = (item.items ?? []).map((todo) => ({
+        text: todo.text,
+        completed: todo.completed,
+      }));
+      return finalizeActiveThoughts(appendTodoList(state, event.provider, items, timestamp));
+    }
+    case "error": {
+      const activity: ActivityLogItem = {
+        kind: "activity_log",
+        id: createTimelineId("error", item.message ?? "", timestamp),
+        timestamp,
+        activityType: "error",
+        message: item.message ?? "Unknown error",
+      };
+      return finalizeActiveThoughts(appendActivityLog(state, activity));
+    }
+    case "compaction":
+      return finalizeActiveThoughts(reduceTimelineCompaction(state, item, timestamp));
+    default:
+      return state;
+  }
 }
 
 /**
@@ -503,145 +802,8 @@ export function reduceStreamUpdate(
 ): StreamItem[] {
   const source = options?.source ?? "live";
   switch (event.type) {
-    case "timeline": {
-      const item = event.item;
-      let nextState = state;
-      switch (item.type) {
-        case "user_message":
-          nextState = appendUserMessage(state, item.text, timestamp, item.messageId);
-          break;
-        case "assistant_message":
-          nextState = appendAssistantMessage(state, item.text, timestamp, source);
-          break;
-        case "reasoning":
-          return appendThought(state, item.text, timestamp);
-        case "tool_call": {
-          const normalizedToolName = item.name
-            .trim()
-            .replace(/[.\s-]+/g, "_")
-            .toLowerCase();
-          if (event.provider === "claude" && normalizedToolName === "exitplanmode") {
-            // ExitPlanMode is rendered via the plan permission prompt; avoid duplicating it in the timeline.
-            break;
-          }
-
-          if (
-            event.provider === "claude" &&
-            (normalizedToolName === "todowrite" || normalizedToolName === "todo_write")
-          ) {
-            // For Claude: TodoWrite often appears as a tool call that never resolves. Always render it
-            // as Tasks when possible and otherwise hide it to avoid a stuck loading tool call.
-            const tasks = extractTaskEntriesFromToolCall(
-              item.name,
-              inputFromUnknownDetail(item.detail),
-            );
-            if (tasks) {
-              nextState = appendTodoList(
-                state,
-                event.provider,
-                tasks.map((entry) => ({
-                  text: entry.text,
-                  completed: entry.completed,
-                })),
-                timestamp,
-              );
-            }
-            break;
-          }
-
-          const tasks = extractTaskEntriesFromToolCall(
-            item.name,
-            inputFromUnknownDetail(item.detail),
-          );
-          if (tasks) {
-            nextState = appendTodoList(
-              state,
-              event.provider,
-              tasks.map((entry) => ({
-                text: entry.text,
-                completed: entry.completed,
-              })),
-              timestamp,
-            );
-            break;
-          }
-
-          nextState = appendAgentToolCall(
-            state,
-            {
-              provider: event.provider,
-              callId: item.callId,
-              name: item.name,
-              status: item.status,
-              error: item.error,
-              detail: item.detail,
-              metadata: item.metadata,
-            },
-            timestamp,
-          );
-          break;
-        }
-        case "todo": {
-          if (event.provider === "claude") {
-            // Claude plan mode is rendered via permission prompts + TodoWrite tool calls.
-            // Avoid rendering legacy plan-mode todo timeline items as Tasks.
-            break;
-          }
-          const items: TodoEntry[] = (item.items ?? []).map((todo) => ({
-            text: todo.text,
-            completed: Boolean(todo.completed),
-          }));
-          nextState = appendTodoList(state, event.provider, items, timestamp);
-          break;
-        }
-        case "error": {
-          const activity: ActivityLogItem = {
-            kind: "activity_log",
-            id: createTimelineId("error", item.message ?? "", timestamp),
-            timestamp,
-            activityType: "error",
-            message: formatErrorMessage(item.message ?? "Unknown error"),
-          };
-          nextState = appendActivityLog(state, activity);
-          break;
-        }
-        case "compaction": {
-          if (item.status === "completed") {
-            const loadingIdx = state.findIndex(
-              (s) => s.kind === "compaction" && s.status === "loading",
-            );
-            if (loadingIdx >= 0) {
-              const existing = state[loadingIdx];
-              if (!existing || existing.kind !== "compaction") {
-                break;
-              }
-              const updated: CompactionItem = {
-                ...existing,
-                status: "completed",
-                trigger: item.trigger,
-                preTokens: item.preTokens,
-              };
-              nextState = [...state.slice(0, loadingIdx), updated, ...state.slice(loadingIdx + 1)];
-              break;
-            }
-          }
-          const compaction: CompactionItem = {
-            kind: "compaction",
-            id: createTimelineId("compaction", item.status, timestamp),
-            timestamp,
-            status: item.status,
-            trigger: item.trigger,
-            preTokens: item.preTokens,
-          };
-          nextState = [...state, compaction];
-          break;
-        }
-        default:
-          return state;
-      }
-
-      return finalizeActiveThoughts(nextState);
-    }
+    case "timeline":
+      return reduceTimelineEvent(state, event, timestamp, source);
     case "thread_started":
     case "turn_started":
     case "turn_completed":
@@ -660,7 +822,10 @@ export function reduceStreamUpdate(
  * Hydrate stream state from a batch of AgentManager stream events
  */
 export function hydrateStreamState(
-  events: Array<{ event: AgentStreamEventPayload; timestamp: Date }>,
+  events: Array<{
+    event: AgentStreamEventPayload;
+    timestamp: Date;
+  }>,
   options?: { source?: StreamUpdateSource },
 ): StreamItem[] {
   const hydrated = events.reduce<StreamItem[]>((state, { event, timestamp }) => {
@@ -688,6 +853,16 @@ const STREAM_COMPLETION_EVENTS = new Set<AgentStreamEventPayload["type"]>([
   "turn_canceled",
 ]);
 
+function applyCompletionToTail(
+  tail: StreamItem[],
+  event: AgentStreamEventPayload,
+  timestamp: Date,
+  source: StreamUpdateSource,
+): StreamItem[] {
+  const finalized = finalizeActiveThoughts(tail);
+  return reduceStreamUpdate(finalized, event, timestamp, { source });
+}
+
 /**
  * Determine what kind of StreamItem an event would produce
  */
@@ -713,6 +888,13 @@ function getEventItemKind(event: AgentStreamEventPayload): StreamItem["kind"] | 
   }
 }
 
+function getIncomingAssistantMessageId(event: AgentStreamEventPayload): string | undefined {
+  if (event.type !== "timeline" || event.item.type !== "assistant_message") {
+    return undefined;
+  }
+  return event.item.messageId;
+}
+
 /**
  * Finalize head items before flushing to tail.
  * Marks thoughts as "ready" since they're no longer being streamed.
@@ -722,8 +904,119 @@ function finalizeHeadItems(head: StreamItem[]): StreamItem[] {
     if (item.kind === "thought" && item.status !== "ready") {
       return markThoughtReady(item);
     }
+    if (item.kind === "assistant_message" && item.blockGroupId) {
+      return {
+        ...item,
+        id: createAssistantBlockId({
+          groupId: item.blockGroupId,
+          blockIndex: item.blockIndex ?? 0,
+        }),
+      };
+    }
     return item;
   });
+}
+
+function createAssistantBlockId(params: { groupId: string; blockIndex: number }): string {
+  return `${params.groupId}:block:${params.blockIndex}`;
+}
+
+function getTrailingNewlineSuffix(text: string): string {
+  return /\n+$/.exec(text)?.[0] ?? "";
+}
+
+function getActiveAssistantHeadIndex(head: StreamItem[]): number {
+  for (let index = head.length - 1; index >= 0; index -= 1) {
+    if (head[index]?.kind === "assistant_message") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function getTailAssistantToResume(params: {
+  incomingKind: StreamItem["kind"] | null;
+  event: AgentStreamEventPayload;
+  nextHead: StreamItem[];
+  tailAssistant: StreamItem | undefined;
+}): AssistantMessageItem | null {
+  if (params.incomingKind !== "assistant_message" || params.nextHead.length !== 0) {
+    return null;
+  }
+  if (params.tailAssistant?.kind !== "assistant_message") {
+    return null;
+  }
+  const incomingMessageId = getIncomingAssistantMessageId(params.event);
+  if (incomingMessageId !== undefined && params.tailAssistant.messageId !== incomingMessageId) {
+    return null;
+  }
+  return params.tailAssistant;
+}
+
+function promoteCompletedAssistantBlocks(params: { tail: StreamItem[]; head: StreamItem[] }): {
+  tail: StreamItem[];
+  head: StreamItem[];
+  changedTail: boolean;
+  changedHead: boolean;
+} {
+  const assistantIndex = getActiveAssistantHeadIndex(params.head);
+  const activeItem = params.head[assistantIndex];
+  if (assistantIndex < 0 || !activeItem || activeItem.kind !== "assistant_message") {
+    return {
+      tail: params.tail,
+      head: params.head,
+      changedTail: false,
+      changedHead: false,
+    };
+  }
+
+  const blocks = splitMarkdownBlocks(activeItem.text);
+  if (blocks.length < 2) {
+    return {
+      tail: params.tail,
+      head: params.head,
+      changedTail: false,
+      changedHead: false,
+    };
+  }
+
+  const blockGroupId = activeItem.blockGroupId ?? activeItem.id;
+  const firstBlockIndex = activeItem.blockIndex ?? 0;
+  const completedBlocks = blocks.slice(0, -1);
+  const liveBlock = `${blocks[blocks.length - 1] ?? ""}${getTrailingNewlineSuffix(activeItem.text)}`;
+  const promotedItems = completedBlocks.map<AssistantMessageItem>((block, offset) => ({
+    kind: "assistant_message",
+    id: createAssistantBlockId({
+      groupId: blockGroupId,
+      blockIndex: firstBlockIndex + offset,
+    }),
+    ...(activeItem.messageId ? { messageId: activeItem.messageId } : {}),
+    blockGroupId,
+    blockIndex: firstBlockIndex + offset,
+    text: block,
+    timestamp: activeItem.timestamp,
+  }));
+
+  const nextTail = flushHeadToTail(params.tail, promotedItems);
+  const liveItem: AssistantMessageItem = {
+    ...activeItem,
+    id: `${blockGroupId}:head`,
+    blockGroupId,
+    blockIndex: firstBlockIndex + completedBlocks.length,
+    text: liveBlock,
+  };
+  const nextHead = [
+    ...params.head.slice(0, assistantIndex),
+    liveItem,
+    ...params.head.slice(assistantIndex + 1),
+  ];
+
+  return {
+    tail: nextTail,
+    head: nextHead,
+    changedTail: nextTail !== params.tail,
+    changedHead: true,
+  };
 }
 
 /**
@@ -747,9 +1040,14 @@ export function flushHeadToTail(tail: StreamItem[], head: StreamItem[]): StreamI
 
 /**
  * Determine if the head should be flushed based on incoming event kind.
- * Flush when a different kind arrives or when the incoming kind is not streamable.
+ * Flush when a different streamable lane starts, including a new identified assistant message.
  */
-function shouldFlushHead(head: StreamItem[], incomingKind: StreamItem["kind"] | null): boolean {
+function shouldFlushHead(input: {
+  head: StreamItem[];
+  incomingKind: StreamItem["kind"] | null;
+  event: AgentStreamEventPayload;
+}): boolean {
+  const { head, incomingKind, event } = input;
   if (head.length === 0) {
     return false;
   }
@@ -781,6 +1079,11 @@ function shouldFlushHead(head: StreamItem[], incomingKind: StreamItem["kind"] | 
   // If incoming kind is different from current head's streamable kind, flush
   if (lastStreamable.kind !== incomingKind) {
     return true;
+  }
+
+  if (incomingKind === "assistant_message" && lastStreamable.kind === "assistant_message") {
+    const incomingMessageId = getIncomingAssistantMessageId(event);
+    return incomingMessageId !== undefined && lastStreamable.messageId !== incomingMessageId;
   }
 
   return false;
@@ -834,8 +1137,7 @@ export function applyStreamEvent(params: {
   // Handle turn completion events - flush everything
   if (STREAM_COMPLETION_EVENTS.has(event.type)) {
     flushHead();
-    // Also finalize any remaining thoughts in tail
-    const finalized = finalizeActiveThoughts(nextTail);
+    const finalized = applyCompletionToTail(nextTail, event, timestamp, source);
     if (finalized !== nextTail) {
       nextTail = finalized;
       changedTail = true;
@@ -846,8 +1148,27 @@ export function applyStreamEvent(params: {
   const incomingKind = getEventItemKind(event);
 
   // Check if we need to flush head before processing this event
-  if (shouldFlushHead(nextHead, incomingKind)) {
+  if (
+    shouldFlushHead({
+      head: nextHead,
+      incomingKind,
+      event,
+    })
+  ) {
     flushHead();
+  }
+
+  const tailAssistant = getTailAssistantToResume({
+    incomingKind,
+    event,
+    nextHead,
+    tailAssistant: nextTail.at(-1),
+  });
+  if (tailAssistant) {
+    nextTail = nextTail.slice(0, -1);
+    nextHead = [tailAssistant];
+    changedTail = true;
+    changedHead = true;
   }
 
   // For streamable kinds, apply to head
@@ -856,6 +1177,16 @@ export function applyStreamEvent(params: {
     if (reduced !== nextHead) {
       nextHead = reduced;
       changedHead = true;
+    }
+    if (incomingKind === "assistant_message") {
+      const promoted = promoteCompletedAssistantBlocks({
+        tail: nextTail,
+        head: nextHead,
+      });
+      nextTail = promoted.tail;
+      nextHead = promoted.head;
+      changedTail = changedTail || promoted.changedTail;
+      changedHead = changedHead || promoted.changedHead;
     }
     return { tail: nextTail, head: nextHead, changedTail, changedHead };
   }

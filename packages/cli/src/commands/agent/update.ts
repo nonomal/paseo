@@ -86,7 +86,7 @@ export async function runUpdateCommand(
   options: AgentUpdateOptions,
   _command: Command,
 ): Promise<AgentUpdateCommandResult> {
-  const host = getDaemonHost({ host: options.host as string | undefined });
+  const host = getDaemonHost({ host: options.host });
 
   // Validate arguments
   if (!agentIdArg || agentIdArg.trim().length === 0) {
@@ -120,7 +120,7 @@ export async function runUpdateCommand(
 
   let client;
   try {
-    client = await connectToDaemon({ host: options.host as string | undefined });
+    client = await connectToDaemon({ host: options.host });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const error: CommandError = {
@@ -132,7 +132,7 @@ export async function runUpdateCommand(
   }
 
   try {
-    const fetchResult = await client.fetchAgent(agentIdArg);
+    const fetchResult = await client.fetchAgent({ agentId: agentIdArg });
     if (!fetchResult) {
       const error: CommandError = {
         code: "AGENT_NOT_FOUND",
@@ -148,7 +148,7 @@ export async function runUpdateCommand(
       ...(Object.keys(labels).length > 0 ? { labels } : {}),
     });
 
-    const updatedResult = await client.fetchAgent(agentId);
+    const updatedResult = await client.fetchAgent({ agentId });
     if (!updatedResult) {
       throw new Error(`Agent not found after update: ${agentId}`);
     }

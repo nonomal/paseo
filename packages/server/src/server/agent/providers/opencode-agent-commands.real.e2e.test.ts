@@ -1,15 +1,21 @@
-import { beforeAll, beforeEach, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "vitest";
 import pino from "pino";
 
-import type { AgentSlashCommand } from "../agent-sdk-types.js";
-import { isCommandAvailable } from "../../../utils/executable.js";
-import { OpenCodeAgentClient } from "./opencode-agent.js";
+import { OpenCodeServerManager } from "./opencode/server-manager.js";
+import {
+  canRunRealProvider,
+  createRealProviderClient,
+  getRealProviderConfig,
+} from "../../daemon-e2e/real-provider-test-config.js";
+
+const OPENCODE_REAL_TEST_MODEL = getRealProviderConfig("opencode").model;
+const logger = pino({ level: "silent" });
 
 describe("opencode agent commands contract (real)", () => {
   let canRun = false;
 
   beforeAll(async () => {
-    canRun = await isCommandAvailable("opencode");
+    canRun = await canRunRealProvider("opencode");
   });
 
   beforeEach((context) => {
@@ -18,13 +24,16 @@ describe("opencode agent commands contract (real)", () => {
     }
   });
 
-  test("lists slash commands with the expected contract", async () => {
-    expect(await isCommandAvailable("opencode")).toBe(true);
+  afterAll(async () => {
+    await OpenCodeServerManager.getInstance(logger).shutdown();
+  });
 
-    const client = new OpenCodeAgentClient(pino({ level: "silent" }));
+  test("lists slash commands with the expected contract", async () => {
+    const client = createRealProviderClient("opencode", logger);
     const session = await client.createSession({
       provider: "opencode",
       cwd: process.cwd(),
+      model: OPENCODE_REAL_TEST_MODEL,
       modeId: "plan",
     });
 
@@ -36,7 +45,7 @@ describe("opencode agent commands contract (real)", () => {
       expect(commands.length).toBeGreaterThan(0);
 
       for (const command of commands) {
-        const typed = command as AgentSlashCommand;
+        const typed = command;
         expect(typeof typed.name).toBe("string");
         expect(typed.name.length).toBeGreaterThan(0);
         expect(typed.name.startsWith("/")).toBe(false);
@@ -49,12 +58,11 @@ describe("opencode agent commands contract (real)", () => {
   }, 60_000);
 
   test("executes a slash command without arguments", async () => {
-    expect(await isCommandAvailable("opencode")).toBe(true);
-
-    const client = new OpenCodeAgentClient(pino({ level: "silent" }));
+    const client = createRealProviderClient("opencode", logger);
     const session = await client.createSession({
       provider: "opencode",
       cwd: process.cwd(),
+      model: OPENCODE_REAL_TEST_MODEL,
       modeId: "plan",
     });
 
@@ -63,7 +71,7 @@ describe("opencode agent commands contract (real)", () => {
       expect(commands.length).toBeGreaterThan(0);
 
       // Pick the first available command and send it without arguments.
-      const command = commands[0]!;
+      const command = commands[0];
       const events: Array<{ type: string }> = [];
       session.subscribe((event) => events.push(event));
 

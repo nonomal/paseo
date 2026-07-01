@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { View, Text } from "react-native";
+import { useTranslation } from "react-i18next";
 import { StyleSheet } from "react-native-unistyles";
 import Animated from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -15,6 +16,7 @@ interface ArchivedAgentCalloutProps {
 }
 
 export function ArchivedAgentCallout({ serverId, agentId }: ArchivedAgentCalloutProps) {
+  const { t } = useTranslation();
   const insets = useSafeAreaInsets();
   const client = useHostRuntimeClient(serverId);
   const isConnected = useHostRuntimeIsConnected(serverId);
@@ -22,7 +24,12 @@ export function ArchivedAgentCallout({ serverId, agentId }: ArchivedAgentCallout
 
   const { style: keyboardAnimatedStyle } = useKeyboardShiftStyle({ mode: "translate" });
 
-  async function handleUnarchive() {
+  const containerStyle = useMemo(
+    () => [styles.container, { paddingBottom: insets.bottom }, keyboardAnimatedStyle],
+    [insets.bottom, keyboardAnimatedStyle],
+  );
+
+  const handleUnarchive = useCallback(async () => {
     if (!client || !isConnected || isUnarchiving) return;
     setIsUnarchiving(true);
     try {
@@ -31,23 +38,21 @@ export function ArchivedAgentCallout({ serverId, agentId }: ArchivedAgentCallout
       console.error("[ArchivedAgentCallout] Failed to unarchive agent:", error);
       setIsUnarchiving(false);
     }
-  }
+  }, [client, isConnected, isUnarchiving, agentId]);
 
   return (
-    <Animated.View
-      style={[styles.container, { paddingBottom: insets.bottom }, keyboardAnimatedStyle]}
-    >
+    <Animated.View style={containerStyle}>
       <View style={styles.inputAreaContainer}>
         <View style={styles.inputAreaContent}>
           <View style={styles.callout}>
-            <Text style={styles.calloutText}>This agent is archived</Text>
+            <Text style={styles.calloutText}>{t("agentPanel.archived.callout")}</Text>
             <Button
               size="sm"
               variant="secondary"
               onPress={handleUnarchive}
               disabled={!isConnected || isUnarchiving}
             >
-              Unarchive
+              {t("agentPanel.archived.unarchive")}
             </Button>
           </View>
         </View>
@@ -56,7 +61,7 @@ export function ArchivedAgentCallout({ serverId, agentId }: ArchivedAgentCallout
   );
 }
 
-const styles = StyleSheet.create(((theme: Theme) => ({
+const styles = StyleSheet.create((theme: Theme) => ({
   container: {
     flexDirection: "column",
     position: "relative",
@@ -96,4 +101,4 @@ const styles = StyleSheet.create(((theme: Theme) => ({
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.base,
   },
-})) as any) as Record<string, any>;
+})) as unknown as Record<string, object>;

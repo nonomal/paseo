@@ -1,14 +1,15 @@
 import type { ReactNode } from "react";
-import { useHostRuntimeBootstrapState, useStoreReady } from "@/app/_layout";
+import { useHostRuntimeBootstrapState } from "@/app/_layout";
+import { useHostRegistryStatus } from "@/runtime/host-runtime";
 import { StartupSplashScreen } from "@/screens/startup-splash-screen";
 
 export function HostRouteBootstrapBoundary({ children }: { children: ReactNode }) {
-  const storeReady = useStoreReady();
   const bootstrapState = useHostRuntimeBootstrapState();
+  const hostRegistryStatus = useHostRegistryStatus();
 
-  if (!storeReady) {
+  if (bootstrapState.startupBlocker.kind !== "none" || hostRegistryStatus === "loading") {
     return <StartupSplashScreen bootstrapState={bootstrapState} />;
   }
 
-  return <>{children}</>;
+  return children;
 }

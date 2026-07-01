@@ -1,17 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   PanResponder,
-  View,
+  type GestureResponderEvent,
   type LayoutChangeEvent,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
+  type ViewStyle,
+  View,
 } from "react-native";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { isWeb as platformIsWeb } from "@/constants/platform";
+import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import {
   computeScrollOffsetFromDragDelta,
   computeVerticalScrollbarGeometry,
 } from "./web-desktop-scrollbar.math";
-import { isWeb as platformIsWeb } from "@/constants/platform";
 
 const METRICS_EPSILON = 0.5;
 const HANDLE_WIDTH_IDLE = 6;
@@ -27,7 +30,24 @@ const HANDLE_WIDTH_TRANSITION_DURATION_MS = 240;
 const HANDLE_SCROLL_VISIBILITY_MS = 1200;
 const HANDLE_SCROLL_ACTIVE_MS = 110;
 
-function readClientY(event: any): number | null {
+interface WebPointerStyle {
+  cursor?: "grab" | "grabbing";
+  touchAction?: "none";
+  userSelect?: "none";
+  transitionProperty?: string;
+  transitionDuration?: string;
+  transitionTimingFunction?: string;
+}
+
+interface PointerLikeEvent {
+  clientY?: number;
+  pageY?: number;
+  nativeEvent?: { clientY?: number; pageY?: number; preventDefault?: () => void };
+  preventDefault?: () => void;
+  stopPropagation?: () => void;
+}
+
+function readClientY(event: PointerLikeEvent): number | null {
   const value =
     event?.nativeEvent?.clientY ?? event?.clientY ?? event?.nativeEvent?.pageY ?? event?.pageY;
   return typeof value === "number" ? value : null;
@@ -37,11 +57,11 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-export type ScrollbarMetrics = {
+export interface ScrollbarMetrics {
   offset: number;
   viewportSize: number;
   contentSize: number;
-};
+}
 
 function areMetricsEqual(a: ScrollbarMetrics, b: ScrollbarMetrics): boolean {
   return (
@@ -49,6 +69,13 @@ function areMetricsEqual(a: ScrollbarMetrics, b: ScrollbarMetrics): boolean {
     Math.abs(a.viewportSize - b.viewportSize) <= METRICS_EPSILON &&
     Math.abs(a.contentSize - b.contentSize) <= METRICS_EPSILON
   );
+}
+
+interface WebDesktopScrollbarOverlayProps {
+  enabled: boolean;
+  metrics: ScrollbarMetrics;
+  onScrollToOffset: (offset: number) => void;
+  inverted?: boolean;
 }
 
 export function useWebDesktopScrollbarMetrics() {
@@ -106,13 +133,6 @@ export function useWebDesktopScrollbarMetrics() {
     setOffset,
   };
 }
-
-type WebDesktopScrollbarOverlayProps = {
-  enabled: boolean;
-  metrics: ScrollbarMetrics;
-  onScrollToOffset: (offset: number) => void;
-  inverted?: boolean;
-};
 
 export function WebDesktopScrollbarOverlay({
   enabled,
@@ -265,8 +285,12 @@ export function WebDesktopScrollbarOverlay({
       onStartShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponder: () => true,
       onPanResponderTerminationRequest: () => false,
-      onPanResponderGrant: () => {
+      onPanResponderGrant: (event: GestureResponderEvent) => {
+        const clientY = readClientY(event);
         dragStartOffsetRef.current = normalizedOffsetRef.current;
+        if (clientY !== null) {
+          dragStartClientYRef.current = clientY;
+        }
         setIsDragging(true);
       },
       onPanResponderMove: (_event, gestureState) => {
@@ -279,26 +303,23 @@ export function WebDesktopScrollbarOverlay({
         setIsDragging(false);
       },
     });
-  }, [applyDragDelta, platformIsWeb]);
+  }, [applyDragDelta]);
 
-  const startWebDrag = useCallback(
-    (event: any) => {
-      if (!platformIsWeb) {
-        return;
-      }
-      const clientY = readClientY(event);
-      if (clientY === null) {
-        return;
-      }
-      event?.preventDefault?.();
-      event?.stopPropagation?.();
-      event?.nativeEvent?.preventDefault?.();
-      dragStartOffsetRef.current = normalizedOffsetRef.current;
-      dragStartClientYRef.current = clientY;
-      setIsDragging(true);
-    },
-    [platformIsWeb],
-  );
+  const startWebDrag = useCallback((event: PointerLikeEvent) => {
+    if (!platformIsWeb) {
+      return;
+    }
+    const clientY = readClientY(event);
+    if (clientY === null) {
+      return;
+    }
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    event?.nativeEvent?.preventDefault?.();
+    dragStartOffsetRef.current = normalizedOffsetRef.current;
+    dragStartClientYRef.current = clientY;
+    setIsDragging(true);
+  }, []);
 
   const handleGrabHoverIn = useCallback(() => {
     if (!isScrollVisible && !isDragging) {
@@ -334,20 +355,14 @@ export function WebDesktopScrollbarOverlay({
       window.removeEventListener("pointerup", stopDragging);
       window.removeEventListener("pointercancel", stopDragging);
     };
-  }, [applyDragDelta, isDragging, platformIsWeb]);
-
-  if (!enabled || !geometry.isVisible) {
-    return null;
-  }
+  }, [applyDragDelta, isDragging]);
 
   const handleVisible = isDragging || isScrollVisible || isHandleHovered;
-  const handleOpacity = isDragging
-    ? HANDLE_OPACITY_DRAGGING
-    : isHandleHovered
-      ? HANDLE_OPACITY_HOVERED
-      : isScrollVisible
-        ? HANDLE_OPACITY_VISIBLE
-        : 0;
+  let handleOpacity: number;
+  if (isDragging) handleOpacity = HANDLE_OPACITY_DRAGGING;
+  else if (isHandleHovered) handleOpacity = HANDLE_OPACITY_HOVERED;
+  else if (isScrollVisible) handleOpacity = HANDLE_OPACITY_VISIBLE;
+  else handleOpacity = 0;
   const handleWidth = isDragging || isHandleHovered ? HANDLE_WIDTH_ACTIVE : HANDLE_WIDTH_IDLE;
   const handleColor = theme.colors.scrollbarHandle;
   const handleCursor = isDragging ? "grabbing" : "grab";
@@ -360,57 +375,65 @@ export function WebDesktopScrollbarOverlay({
   );
   const handleInsetTop = Math.max(0, (thumbRegionHeight - geometry.handleSize) / 2);
 
+  const thumbRegionStyle = useMemo(
+    () => [
+      styles.thumbRegion,
+      inlineUnistylesStyle({
+        height: thumbRegionHeight,
+        transform: [{ translateY: thumbRegionOffset }],
+      }),
+      platformIsWeb &&
+        inlineUnistylesStyle({
+          cursor: handleCursor,
+          touchAction: "none",
+          userSelect: "none",
+          transitionProperty: "transform",
+          transitionDuration: `${handleTravelDurationMs}ms`,
+          transitionTimingFunction: "linear",
+        } satisfies WebPointerStyle as unknown as ViewStyle),
+    ],
+    [thumbRegionHeight, thumbRegionOffset, handleCursor, handleTravelDurationMs],
+  );
+
+  const handleStyle = useMemo(
+    () => [
+      styles.handle,
+      inlineUnistylesStyle({
+        marginTop: handleInsetTop,
+        height: geometry.handleSize,
+        width: handleWidth,
+        backgroundColor: handleColor,
+        opacity: handleOpacity,
+      }),
+      platformIsWeb &&
+        inlineUnistylesStyle({
+          transitionProperty: "opacity, width, background-color",
+          transitionDuration: `${HANDLE_FADE_DURATION_MS}ms, ${HANDLE_WIDTH_TRANSITION_DURATION_MS}ms, ${HANDLE_FADE_DURATION_MS}ms`,
+          transitionTimingFunction: "ease-out, cubic-bezier(0.22, 0.75, 0.2, 1), ease-out",
+        } satisfies WebPointerStyle as unknown as ViewStyle),
+    ],
+    [handleInsetTop, geometry.handleSize, handleWidth, handleColor, handleOpacity],
+  );
+
+  if (!enabled || !geometry.isVisible) {
+    return null;
+  }
+
   return (
     <View style={styles.overlay} pointerEvents="box-none">
       <View
-        style={[
-          styles.thumbRegion,
-          {
-            top: 0,
-            height: thumbRegionHeight,
-            transform: [{ translateY: thumbRegionOffset }],
-          },
-          platformIsWeb &&
-            ({
-              cursor: handleCursor,
-              touchAction: "none",
-              userSelect: "none",
-              transitionProperty: "transform",
-              transitionDuration: `${handleTravelDurationMs}ms`,
-              transitionTimingFunction: "linear",
-            } as any),
-        ]}
+        style={thumbRegionStyle}
         pointerEvents={handleVisible ? "auto" : "none"}
         {...(panResponder?.panHandlers ?? {})}
         {...(platformIsWeb
           ? ({
               onPointerDown: startWebDrag,
-              onPointerEnter: handleGrabHoverIn,
-              onPointerLeave: handleGrabHoverOut,
               onMouseEnter: handleGrabHoverIn,
               onMouseLeave: handleGrabHoverOut,
-            } as any)
+            } as object)
           : null)}
       >
-        <View
-          style={[
-            styles.handle,
-            {
-              marginTop: handleInsetTop,
-              height: geometry.handleSize,
-              width: handleWidth,
-              backgroundColor: handleColor,
-              opacity: handleOpacity,
-            },
-            platformIsWeb &&
-              ({
-                transitionProperty: "opacity, width, background-color",
-                transitionDuration: `${HANDLE_FADE_DURATION_MS}ms, ${HANDLE_WIDTH_TRANSITION_DURATION_MS}ms, ${HANDLE_FADE_DURATION_MS}ms`,
-                transitionTimingFunction: "ease-out, cubic-bezier(0.22, 0.75, 0.2, 1), ease-out",
-              } as any),
-          ]}
-          pointerEvents="none"
-        />
+        <View style={handleStyle} pointerEvents="none" />
       </View>
     </View>
   );
@@ -436,5 +459,6 @@ const styles = StyleSheet.create(() => ({
     position: "absolute",
     right: -3,
     width: HANDLE_GRAB_WIDTH,
+    top: 0,
   },
 }));

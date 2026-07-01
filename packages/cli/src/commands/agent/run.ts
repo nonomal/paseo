@@ -1,9 +1,6 @@
 import { Command, Option } from "commander";
-import {
-  getStructuredAgentResponse,
-  StructuredAgentResponseError,
-  type AgentSnapshotPayload,
-} from "@getpaseo/server";
+import { getStructuredAgentResponse, StructuredAgentResponseError } from "@getpaseo/server";
+import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
 import type {
   CommandOptions,
@@ -18,6 +15,8 @@ import { parseDuration } from "../../utils/duration.js";
 import { collectMultiple } from "../../utils/command-options.js";
 import { resolveProviderAndModel } from "../../utils/provider-model.js";
 
+export { resolveProviderAndModel } from "../../utils/provider-model.js";
+
 export function addRunOptions(cmd: Command): Command {
   return cmd
     .description("Create and start an agent with a task")
@@ -28,7 +27,6 @@ export function addRunOptions(cmd: Command): Command {
     .option(
       "--provider <provider>",
       "Agent provider, or provider/model (e.g. codex or codex/gpt-5.4)",
-      "claude",
     )
     .option(
       "--model <model>",
@@ -39,12 +37,22 @@ export function addRunOptions(cmd: Command): Command {
     .option("--worktree <name>", "Create agent in a new git worktree")
     .option("--base <branch>", "Base branch for worktree (default: current branch)")
     .option(
+      "--workspace <id>",
+      "Run in an existing workspace (default: a new workspace is created per run; falls back to $PASEO_WORKSPACE_ID)",
+    )
+    .option(
       "--image <path>",
       "Attach image(s) to the initial prompt (can be used multiple times)",
       collectMultiple,
       [],
     )
     .option("--cwd <path>", "Working directory (default: current)")
+    .option(
+      "--env <key=value>",
+      "Set environment variable(s) for the agent process (can be used multiple times)",
+      collectMultiple,
+      [],
+    )
     .option(
       "--label <key=value>",
       "Add label(s) to the agent (can be used multiple times)",
@@ -92,8 +100,10 @@ export interface AgentRunOptions extends CommandOptions {
   mode?: string;
   worktree?: string;
   base?: string;
+  workspace?: string;
   image?: string[];
   cwd?: string;
+  env?: string[];
   label?: string[];
   waitTimeout?: string;
   outputSchema?: string;
@@ -172,6 +182,40 @@ class StructuredRunStatusError extends Error {
   }
 }
 
+async function fetchStructuredOutput(
+  caller: (structuredPrompt: string) => Promise<string>,
+  prompt: string,
+  outputSchema: ReturnType<typeof loadOutputSchema>,
+): Promise<Record<string, unknown>> {
+  try {
+    return await getStructuredAgentResponse<Record<string, unknown>>({
+      caller,
+      prompt,
+      schema: outputSchema,
+      schemaName: "RunOutput",
+      maxRetries: 2,
+    });
+  } catch (err) {
+    if (err instanceof StructuredRunStatusError) {
+      throw {
+        code: "OUTPUT_SCHEMA_FAILED",
+        message: err.message,
+      } satisfies CommandError;
+    }
+    if (err instanceof StructuredAgentResponseError) {
+      throw {
+        code: "OUTPUT_SCHEMA_FAILED",
+        message: "Agent response did not match the required output schema",
+        details:
+          err.validationErrors.length > 0
+            ? err.validationErrors.join("\n")
+            : err.lastResponse || "No response",
+      } satisfies CommandError;
+    }
+    throw err;
+  }
+}
+
 type ConnectedDaemonClient = Awaited<ReturnType<typeof connectToDaemon>>;
 
 export interface StructuredResponseTimelineClient {
@@ -191,7 +235,6 @@ export async function resolveStructuredResponseMessage(options: {
   try {
     const timeline = await options.client.fetchAgentTimeline(options.agentId, {
       direction: "tail",
-      projection: "projected",
       limit: 200,
     });
     for (let index = timeline.entries.length - 1; index >= 0; index -= 1) {
@@ -218,77 +261,225 @@ function structuredRunSchema(output: Record<string, unknown>): OutputSchema<Agen
   };
 }
 
+function validateRunOptions(prompt: string, options: AgentRunOptions, outputSchema: unknown): void {
+  if (!prompt || prompt.trim().length === 0) {
+    throw {
+      code: "MISSING_PROMPT",
+      message: "A prompt is required",
+      details: "Usage: paseo agent run [options] <prompt>",
+    } satisfies CommandError;
+  }
+
+  if (options.base && !options.worktree) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--base can only be used with --worktree",
+      details: "Usage: paseo agent run --worktree <name> --base <branch> <prompt>",
+    } satisfies CommandError;
+  }
+
+  if (options.worktree && options.workspace) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--worktree and --workspace cannot be combined",
+      details: "--workspace runs in an existing workspace; --worktree mints a new one",
+    } satisfies CommandError;
+  }
+
+  if (options.worktree && !options.workspace && process.env.PASEO_WORKSPACE_ID) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--worktree cannot be combined with an ambient PASEO_WORKSPACE_ID",
+      details:
+        "PASEO_WORKSPACE_ID selects an existing workspace; --worktree mints a new one. Unset PASEO_WORKSPACE_ID to use --worktree.",
+    } satisfies CommandError;
+  }
+
+  if (outputSchema && options.detach) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--output-schema cannot be used with --detach",
+      details: "Structured output requires waiting for the agent to finish",
+    } satisfies CommandError;
+  }
+}
+
+function parseWaitTimeoutOption(waitTimeout: string | undefined): number {
+  if (!waitTimeout) return 0;
+  try {
+    const ms = parseDuration(waitTimeout);
+    if (ms <= 0) {
+      throw new Error("Timeout must be positive");
+    }
+    return ms;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw {
+      code: "INVALID_TIMEOUT",
+      message: "Invalid wait timeout value",
+      details: message,
+    } satisfies CommandError;
+  }
+}
+
+function loadRunImages(
+  imagePaths: string[] | undefined,
+): Array<{ data: string; mimeType: string }> | undefined {
+  if (!imagePaths || imagePaths.length === 0) return undefined;
+  return imagePaths.map((imagePath) => {
+    const resolvedPath = resolve(imagePath);
+    try {
+      const imageData = readFileSync(resolvedPath);
+      const mimeType = lookup(resolvedPath) || "application/octet-stream";
+      if (!mimeType.startsWith("image/")) {
+        throw new Error(`File is not an image: ${imagePath} (detected type: ${mimeType})`);
+      }
+      return {
+        data: imageData.toString("base64"),
+        mimeType,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to read image ${imagePath}: ${message}`, { cause: err });
+    }
+  });
+}
+
+function parseRunLabels(labelFlags: string[] | undefined): Record<string, string> {
+  return parseKeyValueFlags(labelFlags, {
+    flagName: "--label",
+    code: "INVALID_LABEL",
+    noun: "label",
+    pluralNoun: "Labels",
+  });
+}
+
+function parseRunEnv(envFlags: string[] | undefined): Record<string, string> {
+  return parseKeyValueFlags(envFlags, {
+    flagName: "--env",
+    code: "INVALID_ENV",
+    noun: "environment variable",
+    pluralNoun: "Environment variables",
+  });
+}
+
+function parseKeyValueFlags(
+  flags: string[] | undefined,
+  options: {
+    flagName: string;
+    code: CommandError["code"];
+    noun: string;
+    pluralNoun: string;
+  },
+): Record<string, string> {
+  const labels: Record<string, string> = {};
+  if (!flags) return labels;
+  for (const labelStr of flags) {
+    const eqIndex = labelStr.indexOf("=");
+    if (eqIndex === -1) {
+      throw {
+        code: options.code,
+        message: `Invalid ${options.noun} format: ${labelStr}`,
+        details: `${options.pluralNoun} must be in key=value format`,
+      } satisfies CommandError;
+    }
+    const key = labelStr.slice(0, eqIndex);
+    labels[key] = labelStr.slice(eqIndex + 1);
+  }
+  return labels;
+}
+
+async function connectToDaemonOrThrow(
+  hostOption: string | undefined,
+  host: string,
+): Promise<ConnectedDaemonClient> {
+  try {
+    return await connectToDaemon({ host: hostOption });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw {
+      code: "DAEMON_NOT_RUNNING",
+      message: `Cannot connect to daemon at ${host}: ${message}`,
+      details: "Start the daemon with: paseo daemon start",
+    } satisfies CommandError;
+  }
+}
+
+// A workspace is the explicit home of a run: it owns the directory the agent
+// runs in. The CLI resolves one before creating any agent, so no run leans on
+// createAgent's legacy cwd->workspace fallback.
+interface RunWorkspace {
+  id: string;
+  cwd: string;
+}
+
+// Workspace policy for `paseo run`. Precedence:
+//   1. --workspace <id>            -> run in that existing workspace
+//   2. $PASEO_WORKSPACE_ID         -> exported by workspace terminals
+//   3. --worktree <name>           -> mint a new worktree-backed workspace
+//   4. bare run                    -> mint a new local-backed workspace for cwd
+// --worktree is rejected alongside both --workspace and an ambient
+// $PASEO_WORKSPACE_ID (validateRunOptions), so worktree resolution here never
+// races an existing-workspace selection.
+async function resolveRunWorkspace(
+  client: ConnectedDaemonClient,
+  options: AgentRunOptions,
+  cwd: string,
+): Promise<RunWorkspace> {
+  // An explicit --worktree mints its own workspace; --workspace and an ambient
+  // PASEO_WORKSPACE_ID are both rejected alongside --worktree upstream.
+  const explicit = options.worktree
+    ? undefined
+    : options.workspace?.trim() || process.env.PASEO_WORKSPACE_ID?.trim();
+  if (explicit) {
+    console.error(`Using workspace ${explicit}`);
+    return { id: explicit, cwd };
+  }
+
+  // TODO: thread the run `prompt` as firstAgentContext so workspace-level
+  // title/branch generation picks up the task description (U8/U6 deferred).
+  const result = options.worktree
+    ? await client.createWorkspace({
+        source: {
+          kind: "worktree",
+          cwd,
+          worktreeSlug: options.worktree,
+          baseBranch: options.base,
+        },
+      })
+    : await client.createWorkspace({ source: { kind: "directory", path: cwd } });
+
+  if (!result.workspace) {
+    throw {
+      code: "WORKSPACE_CREATE_FAILED",
+      message: result.error ?? "Failed to create workspace for this run",
+    } satisfies CommandError;
+  }
+
+  const branch = result.workspace.gitRuntime?.currentBranch;
+  const label = branch ? `${result.workspace.name} (${branch})` : result.workspace.name;
+  console.error(`Created workspace ${result.workspace.id} - ${label}`);
+  console.error(
+    "Tip: pass --workspace <id> (or set PASEO_WORKSPACE_ID) to run in an existing workspace.",
+  );
+  return { id: result.workspace.id, cwd: result.workspace.workspaceDirectory ?? cwd };
+}
+
 export async function runRunCommand(
   prompt: string,
   options: AgentRunOptions,
   _command: Command,
 ): Promise<SingleResult<AgentRunResult>> {
-  const host = getDaemonHost({ host: options.host as string | undefined });
+  const host = getDaemonHost({ host: options.host });
   const outputSchema = options.outputSchema ? loadOutputSchema(options.outputSchema) : undefined;
-  let waitTimeoutMs = 0;
 
-  // Validate prompt is provided
-  if (!prompt || prompt.trim().length === 0) {
-    const error: CommandError = {
-      code: "MISSING_PROMPT",
-      message: "A prompt is required",
-      details: "Usage: paseo agent run [options] <prompt>",
-    };
-    throw error;
-  }
-
-  // Validate --base is only used with --worktree
-  if (options.base && !options.worktree) {
-    const error: CommandError = {
-      code: "INVALID_OPTIONS",
-      message: "--base can only be used with --worktree",
-      details: "Usage: paseo agent run --worktree <name> --base <branch> <prompt>",
-    };
-    throw error;
-  }
-
-  // --output-schema always runs in attached/wait mode
-  if (outputSchema && options.detach) {
-    const error: CommandError = {
-      code: "INVALID_OPTIONS",
-      message: "--output-schema cannot be used with --detach",
-      details: "Structured output requires waiting for the agent to finish",
-    };
-    throw error;
-  }
-
-  if (options.waitTimeout) {
-    try {
-      waitTimeoutMs = parseDuration(options.waitTimeout);
-      if (waitTimeoutMs <= 0) {
-        throw new Error("Timeout must be positive");
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const error: CommandError = {
-        code: "INVALID_TIMEOUT",
-        message: "Invalid wait timeout value",
-        details: message,
-      };
-      throw error;
-    }
-  }
+  validateRunOptions(prompt, options, outputSchema);
+  const waitTimeoutMs = parseWaitTimeoutOption(options.waitTimeout);
 
   const resolvedProviderModel = resolveProviderAndModel(options);
   const resolvedTitle = options.title ?? options.name;
 
-  let client;
-  try {
-    client = await connectToDaemon({ host: options.host as string | undefined });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const error: CommandError = {
-      code: "DAEMON_NOT_RUNNING",
-      message: `Cannot connect to daemon at ${host}: ${message}`,
-      details: "Start the daemon with: paseo daemon start",
-    };
-    throw error;
-  }
+  const client = await connectToDaemonOrThrow(options.host, host);
 
   try {
     // Resolve working directory
@@ -304,58 +495,15 @@ export async function runRunCommand(
       throw error;
     }
 
-    // Process images if provided
-    let images: Array<{ data: string; mimeType: string }> | undefined;
-    if (options.image && options.image.length > 0) {
-      images = options.image.map((imagePath) => {
-        const resolvedPath = resolve(imagePath);
-        try {
-          const imageData = readFileSync(resolvedPath);
-          const mimeType = lookup(resolvedPath) || "application/octet-stream";
+    const images = loadRunImages(options.image);
 
-          // Verify it's an image MIME type
-          if (!mimeType.startsWith("image/")) {
-            throw new Error(`File is not an image: ${imagePath} (detected type: ${mimeType})`);
-          }
+    const labels = parseRunLabels(options.label);
+    const env = parseRunEnv(options.env);
+    const requestEnv = Object.keys(env).length > 0 ? env : undefined;
 
-          return {
-            data: imageData.toString("base64"),
-            mimeType,
-          };
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          throw new Error(`Failed to read image ${imagePath}: ${message}`);
-        }
-      });
-    }
-
-    // Build git options if worktree is specified
-    const git = options.worktree
-      ? {
-          createWorktree: true,
-          worktreeSlug: options.worktree,
-          baseBranch: options.base,
-        }
-      : undefined;
-
-    // Build labels from --label flags
-    const labels: Record<string, string> = {};
-    if (options.label) {
-      for (const labelStr of options.label) {
-        const eqIndex = labelStr.indexOf("=");
-        if (eqIndex === -1) {
-          const error: CommandError = {
-            code: "INVALID_LABEL",
-            message: `Invalid label format: ${labelStr}`,
-            details: "Labels must be in key=value format",
-          };
-          throw error;
-        }
-        const key = labelStr.slice(0, eqIndex);
-        const value = labelStr.slice(eqIndex + 1);
-        labels[key] = value;
-      }
-    }
+    const workspace = await resolveRunWorkspace(client, options, cwd);
+    const workspaceId = workspace.id;
+    const runCwd = workspace.cwd;
 
     if (outputSchema) {
       let structuredAgent: AgentSnapshotPayload | null = null;
@@ -364,7 +512,8 @@ export async function runRunCommand(
         if (!structuredAgent) {
           structuredAgent = await client.createAgent({
             provider: resolvedProviderModel.provider,
-            cwd,
+            cwd: runCwd,
+            workspaceId,
             title: resolvedTitle,
             modeId: options.mode,
             model: resolvedProviderModel.model,
@@ -372,8 +521,7 @@ export async function runRunCommand(
             initialPrompt: structuredPrompt,
             outputSchema,
             images,
-            git,
-            worktreeName: options.worktree,
+            env: requestEnv,
             labels: Object.keys(labels).length > 0 ? labels : undefined,
           });
         } else {
@@ -412,36 +560,7 @@ export async function runRunCommand(
         return lastMessage;
       };
 
-      let output: Record<string, unknown>;
-      try {
-        output = await getStructuredAgentResponse<Record<string, unknown>>({
-          caller: callStructuredTurn,
-          prompt,
-          schema: outputSchema,
-          schemaName: "RunOutput",
-          maxRetries: 2,
-        });
-      } catch (err) {
-        if (err instanceof StructuredRunStatusError) {
-          const error: CommandError = {
-            code: "OUTPUT_SCHEMA_FAILED",
-            message: err.message,
-          };
-          throw error;
-        }
-        if (err instanceof StructuredAgentResponseError) {
-          const error: CommandError = {
-            code: "OUTPUT_SCHEMA_FAILED",
-            message: "Agent response did not match the required output schema",
-            details:
-              err.validationErrors.length > 0
-                ? err.validationErrors.join("\n")
-                : err.lastResponse || "No response",
-          };
-          throw error;
-        }
-        throw err;
-      }
+      const output = await fetchStructuredOutput(callStructuredTurn, prompt, outputSchema);
 
       if (!structuredAgent) {
         const error: CommandError = {
@@ -463,15 +582,15 @@ export async function runRunCommand(
     // Create the agent
     const agent = await client.createAgent({
       provider: resolvedProviderModel.provider,
-      cwd,
+      cwd: runCwd,
+      workspaceId,
       title: resolvedTitle,
       modeId: options.mode,
       model: resolvedProviderModel.model,
       thinkingOptionId,
       initialPrompt: prompt,
       images,
-      git,
-      worktreeName: options.worktree,
+      env: requestEnv,
       labels: Object.keys(labels).length > 0 ? labels : undefined,
     });
 

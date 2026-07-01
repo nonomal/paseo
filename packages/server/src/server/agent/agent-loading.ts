@@ -7,6 +7,7 @@ import {
   buildConfigOverrides,
   buildSessionConfig,
   extractTimestamps,
+  isStoredAgentProviderAvailable,
   toAgentPersistenceHandle,
 } from "../persistence-hooks.js";
 
@@ -40,7 +41,11 @@ export async function ensureAgentLoaded(
     }
 
     const validProviders = deps.validProviders ?? deps.agentManager.getRegisteredProviderIds();
-    const handle = toAgentPersistenceHandle(deps.logger, validProviders, record.persistence);
+    if (!isStoredAgentProviderAvailable(record, validProviders)) {
+      throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
+    }
+
+    const handle = toAgentPersistenceHandle(validProviders, record.persistence);
 
     let snapshot: ManagedAgent;
     if (handle) {
@@ -54,12 +59,14 @@ export async function ensureAgentLoaded(
     } else {
       const config = buildSessionConfig(record, {
         validProviders,
-        logger: deps.logger,
       });
       if (!config) {
         throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
       }
-      snapshot = await deps.agentManager.createAgent(config, agentId, { labels: record.labels });
+      snapshot = await deps.agentManager.createAgent(config, agentId, {
+        labels: record.labels,
+        workspaceId: record.workspaceId,
+      });
       deps.logger.info({ agentId, provider: record.provider }, "Agent created from stored config");
     }
 

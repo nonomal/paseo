@@ -1,23 +1,54 @@
 "use dom";
 
-import { useEffect, useMemo, useRef, useState, type Ref } from "react";
+import {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type DragEvent as ReactDragEvent,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type Ref,
+} from "react";
 import type { DOMProps } from "expo/dom";
 import { useDOMImperativeHandle, type DOMImperativeFactory } from "expo/dom";
 import "@xterm/xterm/css/xterm.css";
 import type { ITheme } from "@xterm/xterm";
-import type { TerminalState } from "@server/shared/messages";
+import type { TerminalState } from "@getpaseo/protocol/messages";
+import type { TerminalInputModeState } from "@getpaseo/protocol/terminal-input-mode";
 import type { PendingTerminalModifiers } from "../utils/terminal-keys";
-import { TerminalEmulatorRuntime } from "../terminal/runtime/terminal-emulator-runtime";
+import {
+  TerminalEmulatorRuntime,
+  type TerminalOutputData,
+} from "../terminal/runtime/terminal-emulator-runtime";
+import type {
+  TerminalLocalFileLinkSource,
+  TerminalLocalFileLinkTarget,
+} from "../terminal/local-links/terminal-local-link-provider";
+import type { TerminalRendererReadyChange } from "../utils/terminal-renderer-readiness";
+import { openExternalUrl } from "../utils/open-external-url";
 import { focusWithRetries } from "../utils/web-focus";
 import {
   computeScrollOffsetFromDragDelta,
   computeVerticalScrollbarGeometry,
 } from "./web-desktop-scrollbar.math";
+import {
+  extractTerminalDropPaths,
+  isTerminalDragLeaveOutside,
+  isTerminalFileDrag,
+  prepareDroppedPathsForTerminal,
+} from "../terminal/drop/terminal-file-drop";
+import { getDesktopHost } from "@/desktop/host";
 
 export interface TerminalEmulatorHandle {
-  writeOutput: (text: string) => void;
+  writeOutput: (data: TerminalOutputData) => void;
+  restoreOutput: (data: TerminalOutputData) => void;
   renderSnapshot: (state: TerminalState | null) => void;
   clear: () => void;
+  blur: () => void;
 }
 
 const SCROLLBAR_HANDLE_WIDTH_IDLE = 6;
@@ -34,11 +65,38 @@ const SCROLLBAR_HANDLE_SCROLL_VISIBILITY_MS = 1_200;
 const SCROLLBAR_HANDLE_SCROLL_ACTIVE_MS = 110;
 const WEBKIT_SCROLLBAR_STYLE_ID = "terminal-emulator-webkit-scrollbar-style";
 
-type ViewportMetrics = {
+const HOST_DIV_STYLE: CSSProperties = {
+  flex: 1,
+  minHeight: 0,
+  minWidth: 0,
+  width: "100%",
+  height: "100%",
+  overflow: "hidden",
+  overscrollBehavior: "none",
+  paddingTop: 0,
+  paddingBottom: 0,
+  paddingLeft: 0,
+  paddingRight: 0,
+};
+
+const SCROLLBAR_CONTAINER_STYLE: CSSProperties = {
+  position: "absolute",
+  top: 0,
+  right: 0,
+  bottom: 0,
+  width: 12,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "flex-start",
+  zIndex: 10,
+  pointerEvents: "none",
+};
+
+interface ViewportMetrics {
   offset: number;
   viewportSize: number;
   contentSize: number;
-};
+}
 
 function buildXtermThemeKey(theme: ITheme): string {
   const values: Array<string> = [
@@ -75,12 +133,16 @@ interface TerminalEmulatorProps {
   streamKey: string;
   testId?: string;
   xtermTheme?: ITheme;
+  scrollbackLines: number;
+  fontFamily?: string;
+  fontSize?: number;
   swipeGesturesEnabled?: boolean;
   onSwipeLeft?: () => void;
   onSwipeRight?: () => void;
   initialSnapshot?: TerminalState | null;
   onInput?: (data: string) => Promise<void> | void;
-  onResize?: (input: { rows: number; cols: number }) => Promise<void> | void;
+  onFocus?: () => Promise<void> | void;
+  onResize?: (input: { rows: number; cols: number; shouldClaim: boolean }) => Promise<void> | void;
   onTerminalKey?: (input: {
     key: string;
     ctrl: boolean;
@@ -89,6 +151,15 @@ interface TerminalEmulatorProps {
     meta: boolean;
   }) => Promise<void> | void;
   onPendingModifiersConsumed?: () => Promise<void> | void;
+  onInputModeChange?: (state: TerminalInputModeState) => Promise<void> | void;
+  onResolveLocalFileLink?: (
+    source: TerminalLocalFileLinkSource,
+  ) => Promise<TerminalLocalFileLinkTarget | null> | TerminalLocalFileLinkTarget | null;
+  onOpenLocalFileLink?: (
+    target: TerminalLocalFileLinkTarget,
+    disposition: "main" | "side",
+  ) => Promise<void> | void;
+  onRendererReadyChange?: (change: TerminalRendererReadyChange) => void;
   pendingModifiers?: PendingTerminalModifiers;
   focusRequestToken?: number;
   resizeRequestToken?: number;
@@ -100,6 +171,16 @@ declare global {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function isTerminalState(value: unknown): value is TerminalState {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "rows" in value &&
+    "cols" in value &&
+    "grid" in value
+  );
 }
 
 function ensureTerminalScrollbarStyle(): void {
@@ -135,14 +216,22 @@ export default function TerminalEmulator({
     foreground: "#e6e6e6",
     cursor: "#e6e6e6",
   },
+  scrollbackLines,
+  fontFamily,
+  fontSize,
   swipeGesturesEnabled = false,
   onSwipeLeft,
   onSwipeRight,
   initialSnapshot = null,
   onInput,
+  onFocus,
   onResize,
   onTerminalKey,
   onPendingModifiersConsumed,
+  onInputModeChange,
+  onResolveLocalFileLink,
+  onOpenLocalFileLink,
+  onRendererReadyChange,
   pendingModifiers = { ctrl: false, shift: false, alt: false },
   focusRequestToken = 0,
   resizeRequestToken = 0,
@@ -151,13 +240,46 @@ export default function TerminalEmulator({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const runtimeRef = useRef<TerminalEmulatorRuntime | null>(null);
   const mountedThemeRef = useRef<ITheme>(xtermTheme);
+  const fontFamilyRef = useRef(fontFamily);
+  const fontSizeRef = useRef(fontSize);
+  const scrollbackLinesRef = useRef(scrollbackLines);
+  scrollbackLinesRef.current = scrollbackLines;
+  fontFamilyRef.current = fontFamily;
+  fontSizeRef.current = fontSize;
   const viewportRef = useRef<HTMLElement | null>(null);
   const dragStartOffsetRef = useRef(0);
   const dragStartClientYRef = useRef(0);
   const scrollVisibilityTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollActiveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastObservedOffsetRef = useRef<number | null>(null);
+  const lastMetricsRef = useRef({ offset: 0, viewportSize: 0, contentSize: 0 });
   const themeKey = useMemo(() => buildXtermThemeKey(xtermTheme), [xtermTheme]);
+  const xtermThemeRef = useRef(xtermTheme);
+  xtermThemeRef.current = xtermTheme;
+  const onRendererReadyChangeRef = useRef(onRendererReadyChange);
+  onRendererReadyChangeRef.current = onRendererReadyChange;
+  const mountCallbacksRef = useRef({
+    onInput,
+    onResize,
+    onTerminalKey,
+    onPendingModifiersConsumed,
+    onInputModeChange,
+    onResolveLocalFileLink,
+    onOpenLocalFileLink,
+  });
+  mountCallbacksRef.current = {
+    onInput,
+    onResize,
+    onTerminalKey,
+    onPendingModifiersConsumed,
+    onInputModeChange,
+    onResolveLocalFileLink,
+    onOpenLocalFileLink,
+  };
+  const initialSnapshotRef = useRef(initialSnapshot);
+  initialSnapshotRef.current = initialSnapshot;
+  const pendingModifiersRef = useRef(pendingModifiers);
+  pendingModifiersRef.current = pendingModifiers;
   const [viewportMetrics, setViewportMetrics] = useState<ViewportMetrics>({
     offset: 0,
     viewportSize: 0,
@@ -167,28 +289,82 @@ export default function TerminalEmulator({
   const [isDraggingScrollbar, setIsDraggingScrollbar] = useState(false);
   const [isScrollVisible, setIsScrollVisible] = useState(false);
   const [isScrollActive, setIsScrollActive] = useState(false);
+  const [isDropActive, setIsDropActive] = useState(false);
+  const dropActiveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const updateViewportMetricsState = useCallback((metrics: ViewportMetrics) => {
+    const lastMetrics = lastMetricsRef.current;
+    if (
+      metrics.offset === lastMetrics.offset &&
+      metrics.viewportSize === lastMetrics.viewportSize &&
+      metrics.contentSize === lastMetrics.contentSize
+    ) {
+      return;
+    }
 
+    lastMetricsRef.current = metrics;
+    setViewportMetrics(metrics);
+  }, []);
+
+  const domBridgeRef = useRef<DOMImperativeFactory | null>(null);
   useDOMImperativeHandle(
-    ref as Ref<DOMImperativeFactory>,
-    () =>
-      ({
-        writeOutput: (text: string) => {
-          runtimeRef.current?.write({ text });
-        },
-        renderSnapshot: (state: TerminalState | null) => {
+    domBridgeRef,
+    (): DOMImperativeFactory => ({
+      writeOutput: (...args) => {
+        const data = args[0];
+        if (data instanceof Uint8Array) runtimeRef.current?.write({ data });
+      },
+      restoreOutput: (...args) => {
+        const data = args[0];
+        if (data instanceof Uint8Array) runtimeRef.current?.restoreOutput({ data });
+      },
+      renderSnapshot: (...args) => {
+        const state = args[0];
+        if (state === null) {
+          runtimeRef.current?.renderSnapshot({ state: null });
+        } else if (isTerminalState(state)) {
           runtimeRef.current?.renderSnapshot({ state });
-        },
-        clear: () => {
-          runtimeRef.current?.clear();
-        },
-      }) as unknown as DOMImperativeFactory,
+        }
+      },
+      clear: () => {
+        runtimeRef.current?.clear();
+      },
+      blur: () => {
+        runtimeRef.current?.blur();
+      },
+    }),
+    [],
+  );
+  useImperativeHandle(
+    ref,
+    (): TerminalEmulatorHandle => ({
+      writeOutput: (data: TerminalOutputData) => {
+        runtimeRef.current?.write({ data });
+      },
+      restoreOutput: (data: TerminalOutputData) => {
+        runtimeRef.current?.restoreOutput({ data });
+      },
+      renderSnapshot: (state: TerminalState | null) => {
+        runtimeRef.current?.renderSnapshot({ state });
+      },
+      clear: () => {
+        runtimeRef.current?.clear();
+      },
+      blur: () => {
+        runtimeRef.current?.blur();
+      },
+    }),
     [],
   );
 
   useEffect(() => {
-    mountedThemeRef.current = xtermTheme;
-    runtimeRef.current?.setTheme({ theme: xtermTheme });
+    const nextTheme = xtermThemeRef.current;
+    mountedThemeRef.current = nextTheme;
+    runtimeRef.current?.setTheme({ theme: nextTheme });
   }, [themeKey]);
+
+  useEffect(() => {
+    runtimeRef.current?.setScrollback({ lines: scrollbackLines });
+  }, [scrollbackLines]);
 
   useEffect(() => {
     ensureTerminalScrollbarStyle();
@@ -197,7 +373,7 @@ export default function TerminalEmulator({
   useEffect(() => {
     const root = rootRef.current;
     if (!root || !swipeGesturesEnabled) {
-      return;
+      return () => {};
     }
 
     const SWIPE_MIN_PX = 22;
@@ -314,29 +490,32 @@ export default function TerminalEmulator({
     const host = hostRef.current;
     const root = rootRef.current;
     if (!host || !root) {
-      return;
+      return () => {};
     }
 
     const runtime = new TerminalEmulatorRuntime();
     runtimeRef.current = runtime;
     runtime.setCallbacks({
       callbacks: {
-        onInput,
-        onResize,
-        onTerminalKey,
-        onPendingModifiersConsumed,
+        ...mountCallbacksRef.current,
+        onOpenExternalUrl: openExternalUrl,
       },
     });
-    runtime.setPendingModifiers({ pendingModifiers });
+    runtime.setPendingModifiers({ pendingModifiers: pendingModifiersRef.current });
     runtime.mount({
       root,
       host,
-      initialSnapshot,
+      initialSnapshot: initialSnapshotRef.current,
+      scrollback: scrollbackLinesRef.current,
       theme: mountedThemeRef.current,
+      fontFamily: fontFamilyRef.current,
+      fontSize: fontSizeRef.current,
     });
+    onRendererReadyChangeRef.current?.({ streamKey, isReady: true });
 
     return () => {
       runtime.unmount();
+      onRendererReadyChangeRef.current?.({ streamKey, isReady: false });
       if (runtimeRef.current === runtime) {
         runtimeRef.current = null;
       }
@@ -350,19 +529,35 @@ export default function TerminalEmulator({
         onResize,
         onTerminalKey,
         onPendingModifiersConsumed,
+        onInputModeChange,
+        onResolveLocalFileLink,
+        onOpenLocalFileLink,
+        onOpenExternalUrl: openExternalUrl,
       },
     });
-  }, [onInput, onPendingModifiersConsumed, onResize, onTerminalKey]);
+  }, [
+    onInput,
+    onInputModeChange,
+    onOpenLocalFileLink,
+    onPendingModifiersConsumed,
+    onResolveLocalFileLink,
+    onResize,
+    onTerminalKey,
+  ]);
 
   useEffect(() => {
     runtimeRef.current?.setPendingModifiers({ pendingModifiers });
   }, [pendingModifiers]);
 
   useEffect(() => {
+    runtimeRef.current?.setFont({ fontFamily, fontSize });
+  }, [fontFamily, fontSize]);
+
+  useEffect(() => {
     if (focusRequestToken <= 0) {
-      return;
+      return () => {};
     }
-    runtimeRef.current?.resize({ force: true });
+    runtimeRef.current?.resize({ force: true, shouldClaim: true });
     return focusWithRetries({
       focus: () => {
         runtimeRef.current?.focus();
@@ -382,36 +577,42 @@ export default function TerminalEmulator({
     if (resizeRequestToken <= 0) {
       return;
     }
-    runtimeRef.current?.resize({ force: true });
+    runtimeRef.current?.resize({ force: true, shouldClaim: true });
   }, [resizeRequestToken]);
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) {
-      return;
+      return () => {};
     }
 
     const viewportElement = host.querySelector<HTMLElement>(".xterm-viewport");
     if (!viewportElement) {
       viewportRef.current = null;
-      setViewportMetrics({ offset: 0, viewportSize: 0, contentSize: 0 });
-      return;
+      updateViewportMetricsState({ offset: 0, viewportSize: 0, contentSize: 0 });
+      return () => {};
     }
 
     viewportRef.current = viewportElement;
 
     const updateViewportMetrics = () => {
-      setViewportMetrics({
-        offset: Math.max(0, viewportElement.scrollTop),
-        viewportSize: Math.max(0, viewportElement.clientHeight),
-        contentSize: Math.max(0, viewportElement.scrollHeight),
-      });
+      const offset = Math.max(0, viewportElement.scrollTop);
+      const viewportSize = Math.max(0, viewportElement.clientHeight);
+      const contentSize = Math.max(0, viewportElement.scrollHeight);
+      updateViewportMetricsState({ offset, viewportSize, contentSize });
     };
 
     updateViewportMetrics();
 
+    let scrollRafId: number | null = null;
     const handleViewportScroll = () => {
-      updateViewportMetrics();
+      if (scrollRafId !== null) {
+        return;
+      }
+      scrollRafId = requestAnimationFrame(() => {
+        scrollRafId = null;
+        updateViewportMetrics();
+      });
     };
 
     const resizeObserver = new ResizeObserver(() => {
@@ -423,27 +624,20 @@ export default function TerminalEmulator({
       resizeObserver.observe(scrollAreaElement);
     }
 
-    const mutationObserver = new MutationObserver(() => {
-      updateViewportMetrics();
-    });
-    mutationObserver.observe(host, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ["style", "class"],
-    });
-
     viewportElement.addEventListener("scroll", handleViewportScroll, { passive: true });
 
     return () => {
+      if (scrollRafId !== null) {
+        cancelAnimationFrame(scrollRafId);
+        scrollRafId = null;
+      }
       viewportElement.removeEventListener("scroll", handleViewportScroll);
       resizeObserver.disconnect();
-      mutationObserver.disconnect();
       if (viewportRef.current === viewportElement) {
         viewportRef.current = null;
       }
     };
-  }, [streamKey]);
+  }, [streamKey, updateViewportMetricsState]);
 
   useEffect(() => {
     const maxScrollOffset = Math.max(0, viewportMetrics.contentSize - viewportMetrics.viewportSize);
@@ -503,7 +697,7 @@ export default function TerminalEmulator({
 
   useEffect(() => {
     if (!isDraggingScrollbar) {
-      return;
+      return () => {};
     }
 
     const handlePointerMove = (event: PointerEvent) => {
@@ -519,7 +713,7 @@ export default function TerminalEmulator({
         return;
       }
       viewportElement.scrollTop = nextOffset;
-      setViewportMetrics({
+      updateViewportMetricsState({
         offset: nextOffset,
         viewportSize: Math.max(0, viewportElement.clientHeight),
         contentSize: Math.max(0, viewportElement.scrollHeight),
@@ -539,17 +733,20 @@ export default function TerminalEmulator({
       window.removeEventListener("pointerup", stopDragging);
       window.removeEventListener("pointercancel", stopDragging);
     };
-  }, [isDraggingScrollbar, scrollbarGeometry.maxHandleOffset, scrollbarGeometry.maxScrollOffset]);
+  }, [
+    isDraggingScrollbar,
+    scrollbarGeometry.maxHandleOffset,
+    scrollbarGeometry.maxScrollOffset,
+    updateViewportMetricsState,
+  ]);
 
   const handleVisible =
     scrollbarGeometry.isVisible && (isDraggingScrollbar || isScrollVisible || isHandleHovered);
-  const handleOpacity = isDraggingScrollbar
-    ? SCROLLBAR_HANDLE_OPACITY_DRAGGING
-    : isHandleHovered
-      ? SCROLLBAR_HANDLE_OPACITY_HOVERED
-      : isScrollVisible
-        ? SCROLLBAR_HANDLE_OPACITY_VISIBLE
-        : 0;
+  let handleOpacity: number;
+  if (isDraggingScrollbar) handleOpacity = SCROLLBAR_HANDLE_OPACITY_DRAGGING;
+  else if (isHandleHovered) handleOpacity = SCROLLBAR_HANDLE_OPACITY_HOVERED;
+  else if (isScrollVisible) handleOpacity = SCROLLBAR_HANDLE_OPACITY_VISIBLE;
+  else handleOpacity = 0;
   const handleWidth =
     isDraggingScrollbar || isHandleHovered
       ? SCROLLBAR_HANDLE_WIDTH_ACTIVE
@@ -565,7 +762,7 @@ export default function TerminalEmulator({
   const handleInsetTop = Math.max(0, (thumbRegionHeight - scrollbarGeometry.handleSize) / 2);
   const handleTravelDurationMs =
     isDraggingScrollbar || isScrollActive ? 0 : SCROLLBAR_HANDLE_TRAVEL_DURATION_MS;
-  const handleContextMenu = () => {
+  const showTerminalContextMenu = useCallback(() => {
     const showContextMenu = window.paseoDesktop?.menu?.showContextMenu;
     if (typeof showContextMenu !== "function") {
       return;
@@ -576,115 +773,238 @@ export default function TerminalEmulator({
       kind: "terminal",
       hasSelection,
     });
-  };
+  }, []);
+
+  const handleRootPointerDown = useCallback(() => {
+    onFocus?.();
+    runtimeRef.current?.focus();
+  }, [onFocus]);
+
+  const handleRootContextMenu = useCallback(
+    (event: ReactMouseEvent) => {
+      event.preventDefault();
+      showTerminalContextMenu();
+    },
+    [showTerminalContextMenu],
+  );
+
+  const scrollbarMaxOffset = scrollbarGeometry.maxScrollOffset;
+  const handleScrollbarPointerDown = useCallback(
+    (event: ReactPointerEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      dragStartOffsetRef.current = clamp(viewportMetrics.offset, 0, scrollbarMaxOffset);
+      dragStartClientYRef.current = event.clientY;
+      setIsDraggingScrollbar(true);
+    },
+    [scrollbarMaxOffset, viewportMetrics.offset],
+  );
+
+  const handleScrollbarPointerEnter = useCallback(() => {
+    if (!isScrollVisible && !isDraggingScrollbar) {
+      return;
+    }
+    setIsHandleHovered(true);
+  }, [isScrollVisible, isDraggingScrollbar]);
+
+  const handleScrollbarPointerLeave = useCallback(() => {
+    setIsHandleHovered(false);
+  }, []);
+
+  const clearDropActiveTimeout = useCallback(() => {
+    if (dropActiveTimeoutRef.current === null) {
+      return;
+    }
+    clearTimeout(dropActiveTimeoutRef.current);
+    dropActiveTimeoutRef.current = null;
+  }, []);
+
+  const clearTerminalDropActive = useCallback(() => {
+    clearDropActiveTimeout();
+    setIsDropActive(false);
+  }, [clearDropActiveTimeout]);
+
+  const keepTerminalDropActive = useCallback(() => {
+    clearDropActiveTimeout();
+    setIsDropActive(true);
+    dropActiveTimeoutRef.current = setTimeout(() => {
+      dropActiveTimeoutRef.current = null;
+      setIsDropActive(false);
+    }, 180);
+  }, [clearDropActiveTimeout]);
+
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) {
+      return () => {};
+    }
+
+    const handleDragEnter = (event: DragEvent) => {
+      if (!isTerminalFileDrag(event.dataTransfer)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      keepTerminalDropActive();
+    };
+
+    const handleDragOver = (event: DragEvent) => {
+      if (!isTerminalFileDrag(event.dataTransfer)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = "copy";
+      }
+      keepTerminalDropActive();
+    };
+
+    const handleDrop = (event: DragEvent) => {
+      if (!isTerminalFileDrag(event.dataTransfer)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      clearTerminalDropActive();
+
+      const bridge = getDesktopHost();
+      const paths = extractTerminalDropPaths(event.dataTransfer, bridge);
+      if (paths.length === 0) {
+        return;
+      }
+
+      runtimeRef.current?.focus();
+      mountCallbacksRef.current.onInput?.(prepareDroppedPathsForTerminal(paths, bridge));
+    };
+
+    root.addEventListener("dragenter", handleDragEnter, { capture: true });
+    root.addEventListener("dragover", handleDragOver, { capture: true });
+    root.addEventListener("drop", handleDrop, { capture: true });
+    window.addEventListener("dragend", clearTerminalDropActive);
+    window.addEventListener("drop", clearTerminalDropActive);
+
+    return () => {
+      root.removeEventListener("dragenter", handleDragEnter, { capture: true });
+      root.removeEventListener("dragover", handleDragOver, { capture: true });
+      root.removeEventListener("drop", handleDrop, { capture: true });
+      window.removeEventListener("dragend", clearTerminalDropActive);
+      window.removeEventListener("drop", clearTerminalDropActive);
+      clearDropActiveTimeout();
+    };
+  }, [clearDropActiveTimeout, clearTerminalDropActive, keepTerminalDropActive]);
+
+  const handleRootDragLeave = useCallback(
+    (event: ReactDragEvent<HTMLDivElement>) => {
+      if (!isTerminalFileDrag(event.dataTransfer)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (
+        !isTerminalDragLeaveOutside({
+          currentTarget: event.currentTarget,
+          relatedTarget: event.relatedTarget,
+        })
+      ) {
+        return;
+      }
+      clearTerminalDropActive();
+    },
+    [clearTerminalDropActive],
+  );
+
+  const rootDivStyle = useMemo<CSSProperties>(
+    () => ({
+      position: "relative",
+      display: "flex",
+      width: "100%",
+      height: "100%",
+      minHeight: 0,
+      minWidth: 0,
+      backgroundColor: xtermTheme.background ?? "#0b0b0b",
+      overflow: "hidden",
+      overscrollBehavior: "none",
+      touchAction: "pan-y",
+    }),
+    [xtermTheme.background],
+  );
+  const dropOverlayStyle = useMemo<CSSProperties>(
+    () => ({
+      position: "absolute",
+      inset: 0,
+      zIndex: 9,
+      border: "1px solid rgba(78, 161, 255, 0.72)",
+      backgroundColor: "rgba(78, 161, 255, 0.16)",
+      opacity: isDropActive ? 1 : 0,
+      pointerEvents: "none",
+      transition: "opacity 120ms ease-out",
+    }),
+    [isDropActive],
+  );
+  const handleContainerStyle = useMemo<CSSProperties>(
+    () => ({
+      position: "absolute",
+      top: 0,
+      right: -3,
+      width: SCROLLBAR_HANDLE_GRAB_WIDTH,
+      height: thumbRegionHeight,
+      transform: `translateY(${thumbRegionOffset}px)`,
+      cursor: isDraggingScrollbar ? "grabbing" : "grab",
+      touchAction: "none",
+      userSelect: "none",
+      transitionProperty: "transform",
+      transitionDuration: `${handleTravelDurationMs}ms`,
+      transitionTimingFunction: "linear",
+      pointerEvents: handleVisible ? "auto" : "none",
+    }),
+    [
+      thumbRegionHeight,
+      thumbRegionOffset,
+      isDraggingScrollbar,
+      handleTravelDurationMs,
+      handleVisible,
+    ],
+  );
+  const handleInnerStyle = useMemo<CSSProperties>(
+    () => ({
+      marginTop: handleInsetTop,
+      height: scrollbarGeometry.handleSize,
+      width: handleWidth,
+      borderRadius: 999,
+      alignSelf: "center",
+      backgroundColor: "rgba(113, 113, 122, 1)",
+      opacity: handleOpacity,
+      transitionProperty: "opacity, width, background-color",
+      transitionDuration: `${SCROLLBAR_HANDLE_FADE_DURATION_MS}ms, ${SCROLLBAR_HANDLE_WIDTH_TRANSITION_DURATION_MS}ms, ${SCROLLBAR_HANDLE_FADE_DURATION_MS}ms`,
+      transitionTimingFunction: "ease-out, cubic-bezier(0.22, 0.75, 0.2, 1), ease-out",
+    }),
+    [handleInsetTop, scrollbarGeometry.handleSize, handleWidth, handleOpacity],
+  );
 
   return (
     <div
       ref={rootRef}
       data-testid={testId}
       data-terminal-scrollbar-root="true"
-      style={{
-        position: "relative",
-        display: "flex",
-        width: "100%",
-        height: "100%",
-        minHeight: 0,
-        minWidth: 0,
-        backgroundColor: xtermTheme.background ?? "#0b0b0b",
-        overflow: "hidden",
-        overscrollBehavior: "none",
-        touchAction: "pan-y",
-      }}
-      onPointerDown={() => {
-        runtimeRef.current?.focus();
-      }}
-      onContextMenu={(event) => {
-        event.preventDefault();
-        handleContextMenu();
-      }}
+      style={rootDivStyle}
+      onPointerDown={handleRootPointerDown}
+      onContextMenu={handleRootContextMenu}
+      onDragLeave={handleRootDragLeave}
     >
-      <div
-        ref={hostRef}
-        style={{
-          flex: 1,
-          minHeight: 0,
-          minWidth: 0,
-          width: "100%",
-          height: "100%",
-          overflow: "hidden",
-          overscrollBehavior: "none",
-          paddingTop: 0,
-          paddingBottom: 0,
-          paddingLeft: 0,
-          paddingRight: 0,
-        }}
-      />
+      <div ref={hostRef} style={HOST_DIV_STYLE} />
+      <div style={dropOverlayStyle} />
       {scrollbarGeometry.isVisible ? (
-        <div
-          style={{
-            position: "absolute",
-            top: 0,
-            right: 0,
-            bottom: 0,
-            width: 12,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "flex-start",
-            zIndex: 10,
-            pointerEvents: "none",
-          }}
-        >
+        <div style={SCROLLBAR_CONTAINER_STYLE}>
           <div
-            style={{
-              position: "absolute",
-              top: 0,
-              right: -3,
-              width: SCROLLBAR_HANDLE_GRAB_WIDTH,
-              height: thumbRegionHeight,
-              transform: `translateY(${thumbRegionOffset}px)`,
-              cursor: isDraggingScrollbar ? "grabbing" : "grab",
-              touchAction: "none",
-              userSelect: "none",
-              transitionProperty: "transform",
-              transitionDuration: `${handleTravelDurationMs}ms`,
-              transitionTimingFunction: "linear",
-              pointerEvents: handleVisible ? "auto" : "none",
-            }}
-            onPointerDown={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              dragStartOffsetRef.current = clamp(
-                viewportMetrics.offset,
-                0,
-                scrollbarGeometry.maxScrollOffset,
-              );
-              dragStartClientYRef.current = event.clientY;
-              setIsDraggingScrollbar(true);
-            }}
-            onPointerEnter={() => {
-              if (!isScrollVisible && !isDraggingScrollbar) {
-                return;
-              }
-              setIsHandleHovered(true);
-            }}
-            onPointerLeave={() => {
-              setIsHandleHovered(false);
-            }}
+            style={handleContainerStyle}
+            onPointerDown={handleScrollbarPointerDown}
+            onPointerEnter={handleScrollbarPointerEnter}
+            onPointerLeave={handleScrollbarPointerLeave}
           >
-            <div
-              style={{
-                marginTop: handleInsetTop,
-                height: scrollbarGeometry.handleSize,
-                width: handleWidth,
-                borderRadius: 999,
-                alignSelf: "center",
-                backgroundColor: "rgba(113, 113, 122, 1)",
-                opacity: handleOpacity,
-                transitionProperty: "opacity, width, background-color",
-                transitionDuration: `${SCROLLBAR_HANDLE_FADE_DURATION_MS}ms, ${SCROLLBAR_HANDLE_WIDTH_TRANSITION_DURATION_MS}ms, ${SCROLLBAR_HANDLE_FADE_DURATION_MS}ms`,
-                transitionTimingFunction: "ease-out, cubic-bezier(0.22, 0.75, 0.2, 1), ease-out",
-              }}
-            />
+            <div style={handleInnerStyle} />
           </div>
         </div>
       ) : null}

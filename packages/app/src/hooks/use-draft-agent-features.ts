@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { AgentProvider, AgentSessionConfig } from "@server/server/agent/agent-sdk-types";
+import { useTranslation } from "react-i18next";
+import type { AgentProvider, AgentSessionConfig } from "@getpaseo/protocol/agent-types";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { mergeProviderPreferences, useFormPreferences } from "./use-form-preferences";
 import {
@@ -16,42 +17,49 @@ type DraftFeatureConfig = Pick<
 
 export function useDraftAgentFeatures(input: {
   serverId: string | null | undefined;
-  provider: AgentProvider;
+  provider: AgentProvider | null;
   cwd: string | null | undefined;
   modeId: string | null | undefined;
   modelId: string | null | undefined;
   thinkingOptionId: string | null | undefined;
+  initialFeatureValues?: Record<string, unknown>;
 }) {
-  const { serverId, provider, cwd, modeId, modelId, thinkingOptionId } = input;
-  const [localFeatureValues, setLocalFeatureValues] = useState<Record<string, unknown>>({});
+  const { t } = useTranslation();
+  const { serverId, provider, cwd, modeId, modelId, thinkingOptionId, initialFeatureValues } =
+    input;
+  const [localFeatureValues, setLocalFeatureValues] = useState<Record<string, unknown>>(
+    () => initialFeatureValues ?? {},
+  );
   const client = useHostRuntimeClient(serverId ?? "");
   const isConnected = useHostRuntimeIsConnected(serverId ?? "");
   const { preferences, updatePreferences } = useFormPreferences();
   const normalizedCwd = cwd?.trim() || "";
+  const normalizedProvider = provider ?? null;
+  const previousProviderRef = useRef<AgentProvider | null>(normalizedProvider);
   const persistedFeatureValues = useMemo(
-    () => preferences.providerPreferences?.[provider]?.featureValues ?? {},
+    () => (provider ? (preferences.providerPreferences?.[provider]?.featureValues ?? {}) : {}),
     [preferences.providerPreferences, provider],
   );
 
   const draftConfig = useMemo<DraftFeatureConfig | null>(() => {
-    if (!normalizedCwd) {
+    if (!normalizedProvider || !normalizedCwd) {
       return null;
     }
 
     return {
-      provider,
+      provider: normalizedProvider,
       cwd: normalizedCwd,
       ...(modeId ? { modeId } : {}),
       ...(modelId ? { model: modelId } : {}),
       ...(thinkingOptionId ? { thinkingOptionId } : {}),
     };
-  }, [modeId, modelId, normalizedCwd, provider, thinkingOptionId]);
+  }, [modeId, modelId, normalizedCwd, normalizedProvider, thinkingOptionId]);
 
   const featuresQuery = useQuery({
     queryKey: [
       "providerFeatures",
       serverId ?? null,
-      provider,
+      normalizedProvider,
       normalizedCwd || null,
       modeId ?? null,
       modelId ?? null,
@@ -61,7 +69,7 @@ export function useDraftAgentFeatures(input: {
     staleTime: 5 * 60 * 1000,
     queryFn: async () => {
       if (!client || !draftConfig) {
-        throw new Error("Host is not connected");
+        throw new Error(t("workspace.terminal.hostDisconnected"));
       }
       const payload = await client.listProviderFeatures(draftConfig);
       if (payload.error) {
@@ -70,7 +78,8 @@ export function useDraftAgentFeatures(input: {
       return payload.features ?? [];
     },
   });
-  const availableFeatures = featuresQuery.data ?? [];
+  const availableFeaturesRaw = featuresQuery.data;
+  const availableFeatures = useMemo(() => availableFeaturesRaw ?? [], [availableFeaturesRaw]);
   const featureValues = useMemo(
     () =>
       resolveFeatureValues({
@@ -86,15 +95,25 @@ export function useDraftAgentFeatures(input: {
   }, [availableFeatures, featureValues]);
 
   useEffect(() => {
-    setLocalFeatureValues({});
-  }, [provider]);
+    const previousProvider = previousProviderRef.current;
+    previousProviderRef.current = normalizedProvider;
+    if (previousProvider === null) {
+      return;
+    }
+    if (previousProvider !== normalizedProvider) {
+      setLocalFeatureValues({});
+    }
+  }, [normalizedProvider]);
 
   useEffect(() => {
+    if (availableFeaturesRaw === undefined) {
+      return;
+    }
     const next = pruneFeatureValues(localFeatureValues, availableFeatures);
     if (next !== localFeatureValues) {
       setLocalFeatureValues(next);
     }
-  }, [availableFeatures, localFeatureValues]);
+  }, [availableFeatures, availableFeaturesRaw, localFeatureValues]);
 
   const effectiveFeatureValues = Object.keys(featureValues).length > 0 ? featureValues : undefined;
   const setFeatureValue = useCallback(
@@ -106,6 +125,9 @@ export function useDraftAgentFeatures(input: {
 
         return { ...current, [featureId]: value };
       });
+      if (!provider) {
+        return;
+      }
       void updatePreferences((current) =>
         mergeProviderPreferences({
           preferences: current,

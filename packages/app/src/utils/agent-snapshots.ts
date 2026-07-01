@@ -1,6 +1,6 @@
-import type { AgentLifecycleStatus } from "@server/shared/agent-lifecycle";
-import type { AgentSnapshotPayload } from "@server/shared/messages";
-import type { AgentPermissionRequest } from "@server/server/agent/agent-sdk-types";
+import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
+import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
+import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
 
 export function derivePendingPermissionKey(
   agentId: string,
@@ -26,12 +26,13 @@ export function normalizeAgentSnapshot(snapshot: AgentSnapshotPayload, serverId:
     ? new Date(snapshot.attentionTimestamp)
     : null;
   const archivedAt = snapshot.archivedAt ? new Date(snapshot.archivedAt) : null;
+  const parentAgentId = getParentAgentIdFromLabels(snapshot.labels);
 
   return {
     serverId,
     id: snapshot.id,
     provider: snapshot.provider,
-    status: snapshot.status as AgentLifecycleStatus,
+    status: snapshot.status,
     createdAt,
     updatedAt,
     lastUserMessageAt,
@@ -46,6 +47,7 @@ export function normalizeAgentSnapshot(snapshot: AgentSnapshotPayload, serverId:
     lastError: snapshot.lastError ?? null,
     title: snapshot.title ?? null,
     cwd: snapshot.cwd,
+    workspaceId: snapshot.workspaceId,
     model: snapshot.model ?? null,
     features: snapshot.features,
     thinkingOptionId: snapshot.thinkingOptionId ?? null,
@@ -53,6 +55,7 @@ export function normalizeAgentSnapshot(snapshot: AgentSnapshotPayload, serverId:
     attentionReason: snapshot.attentionReason ?? null,
     attentionTimestamp,
     archivedAt,
+    parentAgentId,
     labels: snapshot.labels,
   };
 }

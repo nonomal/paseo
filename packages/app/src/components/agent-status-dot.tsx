@@ -1,9 +1,10 @@
+import { useMemo } from "react";
 import { View } from "react-native";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import {
   AGENT_LIFECYCLE_STATUSES,
   type AgentLifecycleStatus,
-} from "@server/shared/agent-lifecycle";
+} from "@getpaseo/protocol/agent-lifecycle";
 import { deriveSidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { getStatusDotColor } from "@/utils/status-dot-color";
 
@@ -41,7 +42,12 @@ export function AgentStatusDot({
     return null;
   }
 
-  return <View style={[styles.dot, { backgroundColor: color }]} />;
+  return <AgentStatusDotView color={color} />;
+}
+
+function AgentStatusDotView({ color }: { color: string }) {
+  const dotStyle = useMemo(() => [styles.dot, { backgroundColor: color }], [color]);
+  return <View style={dotStyle} />;
 }
 
 function isAgentLifecycleStatus(value: string): value is AgentLifecycleStatus {

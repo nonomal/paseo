@@ -1,9 +1,48 @@
 import { describe, expect, test } from "vitest";
 
 import type { AgentStreamEvent } from "./agent/agent-sdk-types.js";
-import { serializeAgentStreamEvent } from "./messages.js";
+import { SessionInboundMessageSchema, serializeAgentStreamEvent } from "./messages.js";
 
 describe("serializeAgentStreamEvent", () => {
+  test("accepts create_agent_request env records", () => {
+    const parsed = SessionInboundMessageSchema.parse({
+      type: "create_agent_request",
+      requestId: "req-env",
+      config: {
+        provider: "codex",
+        cwd: "/tmp",
+      },
+      env: {
+        CHUNK14_PROBE: "expected",
+      },
+      attachments: [],
+    });
+
+    expect(parsed).toMatchObject({
+      type: "create_agent_request",
+      env: {
+        CHUNK14_PROBE: "expected",
+      },
+    });
+  });
+
+  test("rejects non-string create_agent_request env values", () => {
+    const parsed = SessionInboundMessageSchema.safeParse({
+      type: "create_agent_request",
+      requestId: "req-env",
+      config: {
+        provider: "codex",
+        cwd: "/tmp",
+      },
+      env: {
+        CHUNK14_PROBE: 14,
+      },
+      attachments: [],
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
   test("preserves user_message text as-is", () => {
     const event: AgentStreamEvent = {
       type: "timeline",
@@ -99,5 +138,28 @@ describe("serializeAgentStreamEvent", () => {
 
     const serialized = serializeAgentStreamEvent(event as AgentStreamEvent);
     expect(serialized).toBeNull();
+  });
+
+  test("drops internal session config drift events from websocket payloads", () => {
+    const events: AgentStreamEvent[] = [
+      {
+        type: "mode_changed",
+        provider: "codex",
+        currentModeId: "build",
+        availableModes: [{ id: "build", label: "Build" }],
+      },
+      {
+        type: "model_changed",
+        provider: "codex",
+        runtimeInfo: { provider: "codex", sessionId: "session-1", model: "gpt-5.4" },
+      },
+      {
+        type: "thinking_option_changed",
+        provider: "codex",
+        thinkingOptionId: "high",
+      },
+    ];
+
+    expect(events.map((event) => serializeAgentStreamEvent(event))).toEqual([null, null, null]);
   });
 });

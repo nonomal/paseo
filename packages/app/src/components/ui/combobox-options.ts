@@ -1,3 +1,5 @@
+import { compareMatchScores, type MatchScore, scoreTextFields } from "../../utils/score-match";
+
 export type ComboboxOptionKind = "directory" | "file";
 
 export interface ComboboxOptionModel {
@@ -5,6 +7,17 @@ export interface ComboboxOptionModel {
   label: string;
   description?: string;
   kind?: ComboboxOptionKind;
+}
+
+const DESCRIPTION_FALLBACK_TIER = 99;
+
+function scoreOption(opt: ComboboxOptionModel, search: string): MatchScore | null {
+  const best = scoreTextFields(search, [opt.label, opt.id]);
+  if (best) return best;
+  if (!opt.description) return null;
+  const descriptionScore = scoreTextFields(search, [opt.description]);
+  if (!descriptionScore) return null;
+  return { ...descriptionScore, tier: descriptionScore.tier + DESCRIPTION_FALLBACK_TIER };
 }
 
 export interface BuildVisibleComboboxOptionsInput {
@@ -40,21 +53,17 @@ export function filterAndRankComboboxOptions(
   search: string,
 ): ComboboxOptionModel[] {
   if (!search) return options;
-  return options
-    .filter(
-      (opt) =>
-        opt.label.toLowerCase().includes(search) ||
-        opt.id.toLowerCase().includes(search) ||
-        opt.description?.toLowerCase().includes(search),
-    )
-    .sort((a, b) => {
-      const aPrefix =
-        a.label.toLowerCase().startsWith(search) || a.id.toLowerCase().startsWith(search);
-      const bPrefix =
-        b.label.toLowerCase().startsWith(search) || b.id.toLowerCase().startsWith(search);
-      if (aPrefix !== bPrefix) return aPrefix ? -1 : 1;
-      return 0;
-    });
+  const scored: { opt: ComboboxOptionModel; score: MatchScore }[] = [];
+  for (const opt of options) {
+    const score = scoreOption(opt, search);
+    if (score) scored.push({ opt, score });
+  }
+  scored.sort((a, b) => {
+    const cmp = compareMatchScores(a.score, b.score);
+    if (cmp !== 0) return cmp;
+    return a.opt.label.localeCompare(b.opt.label);
+  });
+  return scored.map((entry) => entry.opt);
 }
 
 export function buildVisibleComboboxOptions(
@@ -98,7 +107,7 @@ export function orderVisibleComboboxOptions(
   if (optionsPosition !== "above-search") {
     return visibleOptions;
   }
-  return [...visibleOptions].reverse();
+  return [...visibleOptions].toReversed();
 }
 
 export function getComboboxFallbackIndex(

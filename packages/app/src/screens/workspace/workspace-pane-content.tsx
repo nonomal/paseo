@@ -1,9 +1,17 @@
-import type { ComponentType } from "react";
+import React, { useMemo, type ComponentType } from "react";
 import invariant from "tiny-invariant";
-import { PaneProvider, type PaneContextValue } from "@/panels/pane-context";
+import {
+  createPaneFocusContextValue,
+  PaneFocusProvider,
+  PaneProvider,
+  type PaneContextValue,
+} from "@/panels/pane-context";
+import { useStableEvent } from "@/hooks/use-stable-event";
 import { getPanelRegistration } from "@/panels/panel-registry";
 import { ensurePanelsRegistered } from "@/panels/register-panels";
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
+import { RenderProfile } from "@/utils/render-profiler";
+import type { WorkspaceFileOpenRequest } from "@/workspace/file-open";
 
 export interface WorkspacePaneContentModel {
   key: string;
@@ -15,22 +23,22 @@ export interface BuildWorkspacePaneContentModelInput {
   tab: WorkspaceTabDescriptor;
   normalizedServerId: string;
   normalizedWorkspaceId: string;
-  isPaneFocused: boolean;
   onOpenTab: (target: WorkspaceTabDescriptor["target"]) => void;
   onCloseCurrentTab: () => void;
   onRetargetCurrentTab: (target: WorkspaceTabDescriptor["target"]) => void;
-  onOpenWorkspaceFile: (filePath: string) => void;
+  onOpenWorkspaceFile: (request: WorkspaceFileOpenRequest) => void;
+  onOpenImportSheet: () => void;
 }
 
 export function buildWorkspacePaneContentModel({
   tab,
   normalizedServerId,
   normalizedWorkspaceId,
-  isPaneFocused,
   onOpenTab,
   onCloseCurrentTab,
   onRetargetCurrentTab,
   onOpenWorkspaceFile,
+  onOpenImportSheet,
 }: BuildWorkspacePaneContentModelInput): WorkspacePaneContentModel {
   ensurePanelsRegistered();
   const registration = getPanelRegistration(tab.kind);
@@ -42,26 +50,78 @@ export function buildWorkspacePaneContentModel({
       serverId: normalizedServerId,
       workspaceId: normalizedWorkspaceId,
       tabId: tab.tabId,
-      isPaneFocused,
       target: tab.target,
       openTab: onOpenTab,
       closeCurrentTab: onCloseCurrentTab,
       retargetCurrentTab: onRetargetCurrentTab,
       openFileInWorkspace: onOpenWorkspaceFile,
+      openImportSheet: onOpenImportSheet,
     },
   };
 }
 
 export interface WorkspacePaneContentProps {
   content: WorkspacePaneContentModel;
+  isWorkspaceFocused: boolean;
+  isPaneFocused: boolean;
+  onFocusPane?: () => void;
 }
 
-export function WorkspacePaneContent({ content }: WorkspacePaneContentProps) {
+export function WorkspacePaneContent({
+  content,
+  isWorkspaceFocused,
+  isPaneFocused,
+  onFocusPane,
+}: WorkspacePaneContentProps) {
   const { Component, key, paneContextValue } = content;
+  const openTab = useStableEvent(paneContextValue.openTab);
+  const closeCurrentTab = useStableEvent(paneContextValue.closeCurrentTab);
+  const retargetCurrentTab = useStableEvent(paneContextValue.retargetCurrentTab);
+  const openFileInWorkspace = useStableEvent(paneContextValue.openFileInWorkspace);
+  const openImportSheet = useStableEvent(paneContextValue.openImportSheet);
+  const stablePaneContextValue = useMemo(
+    () => ({
+      serverId: paneContextValue.serverId,
+      workspaceId: paneContextValue.workspaceId,
+      tabId: paneContextValue.tabId,
+      target: paneContextValue.target,
+      openTab,
+      closeCurrentTab,
+      retargetCurrentTab,
+      openFileInWorkspace,
+      openImportSheet,
+    }),
+    [
+      closeCurrentTab,
+      openFileInWorkspace,
+      openImportSheet,
+      openTab,
+      paneContextValue.serverId,
+      paneContextValue.tabId,
+      paneContextValue.target,
+      paneContextValue.workspaceId,
+      retargetCurrentTab,
+    ],
+  );
+  const paneFocusValue = useMemo(
+    () =>
+      createPaneFocusContextValue({
+        isWorkspaceFocused,
+        isPaneFocused,
+        onFocusPane,
+      }),
+    [isPaneFocused, isWorkspaceFocused, onFocusPane],
+  );
 
   return (
-    <PaneProvider value={paneContextValue}>
-      <Component key={key} />
-    </PaneProvider>
+    <RenderProfile
+      id={`WorkspacePaneContent:${paneContextValue.target.kind}:${paneContextValue.tabId}`}
+    >
+      <PaneProvider value={stablePaneContextValue}>
+        <PaneFocusProvider value={paneFocusValue}>
+          <Component key={key} />
+        </PaneFocusProvider>
+      </PaneProvider>
+    </RenderProfile>
   );
 }

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState, type ReactElement } from "react";
+import { memo, useCallback, useMemo, useRef, type ReactElement } from "react";
 import { ScrollView, View } from "react-native";
 import {
   DndContext,
@@ -8,19 +8,17 @@ import {
   type Modifier,
   useSensor,
   useSensors,
-  type DragEndEvent,
-  type DragStartEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
   sortableKeyboardCoordinates,
   verticalListSortingStrategy,
   useSortable,
-  arrayMove,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import type { DraggableListProps, DraggableRenderItemInfo } from "./draggable-list.types";
 import { useWebScrollViewScrollbar } from "./use-web-scrollbar";
+import { getPointerActivationConstraint, useDragReorderState } from "./drag-reorder";
 
 export type { DraggableListProps, DraggableRenderItemInfo };
 
@@ -28,6 +26,13 @@ const restrictToVerticalAxis: Modifier = ({ transform }) => ({
   ...transform,
   x: 0,
 });
+
+const DND_MODIFIERS = [restrictToVerticalAxis];
+const POINTER_ACTIVATION_CONFIG = {
+  defaultDistance: 6,
+  holdDelayMs: 250,
+  holdTolerance: 8,
+};
 
 interface SortableItemProps<T> {
   id: string;
@@ -38,7 +43,7 @@ interface SortableItemProps<T> {
   useDragHandle: boolean;
 }
 
-function SortableItem<T>({
+function SortableItemInner<T>({
   id,
   item,
   index,
@@ -78,12 +83,15 @@ function SortableItem<T>({
   const scaleTransform = isDragging ? "scale(1.02)" : "";
   const combinedTransform = [baseTransform, scaleTransform].filter(Boolean).join(" ");
 
-  const style = {
-    transform: combinedTransform || undefined,
-    transition,
-    opacity: isDragging ? 0.9 : 1,
-    zIndex: isDragging ? 1000 : 1,
-  };
+  const style = useMemo(
+    () => ({
+      transform: combinedTransform || undefined,
+      transition,
+      opacity: isDragging ? 0.9 : 1,
+      zIndex: isDragging ? 1000 : 1,
+    }),
+    [combinedTransform, transition, isDragging],
+  );
 
   const info: DraggableRenderItemInfo<T> = {
     item,
@@ -110,6 +118,8 @@ function SortableItem<T>({
   );
 }
 
+const SortableItem = memo(SortableItemInner) as typeof SortableItemInner;
+
 export function DraggableList<T>({
   data,
   keyExtractor,
@@ -125,66 +135,49 @@ export function DraggableList<T>({
   showsVerticalScrollIndicator = true,
   enableDesktopWebScrollbar = false,
   scrollEnabled = true,
+  extraData: _extraData,
   useDragHandle = false,
   // simultaneousGestureRef is native-only, ignored on web
   onDragBegin,
   nestable: _nestable = false,
 }: DraggableListProps<T>) {
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [dragItems, setDragItems] = useState<T[] | null>(null);
-  const items = dragItems ?? data;
+  const { activeId, items, handlers } = useDragReorderState({
+    data,
+    keyExtractor,
+    onDragEnd,
+    onDragBegin,
+  });
   const showCustomScrollbar = enableDesktopWebScrollbar && scrollEnabled;
   const scrollViewRef = useRef<ScrollView>(null);
   const scrollbar = useWebScrollViewScrollbar(scrollViewRef, {
     enabled: showCustomScrollbar,
   });
+  const pointerActivationConstraint = getPointerActivationConstraint(
+    useDragHandle,
+    POINTER_ACTIVATION_CONFIG,
+  );
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
-      activationConstraint: {
-        distance: 8,
-      },
+      activationConstraint: pointerActivationConstraint,
     }),
     useSensor(KeyboardSensor, {
       coordinateGetter: sortableKeyboardCoordinates,
     }),
   );
 
-  const handleDragStart = useCallback(
-    (event: DragStartEvent) => {
-      setDragItems(data);
-      setActiveId(String(event.active.id));
-      onDragBegin?.();
-    },
-    [data, onDragBegin],
+  const ids = useMemo(
+    () => items.map((item, index) => keyExtractor(item, index)),
+    [items, keyExtractor],
   );
-
-  const handleDragEnd = useCallback(
-    (event: DragEndEvent) => {
-      const { active, over } = event;
-
-      setActiveId(null);
-      setDragItems(null);
-
-      if (over && active.id !== over.id) {
-        const oldIndex = items.findIndex((item, i) => keyExtractor(item, i) === active.id);
-        const newIndex = items.findIndex((item, i) => keyExtractor(item, i) === over.id);
-
-        if (oldIndex >= 0 && newIndex >= 0 && oldIndex !== newIndex) {
-          const newItems = arrayMove(items, oldIndex, newIndex);
-          onDragEnd(newItems);
-        }
-      }
-    },
-    [items, keyExtractor, onDragEnd],
+  const wrapperStyle = useMemo(
+    () => [
+      { position: "relative" as const },
+      scrollEnabled ? { flex: 1, minHeight: 0 } : null,
+      containerStyle,
+    ],
+    [scrollEnabled, containerStyle],
   );
-
-  const ids = items.map((item, index) => keyExtractor(item, index));
-  const wrapperStyle = [
-    { position: "relative" as const },
-    scrollEnabled ? { flex: 1, minHeight: 0 } : null,
-    containerStyle,
-  ];
 
   return (
     <View style={wrapperStyle}>
@@ -205,9 +198,10 @@ export function DraggableList<T>({
           <DndContext
             sensors={sensors}
             collisionDetection={closestCenter}
-            modifiers={[restrictToVerticalAxis]}
-            onDragStart={handleDragStart}
-            onDragEnd={handleDragEnd}
+            modifiers={DND_MODIFIERS}
+            onDragStart={handlers.onDragStart}
+            onDragCancel={handlers.onDragCancel}
+            onDragEnd={handlers.onDragEnd}
           >
             <SortableContext items={ids} strategy={verticalListSortingStrategy}>
               {items.map((item, index) => {
@@ -235,9 +229,10 @@ export function DraggableList<T>({
           <DndContext
             sensors={sensors}
             collisionDetection={closestCenter}
-            modifiers={[restrictToVerticalAxis]}
-            onDragStart={handleDragStart}
-            onDragEnd={handleDragEnd}
+            modifiers={DND_MODIFIERS}
+            onDragStart={handlers.onDragStart}
+            onDragCancel={handlers.onDragCancel}
+            onDragEnd={handlers.onDragEnd}
           >
             <SortableContext items={ids} strategy={verticalListSortingStrategy}>
               {items.map((item, index) => {

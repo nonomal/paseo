@@ -4,11 +4,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import pino from "pino";
 
-import { OpenCodeAgentClient } from "../agent/providers/opencode-agent.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { DaemonClient, type WaitForFinishResult } from "../test-utils/daemon-client.js";
 import { createMessageCollector } from "../test-utils/message-collector.js";
-import { isProviderAvailable } from "./agent-configs.js";
+import { canRunRealProvider, createRealProviderClients } from "./real-provider-test-config.js";
 import type { AgentPermissionRequest } from "../agent/agent-sdk-types.js";
 import type { SessionOutboundMessage } from "../messages.js";
 
@@ -20,23 +19,6 @@ function tmpCwd(): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function pickOpenCodeModel(
-  models: Array<{ id: string }>,
-  preferences: string[] = [
-    "minimax-m2.5-free",
-    "kimi-k2.5-free",
-    "glm-5-free",
-    "free",
-    "mini",
-    "gpt-5-nano",
-  ],
-): string {
-  const preferred = models.find((model) =>
-    preferences.some((fragment) => model.id.includes(fragment)),
-  );
-  return preferred?.id ?? models[0]!.id;
 }
 
 function hasRunningBashToolCall(messages: SessionOutboundMessage[], agentId: string): boolean {
@@ -118,15 +100,13 @@ async function approvePendingPermissions(
   agentId: string,
   handledPermissionIds: Set<string>,
 ): Promise<void> {
-  const snapshot = await client.fetchAgent(agentId).catch(() => null);
+  const snapshot = await client.fetchAgent({ agentId }).catch(() => null);
   const pending = snapshot?.agent.pendingPermissions ?? [];
-  for (const permission of pending) {
-    if (handledPermissionIds.has(permission.id)) {
-      continue;
-    }
+  const toApprove = pending.filter((permission) => !handledPermissionIds.has(permission.id));
+  for (const permission of toApprove) {
     handledPermissionIds.add(permission.id);
-    await allowPermission(client, agentId, permission);
   }
+  await Promise.all(toApprove.map((permission) => allowPermission(client, agentId, permission)));
 }
 
 async function waitForRunningBashToolCall(
@@ -271,7 +251,7 @@ async function createHarness(): Promise<{
 }> {
   const logger = pino({ level: "silent" });
   const daemon = await createTestPaseoDaemon({
-    agentClients: { opencode: new OpenCodeAgentClient(logger) },
+    agentClients: createRealProviderClients(["opencode"], logger),
     logger,
   });
   const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
@@ -284,7 +264,7 @@ describe("daemon E2E (real opencode) - send while working and interrupt", () => 
   let canRun = false;
 
   beforeAll(async () => {
-    canRun = await isProviderAvailable("opencode");
+    canRun = await canRunRealProvider("opencode");
   });
 
   beforeEach((context) => {
@@ -307,8 +287,8 @@ describe("daemon E2E (real opencode) - send while working and interrupt", () => 
         provider: "opencode",
         cwd,
         title: "OpenCode send while working",
-        model: pickOpenCodeModel(modelList.models),
-        modeId: "default",
+        model: "opencode/big-pickle",
+        modeId: "build",
       });
 
       await client.sendMessage(
@@ -367,8 +347,8 @@ describe("daemon E2E (real opencode) - send while working and interrupt", () => 
         provider: "opencode",
         cwd,
         title: "OpenCode explicit interrupt",
-        model: pickOpenCodeModel(modelList.models),
-        modeId: "default",
+        model: "opencode/big-pickle",
+        modeId: "build",
       });
 
       await client.sendMessage(

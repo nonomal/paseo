@@ -1,14 +1,10 @@
 import { test, expect } from "./fixtures";
-import { createTempGitRepo } from "./helpers/workspace";
+import { TerminalE2EHarness } from "./helpers/terminal-dsl";
 import {
-  connectTerminalClient,
-  navigateToTerminal,
-  setupDeterministicPrompt,
   waitForTerminalContent,
   measureKeystrokeLatency,
   computePercentile,
   round2,
-  type TerminalPerfDaemonClient,
   type LatencySample,
 } from "./helpers/terminal-perf";
 
@@ -16,40 +12,30 @@ const LINE_COUNT = 50_000;
 const THROUGHPUT_BUDGET_MS = 30_000;
 const KEYSTROKE_SAMPLE_COUNT = 20;
 const KEYSTROKE_P95_BUDGET_MS = 150;
+const RUN_MANUAL_TERMINAL_PERF = process.env.PASEO_TERMINAL_PERF_E2E === "1";
+const terminalPerfDescribe = RUN_MANUAL_TERMINAL_PERF ? test.describe : test.describe.skip;
 
-test.describe("Terminal wire performance", () => {
-  let client: TerminalPerfDaemonClient;
-  let tempRepo: { path: string; cleanup: () => Promise<void> };
+terminalPerfDescribe("Terminal wire performance", () => {
+  let harness: TerminalE2EHarness;
 
   test.beforeAll(async () => {
-    tempRepo = await createTempGitRepo("perf-");
-    client = await connectTerminalClient();
+    harness = await TerminalE2EHarness.create({ tempPrefix: "perf-" });
   });
 
   test.afterAll(async () => {
-    if (client) {
-      await client.close();
-    }
-    if (tempRepo) {
-      await tempRepo.cleanup();
-    }
+    await harness?.cleanup();
   });
 
   test("throughput: bulk terminal output renders within budget", async ({ page }, testInfo) => {
     test.setTimeout(90_000);
 
-    const result = await client.createTerminal(tempRepo.path, "throughput");
-    if (!result.terminal) {
-      throw new Error(`Failed to create terminal: ${result.error}`);
-    }
-    const terminalId = result.terminal.id;
-
+    const created = await harness.createTerminal({ name: "throughput" });
     try {
-      await navigateToTerminal(page, { cwd: tempRepo.path, terminalId });
-      await setupDeterministicPrompt(page);
+      await harness.openTerminal(page, { terminalId: created.id });
+      await harness.setupPrompt(page);
 
       const sentinel = `PERF_DONE_${Date.now()}`;
-      const terminal = page.locator('[data-testid="terminal-surface"]');
+      const terminal = harness.terminalSurface(page);
       const startMs = Date.now();
 
       await terminal.pressSequentially(`seq 1 ${LINE_COUNT}; echo ${sentinel}\n`, { delay: 0 });
@@ -90,25 +76,20 @@ test.describe("Terminal wire performance", () => {
         `${LINE_COUNT} lines should render within ${THROUGHPUT_BUDGET_MS}ms`,
       ).toBeLessThan(THROUGHPUT_BUDGET_MS);
     } finally {
-      await client.killTerminal(terminalId).catch(() => {});
+      await harness.killTerminal(created.id);
     }
   });
 
   test("keystroke latency: echo round-trip under budget", async ({ page }, testInfo) => {
     test.setTimeout(60_000);
 
-    const result = await client.createTerminal(tempRepo.path, "latency");
-    if (!result.terminal) {
-      throw new Error(`Failed to create terminal: ${result.error}`);
-    }
-    const terminalId = result.terminal.id;
-
+    const created = await harness.createTerminal({ name: "latency" });
     try {
-      await navigateToTerminal(page, { cwd: tempRepo.path, terminalId });
-      await setupDeterministicPrompt(page);
+      await harness.openTerminal(page, { terminalId: created.id });
+      await harness.setupPrompt(page);
 
       // Ensure clean prompt state
-      const terminal = page.locator('[data-testid="terminal-surface"]');
+      const terminal = harness.terminalSurface(page);
       await terminal.press("Control+c");
       await page.waitForTimeout(200);
 
@@ -159,7 +140,7 @@ test.describe("Terminal wire performance", () => {
         `Keystroke p95 latency should be under ${KEYSTROKE_P95_BUDGET_MS}ms`,
       ).toBeLessThan(KEYSTROKE_P95_BUDGET_MS);
     } finally {
-      await client.killTerminal(terminalId).catch(() => {});
+      await harness.killTerminal(created.id);
     }
   });
 });

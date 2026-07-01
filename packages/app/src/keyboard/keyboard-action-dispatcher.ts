@@ -1,6 +1,7 @@
 export type KeyboardActionScope = "global" | "message-input" | "sidebar" | "workspace";
 
 export type KeyboardActionId =
+  | "agent.interrupt"
   | "message-input.focus"
   | "message-input.send"
   | "message-input.dictation-toggle"
@@ -8,6 +9,7 @@ export type KeyboardActionId =
   | "message-input.dictation-confirm"
   | "message-input.voice-toggle"
   | "message-input.voice-mute-toggle"
+  | "message-input.mode-cycle"
   | "workspace.tab.new"
   | "workspace.tab.close-current"
   | "workspace.tab.navigate-index"
@@ -24,10 +26,13 @@ export type KeyboardActionId =
   | "workspace.pane.move-tab.down"
   | "workspace.pane.close"
   | "workspace.terminal.new"
+  | "sidebar.toggle.right"
+  | "workspace.new"
   | "worktree.new"
   | "worktree.archive";
 
 export type KeyboardActionDefinition =
+  | { id: "agent.interrupt"; scope: KeyboardActionScope }
   | { id: "message-input.focus"; scope: KeyboardActionScope }
   | { id: "message-input.send"; scope: KeyboardActionScope }
   | { id: "message-input.dictation-toggle"; scope: KeyboardActionScope }
@@ -35,6 +40,7 @@ export type KeyboardActionDefinition =
   | { id: "message-input.dictation-confirm"; scope: KeyboardActionScope }
   | { id: "message-input.voice-toggle"; scope: KeyboardActionScope }
   | { id: "message-input.voice-mute-toggle"; scope: KeyboardActionScope }
+  | { id: "message-input.mode-cycle"; scope: KeyboardActionScope }
   | { id: "workspace.tab.new"; scope: KeyboardActionScope }
   | { id: "workspace.tab.close-current"; scope: KeyboardActionScope }
   | { id: "workspace.tab.navigate-index"; scope: KeyboardActionScope; index: number }
@@ -51,17 +57,19 @@ export type KeyboardActionDefinition =
   | { id: "workspace.pane.move-tab.down"; scope: KeyboardActionScope }
   | { id: "workspace.pane.close"; scope: KeyboardActionScope }
   | { id: "workspace.terminal.new"; scope: KeyboardActionScope }
+  | { id: "sidebar.toggle.right"; scope: KeyboardActionScope }
+  | { id: "workspace.new"; scope: KeyboardActionScope }
   | { id: "worktree.new"; scope: KeyboardActionScope }
   | { id: "worktree.archive"; scope: KeyboardActionScope };
 
-export type KeyboardActionHandler = {
+export interface KeyboardActionHandler {
   handlerId: string;
   actions: readonly KeyboardActionId[];
   enabled: boolean;
   priority: number;
   isActive?: () => boolean;
   handle: (action: KeyboardActionDefinition) => boolean;
-};
+}
 
 type KeyboardActionRegistryEntry = KeyboardActionHandler & {
   registeredAt: number;

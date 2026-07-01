@@ -1,10 +1,17 @@
-import { useCallback, useEffect, useMemo } from "react";
-import { ActivityIndicator, Pressable, Text, View } from "react-native";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { type ReactElement, useCallback, useMemo } from "react";
+import { useTranslation } from "react-i18next";
+import {
+  ActivityIndicator,
+  Pressable,
+  Text,
+  View,
+  type PressableStateCallbackType,
+} from "react-native";
+import { useMutation } from "@tanstack/react-query";
 import { Check, ChevronDown } from "lucide-react-native";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
-import type { EditorTargetDescriptorPayload, EditorTargetId } from "@server/shared/messages";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { EditorAppIcon } from "@/components/icons/editor-app-icons";
+import { GitHubIcon } from "@/components/icons/github-icon";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -12,90 +19,184 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useToast } from "@/contexts/toast-context";
-import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
+import { useCheckoutStatusQuery } from "@/git/use-status-query";
+import { useIsLocalDaemon } from "@/hooks/use-is-local-daemon";
+import { useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { resolvePreferredEditorId, usePreferredEditor } from "@/hooks/use-preferred-editor";
+import { openExternalUrl } from "@/utils/open-external-url";
 import { isAbsolutePath } from "@/utils/path";
 import { isWeb } from "@/constants/platform";
+import { openDesktopTarget, useDesktopOpenTargets } from "@/workspace/desktop-open-targets";
+import { resolveWorkspaceFilePaths, type WorkspaceFileLocation } from "@/workspace/file-open";
+import { planWorkspaceOpenTargets } from "@/workspace/open-target-planner";
+import type { Theme } from "@/styles/theme";
 
 interface WorkspaceOpenInEditorButtonProps {
   serverId: string;
   cwd: string;
+  activeFile?: WorkspaceFileLocation | null;
+  hideLabels?: boolean;
 }
 
-export function WorkspaceOpenInEditorButton({ serverId, cwd }: WorkspaceOpenInEditorButtonProps) {
-  const { theme } = useUnistyles();
+interface OpenTarget {
+  id: string;
+  label: string;
+  icon: ReactElement;
+  onOpen: () => Promise<void> | void;
+}
+
+const ThemedActivityIndicator = withUnistyles(ActivityIndicator);
+const ThemedEditorAppIcon = withUnistyles(EditorAppIcon);
+const ThemedGitHubIcon = withUnistyles(GitHubIcon);
+const ThemedChevronDown = withUnistyles(ChevronDown);
+const ThemedCheckIcon = withUnistyles(Check);
+
+const foregroundColorMapping = (theme: Theme) => ({ color: theme.colors.foreground });
+const mutedColorMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
+
+interface OpenTargetMenuItemProps {
+  target: OpenTarget;
+  isPreferred: boolean;
+  onOpen: (target: OpenTarget) => void;
+}
+
+function OpenTargetMenuItem({ target, isPreferred, onOpen }: OpenTargetMenuItemProps) {
+  const handleSelect = useCallback(() => onOpen(target), [onOpen, target]);
+  const trailing = useMemo(
+    () => (isPreferred ? <ThemedCheckIcon size={16} uniProps={mutedColorMapping} /> : undefined),
+    [isPreferred],
+  );
+  return (
+    <DropdownMenuItem
+      testID={`workspace-open-in-editor-item-${target.id}`}
+      leading={target.icon}
+      trailing={trailing}
+      onSelect={handleSelect}
+    >
+      {target.label}
+    </DropdownMenuItem>
+  );
+}
+
+export function WorkspaceOpenInEditorButton({
+  serverId,
+  cwd,
+  activeFile,
+  hideLabels,
+}: WorkspaceOpenInEditorButtonProps) {
+  const { t } = useTranslation();
   const toast = useToast();
-  const client = useHostRuntimeClient(serverId);
   const isConnected = useHostRuntimeIsConnected(serverId);
+  const isLocalDaemon = useIsLocalDaemon(serverId);
   const { preferredEditorId, updatePreferredEditor } = usePreferredEditor();
+  const { targets: desktopOpenTargets, isAvailable: isDesktopOpenAvailable } =
+    useDesktopOpenTargets({
+      isLocalExecution: isLocalDaemon,
+    });
 
-  const shouldLoadEditors =
-    isWeb && Boolean(client && isConnected) && cwd.trim().length > 0 && isAbsolutePath(cwd);
+  const resolvedFile = useMemo(
+    () =>
+      activeFile ? resolveWorkspaceFilePaths({ path: activeFile.path, workspaceRoot: cwd }) : null,
+    [activeFile, cwd],
+  );
+  const activeFileName = useMemo(
+    () => resolvedFile?.absolutePath.split("/").findLast(Boolean) ?? null,
+    [resolvedFile],
+  );
 
-  const availableEditorsQuery = useQuery<EditorTargetDescriptorPayload[]>({
-    queryKey: ["available-editors", serverId],
-    enabled: shouldLoadEditors,
-    staleTime: 60_000,
-    retry: false,
-    queryFn: async () => {
-      if (!client) {
-        return [];
-      }
-      try {
-        const payload = await client.listAvailableEditors();
-        return payload.error ? [] : payload.editors;
-      } catch {
-        return [];
-      }
-    },
+  const canResolveWorkspace = isWeb && cwd.trim().length > 0 && isAbsolutePath(cwd);
+  const shouldQueryCheckout = canResolveWorkspace && isConnected;
+
+  const { status: checkoutStatus } = useCheckoutStatusQuery({
+    serverId,
+    cwd: shouldQueryCheckout ? cwd : "",
   });
 
-  const availableEditors = availableEditorsQuery.data ?? [];
-  const availableEditorIds = useMemo(
-    () => availableEditors.map((editor: EditorTargetDescriptorPayload) => editor.id),
-    [availableEditors],
+  const targets = useMemo<OpenTarget[]>(
+    () =>
+      planWorkspaceOpenTargets({
+        workspaceDirectory: cwd,
+        activeFile,
+        resolvedActiveFile: resolvedFile,
+        desktopTargets: desktopOpenTargets,
+        canUseDesktopBridge: isDesktopOpenAvailable,
+        isLocalExecution: isLocalDaemon,
+        checkoutStatus,
+      }).map((target) => {
+        if (target.source === "github") {
+          return {
+            id: target.id,
+            label: target.label,
+            icon: <ThemedGitHubIcon size={16} uniProps={mutedColorMapping} />,
+            onOpen: () => openExternalUrl(target.url),
+          };
+        }
+        return {
+          id: target.id,
+          label: target.label,
+          icon: <ThemedEditorAppIcon editorId={target.id} size={16} uniProps={mutedColorMapping} />,
+          onOpen: () => openDesktopTarget(target.openInput),
+        };
+      }),
+    [
+      activeFile,
+      checkoutStatus,
+      cwd,
+      desktopOpenTargets,
+      isDesktopOpenAvailable,
+      isLocalDaemon,
+      resolvedFile,
+    ],
   );
-  const effectivePreferredEditorId = useMemo(
-    () => resolvePreferredEditorId(availableEditorIds, preferredEditorId),
-    [availableEditorIds, preferredEditorId],
-  );
-  const primaryOption =
-    availableEditors.find(
-      (editor: EditorTargetDescriptorPayload) => editor.id === effectivePreferredEditorId,
-    ) ?? null;
 
-  useEffect(() => {
-    if (!effectivePreferredEditorId || effectivePreferredEditorId === preferredEditorId) {
-      return;
-    }
-    void updatePreferredEditor(effectivePreferredEditorId).catch(() => undefined);
-  }, [effectivePreferredEditorId, preferredEditorId, updatePreferredEditor]);
+  const targetIds = useMemo(() => targets.map((target) => target.id), [targets]);
+  const effectivePreferredEditorId = useMemo(
+    () => resolvePreferredEditorId(targetIds, preferredEditorId),
+    [targetIds, preferredEditorId],
+  );
+  const primaryOption = targets.find((target) => target.id === effectivePreferredEditorId) ?? null;
 
   const openMutation = useMutation({
-    mutationFn: async (editorId: EditorTargetId) => {
-      if (!client) {
-        throw new Error("Host is not connected");
-      }
-      const payload = await client.openInEditor(cwd, editorId);
-      if (payload.error) {
-        throw new Error(payload.error);
-      }
-      return editorId;
-    },
+    mutationFn: (target: OpenTarget) => Promise.resolve(target.onOpen()),
     onError: (error: unknown) => {
-      toast.error(error instanceof Error ? error.message : "Failed to open in editor");
+      toast.error(
+        error instanceof Error ? error.message : t("workspace.git.openInEditor.failedOpen"),
+      );
     },
   });
 
-  const handleOpenEditor = useCallback(
-    (editorId: EditorTargetId) => {
-      void updatePreferredEditor(editorId).catch(() => undefined);
-      openMutation.mutate(editorId);
+  const handleOpenTarget = useCallback(
+    (target: OpenTarget) => {
+      void updatePreferredEditor(target.id).catch(() => undefined);
+      openMutation.mutate(target);
     },
     [openMutation, updatePreferredEditor],
   );
 
-  if (!shouldLoadEditors || !primaryOption || availableEditors.length === 0) {
+  const primaryPressableStyle = useCallback(
+    ({ pressed, hovered = false }: PressableStateCallbackType & { hovered?: boolean }) => [
+      styles.splitButtonPrimary,
+      (Boolean(hovered) || pressed) && styles.splitButtonPrimaryHovered,
+      openMutation.isPending && styles.splitButtonPrimaryDisabled,
+    ],
+    [openMutation.isPending],
+  );
+
+  const caretTriggerStyle = useCallback(
+    ({ hovered, pressed, open }: { hovered: boolean; pressed: boolean; open: boolean }) => [
+      styles.splitButtonCaret,
+      (hovered || pressed || open) && styles.splitButtonCaretHovered,
+    ],
+    [],
+  );
+
+  const handlePrimaryPress = useCallback(() => {
+    if (primaryOption) {
+      handleOpenTarget(primaryOption);
+    }
+  }, [primaryOption, handleOpenTarget]);
+
+  if (!canResolveWorkspace || !primaryOption || targets.length === 0) {
     return null;
   }
 
@@ -104,45 +205,45 @@ export function WorkspaceOpenInEditorButton({ serverId, cwd }: WorkspaceOpenInEd
       <View style={styles.splitButton}>
         <Pressable
           testID="workspace-open-in-editor-primary"
-          style={({ hovered, pressed }) => [
-            styles.splitButtonPrimary,
-            (hovered || pressed) && styles.splitButtonPrimaryHovered,
-            openMutation.isPending && styles.splitButtonPrimaryDisabled,
-          ]}
-          onPress={() => handleOpenEditor(primaryOption.id)}
+          style={primaryPressableStyle}
+          onPress={handlePrimaryPress}
           disabled={openMutation.isPending}
           accessibilityRole="button"
-          accessibilityLabel={`Open workspace in ${primaryOption.label}`}
+          accessibilityLabel={
+            activeFileName
+              ? t("workspace.git.openInEditor.openFileIn", {
+                  fileName: activeFileName,
+                  target: primaryOption.label,
+                })
+              : t("workspace.git.openInEditor.openIn", {
+                  target: primaryOption.label,
+                })
+          }
         >
           {openMutation.isPending ? (
-            <ActivityIndicator
+            <ThemedActivityIndicator
               size="small"
-              color={theme.colors.foreground}
+              uniProps={foregroundColorMapping}
               style={styles.splitButtonSpinnerOnly}
             />
           ) : (
             <View style={styles.splitButtonContent}>
-              <EditorAppIcon
-                editorId={primaryOption.id}
-                size={16}
-                color={theme.colors.foregroundMuted}
-              />
-              <Text style={styles.splitButtonText}>Open</Text>
+              {primaryOption.icon}
+              {!hideLabels && (
+                <Text style={styles.splitButtonText}>{t("workspace.git.openInEditor.open")}</Text>
+              )}
             </View>
           )}
         </Pressable>
-        {availableEditors.length > 1 ? (
+        {targets.length > 1 ? (
           <DropdownMenu>
             <DropdownMenuTrigger
               testID="workspace-open-in-editor-caret"
-              style={({ hovered, pressed, open }) => [
-                styles.splitButtonCaret,
-                (hovered || pressed || open) && styles.splitButtonCaretHovered,
-              ]}
+              style={caretTriggerStyle}
               accessibilityRole="button"
-              accessibilityLabel="Choose editor"
+              accessibilityLabel={t("workspace.git.openInEditor.chooseEditor")}
             >
-              <ChevronDown size={16} color={theme.colors.foregroundMuted} />
+              <ThemedChevronDown size={16} uniProps={mutedColorMapping} />
             </DropdownMenuTrigger>
             <DropdownMenuContent
               align="end"
@@ -150,26 +251,13 @@ export function WorkspaceOpenInEditorButton({ serverId, cwd }: WorkspaceOpenInEd
               maxWidth={176}
               testID="workspace-open-in-editor-menu"
             >
-              {availableEditors.map((editor: EditorTargetDescriptorPayload) => (
-                <DropdownMenuItem
-                  key={editor.id}
-                  testID={`workspace-open-in-editor-item-${editor.id}`}
-                  leading={
-                    <EditorAppIcon
-                      editorId={editor.id}
-                      size={16}
-                      color={theme.colors.foregroundMuted}
-                    />
-                  }
-                  trailing={
-                    editor.id === effectivePreferredEditorId ? (
-                      <Check size={16} color={theme.colors.foregroundMuted} />
-                    ) : undefined
-                  }
-                  onSelect={() => handleOpenEditor(editor.id)}
-                >
-                  {editor.label}
-                </DropdownMenuItem>
+              {targets.map((target) => (
+                <OpenTargetMenuItem
+                  key={target.id}
+                  target={target}
+                  isPreferred={target.id === effectivePreferredEditorId}
+                  onOpen={handleOpenTarget}
+                />
               ))}
             </DropdownMenuContent>
           </DropdownMenu>
@@ -196,7 +284,14 @@ const styles = StyleSheet.create((theme) => ({
   },
   splitButtonPrimary: {
     paddingLeft: theme.spacing[3],
-    paddingRight: 10,
+    paddingRight: theme.spacing[3],
+    paddingVertical: theme.spacing[1],
+    justifyContent: "center",
+    position: "relative",
+  },
+  splitButtonPrimaryIconOnly: {
+    paddingLeft: theme.spacing[2],
+    paddingRight: theme.spacing[2],
     paddingVertical: theme.spacing[1],
     justifyContent: "center",
     position: "relative",
@@ -218,6 +313,7 @@ const styles = StyleSheet.create((theme) => ({
     alignItems: "center",
     justifyContent: "center",
     gap: theme.spacing[2],
+    minHeight: theme.fontSize.sm * 1.5,
   },
   splitButtonSpinnerOnly: {
     transform: [{ scale: 0.8 }],

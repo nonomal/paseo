@@ -53,6 +53,19 @@ describe("resolveAssistantImageSource", () => {
     });
   });
 
+  it("uses the same home-root target as file previews for tilde paths", () => {
+    expect(
+      resolveAssistantImageSource({
+        source: "~/.paseo/screenshots/output.png",
+        workspaceRoot: "/Users/test/project",
+      }),
+    ).toEqual({
+      kind: "file_rpc",
+      cwd: "~",
+      path: "~/.paseo/screenshots/output.png",
+    });
+  });
+
   it("normalizes file URIs into file RPC requests", () => {
     expect(
       resolveAssistantImageSource({
@@ -63,6 +76,19 @@ describe("resolveAssistantImageSource", () => {
       kind: "file_rpc",
       cwd: "/",
       path: "/tmp/paseo-codex-screenshot.png",
+    });
+  });
+
+  it("normalizes markdown-encoded Windows paths into file RPC requests", () => {
+    expect(
+      resolveAssistantImageSource({
+        source: "C:%5CUsers%5Chanse%5CAppData%5CLocal%5CTemp%5Cpaseo-attachments%5Cimage.png",
+        workspaceRoot: "C:/Users/hanse/eatingkat",
+      }),
+    ).toEqual({
+      kind: "file_rpc",
+      cwd: "C:/",
+      path: "C:/Users/hanse/AppData/Local/Temp/paseo-attachments/image.png",
     });
   });
 

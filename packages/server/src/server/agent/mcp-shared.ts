@@ -1,50 +1,61 @@
 import { z } from "zod";
 import type { Logger } from "pino";
 
-import type { AgentPromptInput, AgentPermissionRequest } from "./agent-sdk-types.js";
+import type { AgentPermissionRequest } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent, WaitForAgentResult } from "./agent-manager.js";
 import { curateAgentActivity } from "./activity-curator.js";
+import { selectItemsByProjectedLimit } from "./timeline-projection.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { serializeAgentSnapshot } from "../messages.js";
-import { StoredScheduleSchema } from "../schedule/types.js";
+import { StoredScheduleSchema } from "@getpaseo/protocol/schedule/types";
 import type { AgentProvider } from "./agent-sdk-types.js";
 
 export const AgentProviderEnum = z.string();
 
 export const AgentStatusEnum = z.enum(["initializing", "idle", "running", "error", "closed"]);
 
-export const ProviderModeSchema = z.object({
-  id: z.string(),
-  label: z.string(),
-  description: z.string().optional(),
-  icon: z.string().optional(),
-  colorTier: z.string().optional(),
-});
+export const ProviderModeSchema = z
+  .object({
+    id: z.string(),
+    label: z.string().nullish(),
+    description: z.string().nullish(),
+    icon: z.string().nullish(),
+    colorTier: z.string().nullish(),
+  })
+  .passthrough();
 
-export const ProviderSummarySchema = z.object({
-  id: z.string(),
-  label: z.string(),
-  modes: z.array(ProviderModeSchema),
-});
+export const ProviderSummarySchema = z
+  .object({
+    id: z.string(),
+    label: z.string().nullish(),
+    description: z.string().nullish(),
+    enabled: z.boolean().optional().default(true),
+    modes: z.array(ProviderModeSchema).nullish(),
+  })
+  .passthrough();
 
-export const AgentSelectOptionSchema = z.object({
-  id: z.string(),
-  label: z.string(),
-  description: z.string().optional(),
-  isDefault: z.boolean().optional(),
-  metadata: z.record(z.unknown()).optional(),
-});
+export const AgentSelectOptionSchema = z
+  .object({
+    id: z.string(),
+    label: z.string().nullish(),
+    description: z.string().nullish(),
+    isDefault: z.boolean().nullish(),
+    metadata: z.record(z.string(), z.unknown()).nullish(),
+  })
+  .passthrough();
 
-export const AgentModelSchema = z.object({
-  provider: z.string(),
-  id: z.string(),
-  label: z.string(),
-  description: z.string().optional(),
-  isDefault: z.boolean().optional(),
-  metadata: z.record(z.unknown()).optional(),
-  thinkingOptions: z.array(AgentSelectOptionSchema).optional(),
-  defaultThinkingOptionId: z.string().optional(),
-});
+export const AgentModelSchema = z
+  .object({
+    provider: z.string(),
+    id: z.string(),
+    label: z.string().nullish(),
+    description: z.string().nullish(),
+    isDefault: z.boolean().nullish(),
+    metadata: z.record(z.string(), z.unknown()).nullish(),
+    thinkingOptions: z.array(AgentSelectOptionSchema).nullish(),
+    defaultThinkingOptionId: z.string().nullish(),
+  })
+  .passthrough();
 
 // 30 seconds - surface friendly message before SDK tool timeout (~60s)
 export const AGENT_WAIT_TIMEOUT_MS = 30000;
@@ -54,47 +65,26 @@ export interface ResolvedProviderModel {
   model: string | undefined;
 }
 
-export function resolveProviderAndModel(params: {
-  provider?: string;
-  model?: string;
-  defaultProvider: AgentProvider;
-}): ResolvedProviderModel {
-  const providerInput = params.provider?.trim() || params.defaultProvider;
-  const modelInput = params.model?.trim();
-
-  if (params.model !== undefined && !modelInput) {
-    throw new Error("model cannot be empty");
-  }
-
+export function resolveRequiredProviderModel(
+  providerValue: string,
+): Required<ResolvedProviderModel> {
+  const providerInput = providerValue.trim();
   const slashIndex = providerInput.indexOf("/");
-  if (slashIndex === -1) {
-    return {
-      provider: providerInput as AgentProvider,
-      model: modelInput,
-    };
+  if (slashIndex <= 0 || slashIndex === providerInput.length - 1) {
+    throw new Error("provider must be provider/model, for example codex/gpt-5.4");
   }
 
   const provider = providerInput.slice(0, slashIndex).trim();
-  const modelFromProvider = providerInput.slice(slashIndex + 1).trim();
-  if (!provider || !modelFromProvider) {
-    throw new Error("provider must be <provider> or <provider>/<model>");
-  }
-
-  if (modelInput && modelInput !== modelFromProvider) {
-    throw new Error(
-      `Conflicting model values provided: provider specifies ${modelFromProvider}, but model specifies ${modelInput}`,
-    );
+  const model = providerInput.slice(slashIndex + 1).trim();
+  if (!provider || !model) {
+    throw new Error("provider must be provider/model, for example codex/gpt-5.4");
   }
 
   return {
-    provider: provider as AgentProvider,
-    model: modelInput ?? modelFromProvider,
+    provider: provider,
+    model,
   };
 }
-
-export type StartAgentRunOptions = {
-  replaceRunning?: boolean;
-};
 
 /**
  * Wraps agentManager.waitForAgentEvent with a self-imposed timeout.
@@ -148,7 +138,12 @@ export async function waitForAgentWithTimeout(
     if (error instanceof Error && error.message === "wait timeout") {
       const snapshot = agentManager.getAgent(agentId);
       const timeline = agentManager.getTimeline(agentId);
-      const recentActivity = curateAgentActivity(timeline.slice(-5));
+      const recent = selectItemsByProjectedLimit({
+        items: timeline,
+        direction: "tail",
+        limit: 5,
+      });
+      const recentActivity = curateAgentActivity(recent.items);
       const waitedSeconds = Math.round(AGENT_WAIT_TIMEOUT_MS / 1000);
       const message = `Awaiting the agent timed out after ${waitedSeconds}s. This does not mean the agent failed - call wait_for_agent again to continue waiting.\n\nRecent activity:\n${recentActivity}`;
       return {
@@ -163,117 +158,13 @@ export async function waitForAgentWithTimeout(
   }
 }
 
-export function startAgentRun(
-  agentManager: AgentManager,
-  agentId: string,
-  prompt: AgentPromptInput,
-  logger: Logger,
-  options?: StartAgentRunOptions,
-): void {
-  const shouldReplace = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
-  const iterator = shouldReplace
-    ? agentManager.replaceAgentRun(agentId, prompt)
-    : agentManager.streamAgent(agentId, prompt);
-  void (async () => {
-    try {
-      for await (const _ of iterator) {
-        // Events are broadcast via AgentManager subscribers.
-      }
-    } catch (error) {
-      logger.error({ err: error, agentId }, "Agent stream failed");
-    }
-  })();
-}
-
-interface SetupFinishNotificationParams {
-  agentManager: AgentManager;
-  agentStorage: AgentStorage;
-  childAgentId: string;
-  callerAgentId: string;
-  logger: Logger;
-}
-
-export function setupFinishNotification(params: SetupFinishNotificationParams): void {
-  const { agentManager, agentStorage, childAgentId, callerAgentId, logger } = params;
-  let hasSeenRunning = false;
-  let fired = false;
-  let unsubscribe: (() => void) | null = null;
-
-  async function notify(reason: "finished" | "errored" | "needs permission"): Promise<void> {
-    if (fired) {
-      return;
-    }
-    fired = true;
-    unsubscribe?.();
-
-    if (!agentManager.getAgent(callerAgentId)) {
-      return;
-    }
-
-    const callerRecord = await agentStorage.get(callerAgentId);
-    if (callerRecord?.archivedAt) {
-      return;
-    }
-
-    const title = agentManager.getAgent(childAgentId)?.config?.title ?? childAgentId;
-    const prompt = `<paseo-system>\nAgent ${childAgentId} (${title}) ${reason}.\n</paseo-system>`;
-
-    startAgentRun(agentManager, callerAgentId, prompt, logger, {
-      replaceRunning: true,
-    });
-  }
-
-  unsubscribe = agentManager.subscribe(
-    (event) => {
-      if (fired) {
-        return;
-      }
-
-      if (event.type === "agent_state") {
-        if (event.agent.lifecycle === "running") {
-          hasSeenRunning = true;
-          return;
-        }
-        if (event.agent.lifecycle === "error") {
-          notify("errored");
-          return;
-        }
-        if (event.agent.lifecycle === "idle" && hasSeenRunning) {
-          notify("finished");
-          return;
-        }
-        if (event.agent.lifecycle === "closed") {
-          fired = true;
-          unsubscribe?.();
-          return;
-        }
-        return;
-      }
-
-      if (event.event.type === "permission_requested") {
-        notify("needs permission");
-      }
-    },
-    { agentId: childAgentId, replayState: false },
-  );
-
-  // Check if the child is already running (catches the case where
-  // the lifecycle flipped before our subscribe call was processed).
-  // Do NOT treat an immediate "idle" as "finished" — the agent may
-  // not have started yet (streamAgent sets a pending run before
-  // transitioning to "running").
-  const childSnapshot = agentManager.getAgent(childAgentId);
-  if (!childSnapshot || childSnapshot.lifecycle === "closed") {
-    unsubscribe();
-    return;
-  }
-  if (childSnapshot.lifecycle === "running") {
-    hasSeenRunning = true;
-  } else if (childSnapshot.lifecycle === "error") {
-    notify("errored");
-  }
-}
-
+export function sanitizePermissionRequest(
+  permission: AgentPermissionRequest,
+): AgentPermissionRequest;
+export function sanitizePermissionRequest(permission: null | undefined): null;
+export function sanitizePermissionRequest(
+  permission: AgentPermissionRequest | null | undefined,
+): AgentPermissionRequest | null;
 export function sanitizePermissionRequest(
   permission: AgentPermissionRequest | null | undefined,
 ): AgentPermissionRequest | null {
@@ -289,6 +180,9 @@ export function sanitizePermissionRequest(
   }
   if (sanitized.input === undefined) {
     delete sanitized.input;
+  }
+  if (sanitized.detail === undefined) {
+    delete sanitized.detail;
   }
   if (sanitized.suggestions === undefined) {
     delete sanitized.suggestions;

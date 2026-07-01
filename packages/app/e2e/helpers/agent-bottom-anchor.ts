@@ -1,170 +1,13 @@
 import { expect, type Page } from "@playwright/test";
-import path from "node:path";
-import { pathToFileURL } from "node:url";
-import { randomUUID } from "node:crypto";
-import { createNodeWebSocketFactory, type NodeWebSocketFactory } from "./node-ws-factory";
-import { buildHostWorkspaceRoute } from "../../src/utils/host-routes";
 
 const NEAR_BOTTOM_THRESHOLD_PX = 72;
+const DEFAULT_SCROLL_TOLERANCE_PX = 24;
 
-export type ScrollMetrics = {
+export interface ScrollMetrics {
   offsetY: number;
   contentHeight: number;
   viewportHeight: number;
   distanceFromBottom: number;
-};
-
-export type SeededAgent = {
-  id: string;
-  title: string;
-  expectedTailText: string;
-  url: string;
-  workspaceUrl: string;
-};
-
-export type DaemonClientInstance = {
-  connect(): Promise<void>;
-  close(): Promise<void>;
-  createAgent(options: {
-    provider: string;
-    model: string;
-    thinkingOptionId: string;
-    modeId: string;
-    cwd: string;
-    title: string;
-    initialPrompt: string;
-  }): Promise<{ id: string }>;
-  sendAgentMessage(agentId: string, text: string): Promise<void>;
-  waitForFinish(agentId: string, timeout?: number): Promise<{ status: string }>;
-};
-
-function getDaemonWsUrl(): string {
-  const daemonPort = process.env.E2E_DAEMON_PORT;
-  if (!daemonPort) {
-    throw new Error("E2E_DAEMON_PORT is not set.");
-  }
-  return `ws://127.0.0.1:${daemonPort}/ws`;
-}
-
-function getServerId(): string {
-  const serverId = process.env.E2E_SERVER_ID;
-  if (!serverId) {
-    throw new Error("E2E_SERVER_ID is not set.");
-  }
-  return serverId;
-}
-
-function buildReplyBlock(label: string, lineCount = 14): string {
-  return Array.from({ length: lineCount }, (_, index) => {
-    const line = (index + 1).toString().padStart(2, "0");
-    return `${label} line ${line} anchor verification text keeps wrapping stable across resize and composer growth.`;
-  }).join("\n");
-}
-
-function buildProtocolMessage(label: string, lineCount = 14): string {
-  return [
-    "For every message in this chat, reply with exactly the text after the final line `REPLY:`.",
-    "Do not add extra words, bullets, markdown fences, or tool calls.",
-    "REPLY:",
-    buildReplyBlock(label, lineCount),
-  ].join("\n");
-}
-
-function buildReplyMessage(label: string, lineCount = 14): string {
-  return ["REPLY:", buildReplyBlock(label, lineCount)].join("\n");
-}
-
-export function createReplyTurn(label: string): {
-  message: string;
-  expectedReply: string;
-} {
-  return {
-    message: buildReplyMessage(label),
-    expectedReply: buildReplyBlock(label),
-  };
-}
-
-type DaemonClientConfig = {
-  url: string;
-  clientId: string;
-  clientType: "cli";
-  webSocketFactory?: NodeWebSocketFactory;
-};
-
-async function loadDaemonClientConstructor(): Promise<
-  new (
-    config: DaemonClientConfig,
-  ) => DaemonClientInstance
-> {
-  const repoRoot = path.resolve(__dirname, "../../../../");
-  const moduleUrl = pathToFileURL(
-    path.join(repoRoot, "packages/server/dist/server/server/exports.js"),
-  ).href;
-  const mod = (await import(moduleUrl)) as {
-    DaemonClient: new (config: DaemonClientConfig) => DaemonClientInstance;
-  };
-  return mod.DaemonClient;
-}
-
-export async function connectDaemonClient(): Promise<DaemonClientInstance> {
-  const DaemonClient = await loadDaemonClientConstructor();
-  const webSocketFactory = createNodeWebSocketFactory();
-  const client = new DaemonClient({
-    url: getDaemonWsUrl(),
-    clientId: `app-e2e-${randomUUID()}`,
-    clientType: "cli",
-    webSocketFactory,
-  });
-  await client.connect();
-  return client;
-}
-
-export async function seedBottomAnchorAgent(input: {
-  client: DaemonClientInstance;
-  cwd: string;
-  title?: string;
-  turnCount?: number;
-  lineCount?: number;
-}): Promise<SeededAgent> {
-  const title = input.title ?? `bottom-anchor-${Date.now()}`;
-  const turnCount = Math.max(3, input.turnCount ?? 5);
-  const lineCount = Math.max(14, input.lineCount ?? 14);
-  const created = await input.client.createAgent({
-    provider: "codex",
-    model: "gpt-5.4-mini",
-    thinkingOptionId: "low",
-    modeId: "full-access",
-    cwd: input.cwd,
-    title,
-    initialPrompt: buildProtocolMessage(`${title}-turn-00`, lineCount),
-  });
-  const initialFinish = await input.client.waitForFinish(created.id, 120000);
-  if (initialFinish.status !== "idle") {
-    throw new Error(
-      `Expected seeded agent ${created.id} to become idle after initial prompt, got ${initialFinish.status}.`,
-    );
-  }
-
-  let expectedTailText = buildReplyBlock(`${title}-turn-00`, lineCount);
-  for (let index = 1; index < turnCount; index += 1) {
-    const label = `${title}-turn-${index.toString().padStart(2, "0")}`;
-    expectedTailText = buildReplyBlock(label, lineCount);
-    await input.client.sendAgentMessage(created.id, buildReplyMessage(label, lineCount));
-    const finish = await input.client.waitForFinish(created.id, 120000);
-    if (finish.status !== "idle") {
-      throw new Error(
-        `Expected seeded agent ${created.id} to become idle after turn ${index}, got ${finish.status}.`,
-      );
-    }
-  }
-
-  return {
-    id: created.id,
-    title,
-    expectedTailText,
-    url: `${buildHostWorkspaceRoute(getServerId(), input.cwd)}?open=${encodeURIComponent(`agent:${created.id}`)}`,
-    workspaceUrl: buildHostWorkspaceRoute(getServerId(), input.cwd),
-  };
 }
 
 function getVisibleChatScroll(page: Page) {
@@ -203,48 +46,6 @@ export async function readScrollMetrics(page: Page): Promise<ScrollMetrics> {
   });
 }
 
-export async function scrollUpFromBottom(page: Page, pixels: number): Promise<void> {
-  const scrollViewport = getVisibleChatScroll(page);
-  await expect(scrollViewport).toHaveCount(1, { timeout: 30000 });
-  let remaining = Math.max(0, pixels);
-  while (remaining > 0) {
-    const delta = Math.min(240, remaining);
-    await scrollViewport.evaluate((element: Element, step: number) => {
-      const scrollContainer = element as HTMLElement;
-      scrollContainer.dispatchEvent(
-        new WheelEvent("wheel", {
-          deltaY: -step,
-          bubbles: true,
-          cancelable: true,
-        }),
-      );
-      scrollContainer.scrollTop = Math.max(0, scrollContainer.scrollTop - step);
-      scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }));
-    }, delta);
-    remaining -= delta;
-
-    if ((await readScrollMetrics(page)).distanceFromBottom > NEAR_BOTTOM_THRESHOLD_PX) {
-      return;
-    }
-  }
-}
-
-export async function waitForAgentReady(page: Page, expectedTailText?: string): Promise<void> {
-  await expect(getVisibleChatScroll(page)).toBeVisible({ timeout: 60000 });
-  await expect(page.getByRole("textbox", { name: "Message agent..." }).first()).toBeVisible({
-    timeout: 60000,
-  });
-  await expect(page.getByTestId("agent-loading")).toHaveCount(0, { timeout: 60000 });
-  if (expectedTailText) {
-    await expect
-      .poll(async () => {
-        const metrics = await readScrollMetrics(page);
-        return metrics.contentHeight;
-      })
-      .toBeGreaterThan(0);
-  }
-}
-
 export async function expectNearBottom(page: Page): Promise<void> {
   await expect
     .poll(async () => {
@@ -254,13 +55,23 @@ export async function expectNearBottom(page: Page): Promise<void> {
     .toBeLessThanOrEqual(NEAR_BOTTOM_THRESHOLD_PX);
 }
 
-export async function expectDetachedFromBottom(page: Page): Promise<void> {
+export async function scrollAgentChatToBottom(page: Page): Promise<void> {
+  const chatScroll = getVisibleChatScroll(page);
+  await chatScroll.evaluate((root: Element) => {
+    const scrollElement = root as HTMLElement;
+    scrollElement.scrollTop = scrollElement.scrollHeight;
+  });
   await expect
-    .poll(async () => {
-      const metrics = await readScrollMetrics(page);
-      return metrics.distanceFromBottom;
-    })
-    .toBeGreaterThan(NEAR_BOTTOM_THRESHOLD_PX);
+    .poll(async () =>
+      chatScroll.evaluate((root: Element) => {
+        const scrollElement = root as HTMLElement;
+        return Math.max(
+          0,
+          scrollElement.scrollHeight - (scrollElement.scrollTop + scrollElement.clientHeight),
+        );
+      }),
+    )
+    .toBeLessThanOrEqual(NEAR_BOTTOM_THRESHOLD_PX);
 }
 
 export async function waitForContentGrowth(
@@ -276,10 +87,64 @@ export async function waitForContentGrowth(
   return readScrollMetrics(page);
 }
 
-export async function getChatContainerKey(page: Page): Promise<string | null> {
-  return getVisibleChatScroll(page).evaluate((element) => {
-    const nativeId = (element as HTMLElement).id;
-    const prefix = "agent-chat-scroll-";
-    return nativeId.startsWith(prefix) ? nativeId.slice(prefix.length) : null;
-  });
+export async function waitForScrollableChat(
+  page: Page,
+  input: { minScrollableDistance: number; timeout?: number },
+): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const metrics = await readScrollMetrics(page);
+        return metrics.contentHeight - metrics.viewportHeight;
+      },
+      { timeout: input.timeout },
+    )
+    .toBeGreaterThan(input.minScrollableDistance);
+}
+
+export async function scrollChatAwayFromBottom(
+  page: Page,
+  input: { deltaY: number; minDistanceFromBottom: number },
+): Promise<ScrollMetrics> {
+  const scroll = getVisibleChatScroll(page);
+  const box = await scroll.boundingBox();
+  if (!box) {
+    throw new Error("Agent chat scroll container is not visible");
+  }
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.wheel(0, input.deltaY);
+
+  await expect
+    .poll(async () => {
+      const metrics = await readScrollMetrics(page);
+      return metrics.distanceFromBottom;
+    })
+    .toBeGreaterThan(input.minDistanceFromBottom);
+
+  return readScrollMetrics(page);
+}
+
+export async function expectScrollStaysFixed(
+  page: Page,
+  baseline: ScrollMetrics,
+  input?: { durationMs?: number; sampleIntervalMs?: number; tolerancePx?: number },
+): Promise<void> {
+  const durationMs = input?.durationMs ?? 2_000;
+  const sampleIntervalMs = input?.sampleIntervalMs ?? 250;
+  const tolerancePx = input?.tolerancePx ?? DEFAULT_SCROLL_TOLERANCE_PX;
+  const samples: Array<{ elapsedMs: number; offsetY: number; contentHeight: number }> = [];
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < durationMs) {
+    await page.waitForTimeout(sampleIntervalMs);
+    const metrics = await readScrollMetrics(page);
+    samples.push({
+      elapsedMs: Date.now() - startedAt,
+      offsetY: metrics.offsetY,
+      contentHeight: metrics.contentHeight,
+    });
+    expect(
+      metrics.offsetY,
+      JSON.stringify({ baseline, samples: samples.slice(-12) }),
+    ).toBeLessThanOrEqual(baseline.offsetY + tolerancePx);
+  }
 }

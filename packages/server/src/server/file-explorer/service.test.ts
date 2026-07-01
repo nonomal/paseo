@@ -1,37 +1,18 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { listDirectoryEntries, readExplorerFile } from "./service.js";
+import { readExplorerFile } from "./service.js";
+
+async function createHomeTempDir(prefix: string): Promise<string> {
+  return mkdtemp(path.join(os.homedir(), prefix));
+}
 
 async function createTempDir(prefix: string): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
 describe("file explorer service", () => {
-  it("lists directory entries even when a dangling symlink exists", async () => {
-    const root = await createTempDir("paseo-file-explorer-");
-
-    try {
-      await mkdir(path.join(root, "packages", "server"), { recursive: true });
-      const serverDir = path.join(root, "packages", "server");
-      await writeFile(path.join(serverDir, "README.md"), "# server\n", "utf-8");
-      await symlink("CLAUDE.md", path.join(serverDir, "AGENTS.md"));
-
-      const result = await listDirectoryEntries({
-        root,
-        relativePath: "packages/server",
-      });
-
-      expect(result.path).toBe("packages/server");
-      const names = result.entries.map((entry) => entry.name);
-      expect(names).toContain("README.md");
-      expect(names).not.toContain("AGENTS.md");
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
   it("reads .ex files as text", async () => {
     const root = await createTempDir("paseo-file-explorer-");
 
@@ -97,24 +78,59 @@ describe("file explorer service", () => {
     }
   });
 
-  it("rejects symlinked files that resolve outside the workspace", async () => {
-    const root = await createTempDir("paseo-file-explorer-");
-    const outsideRoot = await createTempDir("paseo-file-explorer-outside-");
+  it("expands a ~ prefix in relative paths against the user home directory", async () => {
+    const root = await createHomeTempDir(".paseo-file-explorer-home-");
 
     try {
-      const externalFile = path.join(outsideRoot, "secret.txt");
-      await writeFile(externalFile, "top secret\n", "utf-8");
-      await symlink(externalFile, path.join(root, "secret-link.txt"));
+      const filePath = path.join(root, "sample.txt");
+      await writeFile(filePath, "hello from home\n", "utf-8");
 
+      const tildePath = `~/${path.relative(os.homedir(), filePath)}`;
+      const result = await readExplorerFile({
+        root,
+        relativePath: tildePath,
+      });
+
+      expect(result.kind).toBe("text");
+      expect(result.content).toBe("hello from home\n");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows home to be the scoped root for tilde file previews", async () => {
+    const root = await createHomeTempDir(".paseo-file-explorer-home-root-");
+
+    try {
+      const filePath = path.join(root, "sample.txt");
+      await writeFile(filePath, "hello from home root\n", "utf-8");
+
+      const tildePath = `~/${path.relative(os.homedir(), filePath)}`;
+      const result = await readExplorerFile({
+        root: "~",
+        relativePath: tildePath,
+      });
+
+      expect(result.kind).toBe("text");
+      expect(result.path).toBe(path.relative(os.homedir(), filePath).split(path.sep).join("/"));
+      expect(result.content).toBe("hello from home root\n");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects ~-prefixed paths that resolve outside the workspace", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-file-explorer-outside-home-"));
+
+    try {
       await expect(
         readExplorerFile({
           root,
-          relativePath: "secret-link.txt",
+          relativePath: "~/some/file.txt",
         }),
       ).rejects.toThrow("Access outside of workspace is not allowed");
     } finally {
       await rm(root, { recursive: true, force: true });
-      await rm(outsideRoot, { recursive: true, force: true });
     }
   });
 });

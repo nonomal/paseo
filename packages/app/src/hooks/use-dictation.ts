@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { DictationStreamSender } from "@/dictation/dictation-stream-sender";
 import { useDictationAudioSource } from "@/hooks/use-dictation-audio-source";
@@ -14,6 +15,7 @@ import {
 } from "./use-dictation.shared";
 
 export function useDictation(options: UseDictationOptions): UseDictationResult {
+  const { t } = useTranslation();
   const {
     client,
     onTranscript,
@@ -22,7 +24,6 @@ export function useDictation(options: UseDictationOptions): UseDictationResult {
     onPermanentFailure,
     canStart,
     canConfirm,
-    autoStopWhenHidden,
     enableDuration = false,
   } = options;
 
@@ -155,8 +156,8 @@ export function useDictation(options: UseDictationOptions): UseDictationResult {
       if (!isRecordingRef.current) {
         return;
       }
-      void startNewStream("reconnect").catch((error) => {
-        reportError(error, "Failed to restart dictation stream after reconnect");
+      void startNewStream("reconnect").catch((err) => {
+        reportError(err, "Failed to restart dictation stream after reconnect");
       });
     });
   }, [client, reportError, startNewStream]);
@@ -286,7 +287,6 @@ export function useDictation(options: UseDictationOptions): UseDictationResult {
     clearStreamingState,
     client,
     enableDuration,
-    isProcessing,
     reportError,
     startDurationTracking,
     startNewStream,
@@ -324,7 +324,7 @@ export function useDictation(options: UseDictationOptions): UseDictationResult {
       clearStreamingState();
       actionGateRef.current.cancelling = false;
     }
-  }, [audio, clearStreamingState, client, reportError, stopDurationTracking]);
+  }, [audio, clearStreamingState, reportError, stopDurationTracking]);
 
   const confirmDictation = useCallback(async () => {
     if (actionGateRef.current.confirming) {
@@ -374,7 +374,6 @@ export function useDictation(options: UseDictationOptions): UseDictationResult {
   }, [
     audio,
     canConfirm,
-    isProcessing,
     handleDictationFailure,
     handleStreamingTranscriptionSuccess,
     stopDurationTracking,
@@ -392,7 +391,7 @@ export function useDictation(options: UseDictationOptions): UseDictationResult {
 
     try {
       if (!client?.isConnected) {
-        throw new Error("Daemon client is disconnected");
+        throw new Error(t("common.errors.daemonClientDisconnected"));
       }
       senderRef.current.resetStreamForReplay();
       const finalSeq = senderRef.current.getFinalSeq();
@@ -404,7 +403,13 @@ export function useDictation(options: UseDictationOptions): UseDictationResult {
       }
       handleDictationFailure(err);
     }
-  }, [client, ensureFinalTranscript, handleDictationFailure, handleStreamingTranscriptionSuccess]);
+  }, [
+    client,
+    ensureFinalTranscript,
+    handleDictationFailure,
+    handleStreamingTranscriptionSuccess,
+    t,
+  ]);
 
   const discardFailedDictation = useCallback(() => {
     setIsProcessing(false);
@@ -427,51 +432,13 @@ export function useDictation(options: UseDictationOptions): UseDictationResult {
     clearStreamingState();
   }, [clearStreamingState, stopDurationTracking]);
 
-  const cancelRef = useRef<(() => void) | null>(null);
   useEffect(() => {
-    cancelRef.current = () => {
-      void cancelDictation();
-    };
-  }, [cancelDictation]);
-
-  const visibilityRef = useRef<boolean | null>(
-    typeof autoStopWhenHidden?.isVisible === "boolean" ? autoStopWhenHidden.isVisible : null,
-  );
-  useEffect(() => {
-    const nextVisible =
-      typeof autoStopWhenHidden?.isVisible === "boolean" ? autoStopWhenHidden.isVisible : null;
-    const prevVisible = visibilityRef.current;
-    visibilityRef.current = nextVisible;
-
-    if (prevVisible === true && nextVisible === false) {
-      attemptGuardRef.current.cancel();
-
-      if (isRecordingRef.current) {
-        cancelRef.current?.();
-        return;
-      }
-
-      if (isProcessingRef.current) {
-        stopDurationTracking();
-        setDuration(0);
-        setIsProcessing(false);
-        isProcessingRef.current = false;
-        setError(null);
-        if (senderRef.current?.hasSegments()) {
-          setStatus("failed");
-        } else {
-          setStatus("idle");
-          clearStreamingState();
-        }
-      }
-    }
-  }, [autoStopWhenHidden?.isVisible, clearStreamingState, stopDurationTracking]);
-
-  useEffect(() => {
+    const attemptGuard = attemptGuardRef.current;
+    const audioStop = audioStopRef;
     return () => {
-      attemptGuardRef.current.cancel();
+      attemptGuard.cancel();
       stopDurationTracking();
-      void audioStopRef.current().catch(() => undefined);
+      void audioStop.current().catch(() => undefined);
     };
   }, [stopDurationTracking]);
 

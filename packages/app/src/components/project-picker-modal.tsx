@@ -1,57 +1,163 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Modal, Pressable, ScrollView, Text, TextInput, View } from "react-native";
+import {
+  Modal,
+  Pressable,
+  ScrollView,
+  Text,
+  TextInput,
+  View,
+  type PressableStateCallbackType,
+  type StyleProp,
+  type TextStyle,
+} from "react-native";
+import { useQuery } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import { Folder } from "lucide-react-native";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
-import { useQuery } from "@tanstack/react-query";
-import { usePathname } from "expo-router";
-import { useKeyboardShortcutsStore } from "@/stores/keyboard-shortcuts-store";
-import { shortenPath } from "@/utils/shorten-path";
-import { useSessionStore } from "@/stores/session-store";
-import { useHosts, useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
+import { getOpenProjectFailureReason, type OpenProjectFailureReason } from "@/hooks/open-project";
 import { useOpenProject } from "@/hooks/use-open-project";
-import { parseServerIdFromPathname } from "@/utils/host-routes";
-import { buildWorkingDirectorySuggestions } from "@/utils/working-directory-suggestions";
+import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
+import { useProjectPickerStore } from "@/stores/project-picker-store";
+import { useRecommendedProjectPaths } from "@/stores/session-store-hooks";
+import { shortenPath } from "@/utils/shorten-path";
 import { isNative } from "@/constants/platform";
+import { buildProjectPickerOptions, type ProjectPickerOption } from "./project-picker-options";
+
+interface PathRowProps {
+  option: ProjectPickerOption;
+  active: boolean;
+  onSelect: (path: string) => void;
+}
+
+function PathRow({ option, active, onSelect }: PathRowProps) {
+  const { theme } = useUnistyles();
+  const { t } = useTranslation();
+  const path = option.path;
+  const handlePress = useCallback(() => {
+    onSelect(path);
+  }, [onSelect, path]);
+  const pressableStyle = useCallback(
+    ({ hovered = false, pressed }: PressableStateCallbackType & { hovered?: boolean }) => [
+      styles.row,
+      (Boolean(hovered) || pressed || active) && {
+        backgroundColor: theme.colors.surface1,
+      },
+    ],
+    [active, theme.colors.surface1],
+  );
+  const rowTextStyle = useMemo(
+    () => [styles.rowText, { color: theme.colors.foreground }],
+    [theme.colors.foreground],
+  );
+  const rowActionTextStyle = useMemo(
+    () => [styles.rowActionText, { color: theme.colors.foregroundMuted }],
+    [theme.colors.foregroundMuted],
+  );
+  return (
+    <Pressable style={pressableStyle} onPress={handlePress}>
+      <View style={styles.rowContent}>
+        <View style={styles.iconSlot}>
+          <Folder size={16} strokeWidth={2.2} color={theme.colors.foregroundMuted} />
+        </View>
+        <Text style={rowTextStyle} numberOfLines={1}>
+          {shortenPath(path)}
+        </Text>
+        {option.kind === "path" ? (
+          <Text style={rowActionTextStyle}>{t("projectPicker.openPath")}</Text>
+        ) : null}
+      </View>
+    </Pressable>
+  );
+}
+
+interface ProjectPickerResultsProps {
+  options: ProjectPickerOption[];
+  activeIndex: number;
+  isSubmitting: boolean;
+  openErrorMessage: string | null;
+  hasQuery: boolean;
+  isSearching: boolean;
+  emptyTextStyle: StyleProp<TextStyle>;
+  errorTextStyle: StyleProp<TextStyle>;
+  onSelect: (path: string) => void;
+}
+
+function ProjectPickerResults({
+  options,
+  activeIndex,
+  isSubmitting,
+  openErrorMessage,
+  hasQuery,
+  isSearching,
+  emptyTextStyle,
+  errorTextStyle,
+  onSelect,
+}: ProjectPickerResultsProps) {
+  const { t } = useTranslation();
+  const canShowResultState = !isSubmitting && !openErrorMessage;
+
+  return (
+    <ScrollView
+      style={styles.results}
+      contentContainerStyle={styles.resultsContent}
+      keyboardShouldPersistTaps="always"
+      showsVerticalScrollIndicator={false}
+    >
+      {isSubmitting ? <Text style={emptyTextStyle}>{t("projectPicker.opening")}</Text> : null}
+      {!isSubmitting && openErrorMessage ? (
+        <Text style={errorTextStyle}>{openErrorMessage}</Text>
+      ) : null}
+      {canShowResultState && options.length === 0 && !hasQuery ? (
+        <Text style={emptyTextStyle}>{t("projectPicker.empty")}</Text>
+      ) : null}
+      {canShowResultState && isSearching ? (
+        <Text style={emptyTextStyle}>{t("projectPicker.searching")}</Text>
+      ) : null}
+      {canShowResultState && !isSearching && options.length === 0 && hasQuery ? (
+        <Text style={emptyTextStyle}>{t("common.empty.noOptionsMatchSearch")}</Text>
+      ) : null}
+      {canShowResultState && options.length > 0 ? (
+        <>
+          {options.map((option, index) => (
+            <PathRow
+              key={`${option.kind}:${option.path}`}
+              option={option}
+              active={index === activeIndex}
+              onSelect={onSelect}
+            />
+          ))}
+        </>
+      ) : null}
+    </ScrollView>
+  );
+}
 
 export function ProjectPickerModal() {
   const { theme } = useUnistyles();
-  const pathname = usePathname();
-  const daemons = useHosts();
-
-  const open = useKeyboardShortcutsStore((s) => s.projectPickerOpen);
-  const setOpen = useKeyboardShortcutsStore((s) => s.setProjectPickerOpen);
-
-  const serverId = useMemo(() => {
-    const fromPath = parseServerIdFromPathname(pathname);
-    if (fromPath) return fromPath;
-    return daemons[0]?.serverId ?? null;
-  }, [pathname, daemons]);
+  const { t } = useTranslation();
+  const request = useProjectPickerStore((state) => state.request);
+  const close = useProjectPickerStore((state) => state.close);
+  const serverId = request?.serverId ?? null;
+  const open = request !== null;
 
   const client = useHostRuntimeClient(serverId ?? "");
   const isConnected = useHostRuntimeIsConnected(serverId ?? "");
-  const workspaces = useSessionStore((state) =>
-    serverId ? state.sessions[serverId]?.workspaces : undefined,
-  );
+  const recommendedPaths = useRecommendedProjectPaths(serverId);
 
   const inputRef = useRef<TextInput>(null);
   const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [openErrorReason, setOpenErrorReason] = useState<OpenProjectFailureReason | null>(null);
   const openProject = useOpenProject(serverId);
 
-  const recommendedPaths = useMemo(() => {
-    if (!workspaces) return [];
-    return Array.from(workspaces.values()).map(
-      (workspace) => workspace.projectRootPath || workspace.id,
-    );
-  }, [workspaces]);
-
   const directorySuggestionsQuery = useQuery({
-    queryKey: ["project-picker-directory-suggestions", serverId, query],
+    queryKey: ["project-picker-directory-suggestions", serverId, debouncedQuery],
     queryFn: async () => {
       if (!client) return [];
       const result = await client.getDirectorySuggestions({
-        query,
+        query: debouncedQuery,
         includeDirectories: true,
         includeFiles: false,
         limit: 30,
@@ -67,53 +173,83 @@ export function ProjectPickerModal() {
 
   const options = useMemo(
     () =>
-      buildWorkingDirectorySuggestions({
+      buildProjectPickerOptions({
         recommendedPaths,
         serverPaths: directorySuggestionsQuery.data ?? [],
         query,
       }),
-    [query, directorySuggestionsQuery.data, recommendedPaths],
+    [directorySuggestionsQuery.data, query, recommendedPaths],
   );
+  const hasQuery = query.trim().length > 0;
+  const isSearching =
+    hasQuery &&
+    options.length === 0 &&
+    (query !== debouncedQuery || directorySuggestionsQuery.isFetching);
+
+  const openErrorMessage = useMemo(() => {
+    if (!openErrorReason) {
+      return null;
+    }
+
+    return t(`projectPicker.errors.${openErrorReason}`);
+  }, [openErrorReason, t]);
 
   const handleClose = useCallback(() => {
-    setOpen(false);
-  }, [setOpen]);
+    close();
+  }, [close]);
 
   const handleSelectPath = useCallback(
     async (path: string) => {
       const trimmed = path.trim();
       if (!trimmed || !client || !serverId) return;
 
+      setOpenErrorReason(null);
       setIsSubmitting(true);
       try {
-        const didOpenProject = await openProject(trimmed);
-        if (didOpenProject) {
-          setOpen(false);
+        const result = await openProject(trimmed);
+        if (result.ok) {
+          close();
+          return;
         }
+
+        setOpenErrorReason(getOpenProjectFailureReason(result));
       } finally {
         setIsSubmitting(false);
       }
     },
-    [client, openProject, serverId, setOpen],
+    [client, close, openProject, serverId],
   );
 
-  const handleSubmitCustom = useCallback(() => {
-    const trimmed = query.trim();
-    if (!trimmed) return;
-    void handleSelectPath(trimmed);
-  }, [handleSelectPath, query]);
+  const submitActiveOption = useCallback(() => {
+    const option = options[activeIndex];
+    if (!option) return;
+    void handleSelectPath(option.path);
+  }, [activeIndex, handleSelectPath, options]);
 
-  // Reset state when opening/closing
+  const handleChangeQuery = useCallback((text: string) => {
+    setQuery(text);
+    setActiveIndex(0);
+    setOpenErrorReason(null);
+  }, []);
+
   useEffect(() => {
     if (open) {
       setQuery("");
+      setDebouncedQuery("");
       setActiveIndex(0);
+      setOpenErrorReason(null);
       const id = setTimeout(() => inputRef.current?.focus(), 0);
       return () => clearTimeout(id);
     }
   }, [open]);
 
-  // Clamp active index
+  // Debounce the query that drives the (potentially multi-second) directory
+  // suggestions RPC so fast typing doesn't fire a filesystem scan per keystroke.
+  useEffect(() => {
+    const id = setTimeout(() => setDebouncedQuery(query), 250);
+    return () => clearTimeout(id);
+  }, [query]);
+
   useEffect(() => {
     if (!open) return;
     if (activeIndex >= options.length) {
@@ -121,7 +257,6 @@ export function ProjectPickerModal() {
     }
   }, [activeIndex, options.length, open]);
 
-  // Keyboard navigation
   useEffect(() => {
     if (!open || isNative) return;
 
@@ -131,17 +266,13 @@ export function ProjectPickerModal() {
 
       if (key === "Escape") {
         event.preventDefault();
-        setOpen(false);
+        close();
         return;
       }
 
       if (key === "Enter") {
         event.preventDefault();
-        if (options.length > 0 && activeIndex < options.length) {
-          void handleSelectPath(options[activeIndex]!);
-        } else if (query.trim()) {
-          handleSubmitCustom();
-        }
+        submitActiveOption();
         return;
       }
 
@@ -160,7 +291,34 @@ export function ProjectPickerModal() {
 
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, [activeIndex, handleSelectPath, handleSubmitCustom, open, options, query, setOpen]);
+  }, [close, open, options.length, submitActiveOption]);
+
+  const panelStyle = useMemo(
+    () => [
+      styles.panel,
+      {
+        borderColor: theme.colors.border,
+        backgroundColor: theme.colors.surface0,
+      },
+    ],
+    [theme.colors.border, theme.colors.surface0],
+  );
+  const headerStyle = useMemo(
+    () => [styles.header, { borderBottomColor: theme.colors.border }],
+    [theme.colors.border],
+  );
+  const inputStyle = useMemo(
+    () => [styles.input, { color: theme.colors.foreground }],
+    [theme.colors.foreground],
+  );
+  const emptyTextStyle = useMemo(
+    () => [styles.emptyText, { color: theme.colors.foregroundMuted }],
+    [theme.colors.foregroundMuted],
+  );
+  const errorTextStyle = useMemo(
+    () => [styles.emptyText, { color: theme.colors.destructive }],
+    [theme.colors.destructive],
+  );
 
   if (!serverId) return null;
 
@@ -169,83 +327,35 @@ export function ProjectPickerModal() {
       <View style={styles.overlay}>
         <Pressable style={styles.backdrop} onPress={handleClose} />
 
-        <View
-          style={[
-            styles.panel,
-            {
-              borderColor: theme.colors.border,
-              backgroundColor: theme.colors.surface0,
-            },
-          ]}
-        >
-          <View style={[styles.header, { borderBottomColor: theme.colors.border }]}>
+        <View style={panelStyle}>
+          <View style={headerStyle}>
             <TextInput
               ref={inputRef}
               value={query}
-              onChangeText={(text) => {
-                setQuery(text);
-                setActiveIndex(0);
-              }}
-              placeholder="Type a directory path..."
+              onChangeText={handleChangeQuery}
+              placeholder={t("projectPicker.placeholder")}
               placeholderTextColor={theme.colors.foregroundMuted}
-              style={[styles.input, { color: theme.colors.foreground }]}
+              style={inputStyle}
               autoCapitalize="none"
               autoCorrect={false}
               autoFocus
               editable={!isSubmitting}
+              returnKeyType="go"
+              onSubmitEditing={submitActiveOption}
             />
           </View>
 
-          <ScrollView
-            style={styles.results}
-            contentContainerStyle={styles.resultsContent}
-            keyboardShouldPersistTaps="always"
-            showsVerticalScrollIndicator={false}
-          >
-            {isSubmitting ? (
-              <Text style={[styles.emptyText, { color: theme.colors.foregroundMuted }]}>
-                Opening project...
-              </Text>
-            ) : options.length === 0 && !query.trim() ? (
-              <Text style={[styles.emptyText, { color: theme.colors.foregroundMuted }]}>
-                Start typing a path
-              </Text>
-            ) : (
-              <>
-                {options.map((path, index) => {
-                  const active = index === activeIndex;
-                  return (
-                    <Pressable
-                      key={path}
-                      style={({ hovered, pressed }) => [
-                        styles.row,
-                        (hovered || pressed || active) && {
-                          backgroundColor: theme.colors.surface1,
-                        },
-                      ]}
-                      onPress={() => void handleSelectPath(path)}
-                    >
-                      <View style={styles.rowContent}>
-                        <View style={styles.iconSlot}>
-                          <Folder
-                            size={16}
-                            strokeWidth={2.2}
-                            color={theme.colors.foregroundMuted}
-                          />
-                        </View>
-                        <Text
-                          style={[styles.rowText, { color: theme.colors.foreground }]}
-                          numberOfLines={1}
-                        >
-                          {shortenPath(path)}
-                        </Text>
-                      </View>
-                    </Pressable>
-                  );
-                })}
-              </>
-            )}
-          </ScrollView>
+          <ProjectPickerResults
+            options={options}
+            activeIndex={activeIndex}
+            isSubmitting={isSubmitting}
+            openErrorMessage={openErrorMessage}
+            hasQuery={hasQuery}
+            isSearching={isSearching}
+            emptyTextStyle={emptyTextStyle}
+            errorTextStyle={errorTextStyle}
+            onSelect={handleSelectPath}
+          />
         </View>
       </View>
     </Modal>
@@ -281,7 +391,7 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: theme.fontSize.lg,
     paddingVertical: theme.spacing[1],
     outlineStyle: "none",
-  } as any,
+  } as object,
   results: {
     flexGrow: 0,
   },
@@ -307,7 +417,12 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: theme.fontSize.base,
     fontWeight: "400",
     lineHeight: 20,
+    flex: 1,
     flexShrink: 1,
+  },
+  rowActionText: {
+    fontSize: theme.fontSize.xs,
+    fontWeight: "500",
   },
   emptyText: {
     paddingHorizontal: theme.spacing[4],

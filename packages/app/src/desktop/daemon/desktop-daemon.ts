@@ -2,8 +2,16 @@ import { getDesktopHost, isElectronRuntime } from "@/desktop/host";
 import { invokeDesktopCommand } from "@/desktop/electron/invoke";
 
 export type DesktopDaemonState = "starting" | "running" | "stopped" | "errored";
+export type DesktopDaemonStopReason =
+  | "manual_ipc"
+  | "settings"
+  | "host_remove"
+  | "quit"
+  | "app_update"
+  | "version_mismatch"
+  | "restart";
 
-export type DesktopDaemonStatus = {
+export interface DesktopDaemonStatus {
   serverId: string;
   status: DesktopDaemonState;
   listen: string | null;
@@ -13,25 +21,26 @@ export type DesktopDaemonStatus = {
   version: string | null;
   desktopManaged: boolean;
   error: string | null;
-};
+}
 
-export type DesktopDaemonLogs = {
+export interface DesktopDaemonLogs {
   logPath: string;
   contents: string;
-};
+}
 
-export type DesktopPairingOffer = {
+export interface DesktopPairingOffer {
   relayEnabled: boolean;
   url: string | null;
   qr: string | null;
-};
+}
 
-export type LocalTransportTarget = {
+export interface LocalTransportTarget {
+  [key: string]: unknown;
   transportType: "socket" | "pipe";
   transportPath: string;
-};
+}
 
-type LocalTransportEventPayload = {
+interface LocalTransportEventPayload {
   sessionId: string;
   kind: "open" | "message" | "close" | "error";
   text?: string | null;
@@ -39,7 +48,7 @@ type LocalTransportEventPayload = {
   code?: number | null;
   reason?: string | null;
   error?: string | null;
-};
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -121,8 +130,10 @@ export async function startDesktopDaemon(): Promise<DesktopDaemonStatus> {
   return parseDesktopDaemonStatus(await invokeDesktopCommand("start_desktop_daemon"));
 }
 
-export async function stopDesktopDaemon(): Promise<DesktopDaemonStatus> {
-  return parseDesktopDaemonStatus(await invokeDesktopCommand("stop_desktop_daemon"));
+export async function stopDesktopDaemon(
+  reason: DesktopDaemonStopReason = "manual_ipc",
+): Promise<DesktopDaemonStatus> {
+  return parseDesktopDaemonStatus(await invokeDesktopCommand("stop_desktop_daemon", { reason }));
 }
 
 export async function restartDesktopDaemon(): Promise<DesktopDaemonStatus> {
@@ -219,10 +230,67 @@ export async function installCli(): Promise<InstallStatus> {
   return parseInstallStatus(await invokeDesktopCommand("install_cli"));
 }
 
-export async function getSkillsInstallStatus(): Promise<InstallStatus> {
-  return parseInstallStatus(await invokeDesktopCommand("get_skills_install_status"));
+export type SkillsState = "not-installed" | "up-to-date" | "drift";
+
+export type SkillOp =
+  | { kind: "add"; name: string }
+  | { kind: "update"; name: string }
+  | { kind: "delete"; name: string };
+
+export interface SkillsStatus {
+  state: SkillsState;
+  ops: SkillOp[];
 }
 
-export async function installSkills(): Promise<InstallStatus> {
-  return parseInstallStatus(await invokeDesktopCommand("install_skills"));
+function parseSkillsState(value: unknown): SkillsState {
+  switch (value) {
+    case "not-installed":
+    case "up-to-date":
+    case "drift":
+      return value;
+    default:
+      throw new Error(`Unexpected skills status state: ${String(value)}`);
+  }
+}
+
+function parseSkillOp(raw: unknown): SkillOp {
+  if (!isRecord(raw)) {
+    throw new Error("Unexpected skill op response.");
+  }
+  const name = toStringOrNull(raw.name);
+  if (!name) throw new Error("Skill op missing name.");
+  switch (raw.kind) {
+    case "add":
+      return { kind: "add", name };
+    case "update":
+      return { kind: "update", name };
+    case "delete":
+      return { kind: "delete", name };
+    default:
+      throw new Error(`Unexpected skill op kind: ${String(raw.kind)}`);
+  }
+}
+
+function parseSkillsStatus(raw: unknown): SkillsStatus {
+  if (!isRecord(raw)) {
+    throw new Error("Unexpected skills status response.");
+  }
+  const ops = Array.isArray(raw.ops) ? raw.ops.map(parseSkillOp) : [];
+  return { state: parseSkillsState(raw.state), ops };
+}
+
+export async function getSkillsStatus(): Promise<SkillsStatus> {
+  return parseSkillsStatus(await invokeDesktopCommand("get_skills_status"));
+}
+
+export async function installSkills(): Promise<SkillsStatus> {
+  return parseSkillsStatus(await invokeDesktopCommand("install_skills"));
+}
+
+export async function updateSkills(): Promise<SkillsStatus> {
+  return parseSkillsStatus(await invokeDesktopCommand("update_skills"));
+}
+
+export async function uninstallSkills(): Promise<SkillsStatus> {
+  return parseSkillsStatus(await invokeDesktopCommand("uninstall_skills"));
 }

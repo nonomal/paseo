@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import WebSocket from "ws";
+import { WebSocket } from "ws";
 import pino from "pino";
 import { Writable } from "node:stream";
 import net from "node:net";
@@ -10,7 +10,17 @@ import { Buffer } from "node:buffer";
 import { generateLocalPairingOffer } from "../pairing-offer.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { createClientChannel, type Transport } from "@getpaseo/relay/e2ee";
-import { buildRelayWebSocketUrl } from "../../shared/daemon-endpoints.js";
+import {
+  deriveSharedKey,
+  decrypt,
+  encrypt,
+  exportPublicKey,
+  generateKeyPair,
+  importPublicKey,
+} from "@getpaseo/relay";
+import { buildRelayWebSocketUrl } from "@getpaseo/protocol/daemon-endpoints";
+import { ConnectionOfferSchema } from "@getpaseo/protocol/connection-offer";
+import { WSOutboundMessageSchema } from "@getpaseo/protocol/messages";
 
 const nodeMajor = Number((process.versions.node ?? "0").split(".")[0] ?? "0");
 const shouldRunRelayE2e = process.env.FORCE_RELAY_E2E === "1" || nodeMajor < 25;
@@ -23,7 +33,7 @@ function createCapturingLogger() {
       cb();
     },
   });
-  const logger = pino({ level: "info" }, stream);
+  const logger = pino({ level: "debug" }, stream);
   return { logger, lines };
 }
 
@@ -59,11 +69,25 @@ function decodeOfferFromFragmentUrl(url: string): {
   }
   const encoded = url.slice(idx + marker.length);
   const json = Buffer.from(encoded, "base64url").toString("utf8");
-  const offer = JSON.parse(json) as { v?: unknown; serverId?: string; daemonPublicKeyB64?: string };
-  if (offer.v !== 2) throw new Error("expected offer.v=2");
-  if (!offer.serverId) throw new Error("offer.serverId missing");
-  if (!offer.daemonPublicKeyB64) throw new Error("offer.daemonPublicKeyB64 missing");
+  const offer = ConnectionOfferSchema.parse(JSON.parse(json));
   return { serverId: offer.serverId, daemonPublicKeyB64: offer.daemonPublicKeyB64 };
+}
+
+function encodeCiphertext(ciphertext: ArrayBuffer): string {
+  return Buffer.from(new Uint8Array(ciphertext)).toString("base64");
+}
+
+function decodeCiphertext(text: string): ArrayBuffer {
+  const buffer = Buffer.from(text, "base64");
+  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+}
+
+function parseEncryptedJson(sharedKey: Uint8Array, text: string): unknown {
+  const plaintext = decrypt(sharedKey, decodeCiphertext(text));
+  if (typeof plaintext !== "string") {
+    throw new Error("Expected encrypted relay frame to contain UTF-8 JSON");
+  }
+  return JSON.parse(plaintext);
 }
 
 async function getAvailablePort(): Promise<number> {
@@ -106,23 +130,30 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
     const serverId = `probe-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const url = buildRelayWebSocketUrl({
       endpoint: `127.0.0.1:${port}`,
+      useTls: false,
       serverId,
       role: "server",
     });
     const opened = await new Promise<boolean>((resolve) => {
+      let pendingResolve: ((value: boolean) => void) | null = resolve;
+      const settle = (value: boolean) => {
+        if (!pendingResolve) return;
+        const fn = pendingResolve;
+        pendingResolve = null;
+        clearTimeout(timer);
+        fn(value);
+      };
       const ws = new WebSocket(url);
       const timer = setTimeout(() => {
         ws.terminate();
-        resolve(false);
+        settle(false);
       }, 5000);
       ws.once("open", () => {
-        clearTimeout(timer);
         ws.close(1000, "probe");
-        resolve(true);
+        settle(true);
       });
       ws.once("error", () => {
-        clearTimeout(timer);
-        resolve(false);
+        settle(false);
       });
     });
     if (opened) {
@@ -136,8 +167,10 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
 (shouldRunRelayE2e ? describe : describe.skip)("Relay transport (E2EE) - daemon E2E", () => {
   let relayPort: number;
   let relayProcess: ChildProcess | null = null;
+  let relayStdoutLines: string[] = [];
 
   const startRelay = async () => {
+    relayStdoutLines = [];
     relayPort = await getAvailablePort();
     const relayDir = path.resolve(process.cwd(), "../relay");
     relayProcess = spawn(
@@ -167,6 +200,7 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
         .split("\n")
         .filter((l) => l.trim());
       for (const line of lines) {
+        relayStdoutLines.push(line);
         // eslint-disable-next-line no-console
         console.log(`[relay] ${line}`);
       }
@@ -219,15 +253,34 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
       const ws = new WebSocket(
         buildRelayWebSocketUrl({
           endpoint: `127.0.0.1:${relayPort}`,
+          useTls: false,
           serverId,
           role: "client",
         }),
       );
 
       const received = await new Promise<unknown>((resolve, reject) => {
+        let pendingResolve: ((value: unknown) => void) | null = resolve;
+        let pendingReject: ((reason: unknown) => void) | null = reject;
+        const settleResolve = (value: unknown) => {
+          if (!pendingResolve) return;
+          const fn = pendingResolve;
+          pendingResolve = null;
+          pendingReject = null;
+          clearTimeout(timeout);
+          fn(value);
+        };
+        const settleReject = (reason: unknown) => {
+          if (!pendingReject) return;
+          const fn = pendingReject;
+          pendingResolve = null;
+          pendingReject = null;
+          clearTimeout(timeout);
+          fn(reason);
+        };
         const timeout = setTimeout(() => {
           ws.close();
-          reject(new Error("timed out waiting for pong"));
+          settleReject(new Error("timed out waiting for pong"));
         }, 20000);
 
         const transport: Transport = {
@@ -256,12 +309,12 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
               onmessage: (data) => {
                 try {
                   const payload = typeof data === "string" ? JSON.parse(data) : data;
+                  const wsMsg = WSOutboundMessageSchema.safeParse(payload);
                   if (
-                    payload &&
-                    typeof payload === "object" &&
-                    (payload as any).type === "session" &&
-                    (payload as any).message?.type === "status" &&
-                    (payload as any).message?.payload?.status === "server_info"
+                    wsMsg.success &&
+                    wsMsg.data.type === "session" &&
+                    wsMsg.data.message.type === "status" &&
+                    wsMsg.data.message.payload?.status === "server_info"
                   ) {
                     if (!pingSent && channelRef) {
                       pingSent = true;
@@ -269,19 +322,16 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
                     }
                     return;
                   }
-                  if (payload && typeof payload === "object" && (payload as any).type === "pong") {
-                    clearTimeout(timeout);
-                    resolve(payload);
+                  if (wsMsg.success && wsMsg.data.type === "pong") {
+                    settleResolve(wsMsg.data);
                     ws.close();
                   }
                 } catch (err) {
-                  clearTimeout(timeout);
-                  reject(err);
+                  settleReject(err);
                 }
               },
               onerror: (err) => {
-                clearTimeout(timeout);
-                reject(err);
+                settleReject(err);
               },
             });
             channelRef = channel;
@@ -294,8 +344,7 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
               }),
             );
           } catch (err) {
-            clearTimeout(timeout);
-            reject(err);
+            settleReject(err);
           }
         });
       });
@@ -345,9 +394,26 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
       );
       expect(handshakeFailures.length).toBe(0);
 
+      // Protocol pings (RFC 6455 control frames) are auto-answered at the Cloudflare edge
+      // without waking the hibernated relay Durable Object. After 12s, the keepalive interval
+      // (10s) must have fired at least once and received a pong. If this assertion fails, the
+      // daemon may have regressed to app-level JSON pings (which wake the DO and cost CPU).
+      const pongLines = lines.filter((l) => l.includes("relay_control_pong_received"));
+      expect(pongLines.length).toBeGreaterThan(0);
+      const staleLines = lines.filter((l) => l.includes("relay_control_stale_terminating"));
+      expect(staleLines.length).toBe(0);
+      // Guard against the dual-ping regression: if a JSON {type:"ping"} reaches the DO during
+      // the idle window, the DO logs `legacy_json_ping_received`. The current daemon code must
+      // not send JSON pings on the control socket — only protocol pings via socket.ping().
+      const legacyPingLines = relayStdoutLines.filter((l) =>
+        l.includes("legacy_json_ping_received"),
+      );
+      expect(legacyPingLines.length).toBe(0);
+
       const ws = new WebSocket(
         buildRelayWebSocketUrl({
           endpoint: `127.0.0.1:${relayPort}`,
+          useTls: false,
           serverId,
           role: "client",
         }),
@@ -385,12 +451,12 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
             const channel = await createClientChannel(transport, daemonPublicKeyB64, {
               onmessage: (data) => {
                 const payload = typeof data === "string" ? JSON.parse(data) : data;
+                const wsMsg = WSOutboundMessageSchema.safeParse(payload);
                 if (
-                  payload &&
-                  typeof payload === "object" &&
-                  (payload as any).type === "session" &&
-                  (payload as any).message?.type === "status" &&
-                  (payload as any).message?.payload?.status === "server_info"
+                  wsMsg.success &&
+                  wsMsg.data.type === "session" &&
+                  wsMsg.data.message.type === "status" &&
+                  wsMsg.data.message.payload?.status === "server_info"
                 ) {
                   if (!pingSent && channelRef) {
                     pingSent = true;
@@ -398,9 +464,9 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
                   }
                   return;
                 }
-                if (payload && typeof payload === "object" && (payload as any).type === "pong") {
+                if (wsMsg.success && wsMsg.data.type === "pong") {
                   clearTimeout(timeout);
-                  resolve(payload);
+                  resolve(wsMsg.data);
                   ws.close();
                 }
               },
@@ -426,6 +492,146 @@ async function waitForRelayWebSocketReady(port: number, timeout = 60000): Promis
       });
 
       expect(received).toEqual({ type: "pong" });
+    } catch (err) {
+      const tail = lines.slice(-50).join("");
+      // eslint-disable-next-line no-console
+      console.error("daemon logs (tail):\n", tail);
+      throw err;
+    } finally {
+      await daemon.close();
+      await stopRelay();
+    }
+  }, 90000);
+
+  test("daemon accepts a relay client that pipelines app hello after E2EE hello", async () => {
+    process.env.PASEO_PRIMARY_LAN_IP = "192.168.1.12";
+
+    const { logger, lines } = createCapturingLogger();
+    await startRelay();
+
+    const daemon = await createTestPaseoDaemon({
+      listen: "127.0.0.1",
+      logger,
+      relayEnabled: true,
+      relayEndpoint: `127.0.0.1:${relayPort}`,
+    });
+
+    try {
+      const offerUrl = await getPairingOfferUrl({
+        paseoHome: daemon.paseoHome,
+        relayEnabled: daemon.config.relayEnabled,
+        relayEndpoint: daemon.config.relayEndpoint,
+        relayPublicEndpoint: daemon.config.relayPublicEndpoint,
+        appBaseUrl: daemon.config.appBaseUrl,
+      });
+      const { serverId, daemonPublicKeyB64 } = decodeOfferFromFragmentUrl(offerUrl);
+      const clientKeyPair = generateKeyPair();
+      const sharedKey = deriveSharedKey(
+        clientKeyPair.secretKey,
+        importPublicKey(daemonPublicKeyB64),
+      );
+
+      const ws = new WebSocket(
+        buildRelayWebSocketUrl({
+          endpoint: `127.0.0.1:${relayPort}`,
+          useTls: false,
+          serverId,
+          role: "client",
+        }),
+      );
+
+      const received = await new Promise<unknown>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          ws.close();
+          reject(new Error("timed out waiting for server_info"));
+        }, 20000);
+
+        const settleResolve = (value: unknown) => {
+          clearTimeout(timeout);
+          resolve(value);
+          ws.close();
+        };
+        const settleReject = (reason: unknown) => {
+          clearTimeout(timeout);
+          reject(reason);
+          ws.close();
+        };
+
+        ws.on("open", () => {
+          ws.send(
+            JSON.stringify({
+              type: "e2ee_hello",
+              key: exportPublicKey(clientKeyPair.publicKey),
+            }),
+          );
+          ws.send(
+            encodeCiphertext(
+              encrypt(
+                sharedKey,
+                JSON.stringify({
+                  type: "hello",
+                  clientId: "cid_relay_pipelined_hello",
+                  clientType: "cli",
+                  protocolVersion: 1,
+                }),
+              ),
+            ),
+          );
+        });
+
+        ws.on("message", (data) => {
+          try {
+            const text = typeof data === "string" ? data : data.toString();
+            const maybePlaintext = JSON.parse(text) as unknown;
+            if (
+              maybePlaintext &&
+              typeof maybePlaintext === "object" &&
+              "type" in maybePlaintext &&
+              maybePlaintext.type === "e2ee_ready"
+            ) {
+              return;
+            }
+          } catch {
+            // encrypted frame; parse below
+          }
+
+          try {
+            const parsed = WSOutboundMessageSchema.parse(
+              parseEncryptedJson(sharedKey, data.toString()),
+            );
+            if (
+              parsed.type === "session" &&
+              parsed.message.type === "status" &&
+              parsed.message.payload?.status === "server_info"
+            ) {
+              settleResolve({
+                type: parsed.type,
+                message: {
+                  type: parsed.message.type,
+                  payload: { status: parsed.message.payload.status },
+                },
+              });
+            }
+          } catch (error) {
+            settleReject(error);
+          }
+        });
+
+        ws.on("close", (code, reason) => {
+          settleReject(new Error(`relay client closed before server_info: ${code} ${reason}`));
+        });
+        ws.on("error", (err) => {
+          settleReject(err);
+        });
+      });
+
+      expect(received).toEqual({
+        type: "session",
+        message: {
+          type: "status",
+          payload: { status: "server_info" },
+        },
+      });
     } catch (err) {
       const tail = lines.slice(-50).join("");
       // eslint-disable-next-line no-console

@@ -6,18 +6,23 @@ import {
   RefreshControl,
   FlatList,
   type ListRenderItem,
+  type PressableStateCallbackType,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useCallback, useMemo, useState, type ReactElement } from "react";
-import { router } from "expo-router";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { formatTimeAgo } from "@/utils/time";
-import { shortenPath } from "@/utils/shorten-path";
 import { type AggregatedAgent } from "@/hooks/use-aggregated-agents";
 import { useSessionStore } from "@/stores/session-store";
-import { Archive } from "lucide-react-native";
-import { prepareWorkspaceTab } from "@/utils/workspace-navigation";
+import { Archive, ChevronRight } from "lucide-react-native";
+import { getProviderIcon } from "@/components/provider-icons";
+import { navigateToAgent } from "@/utils/navigate-to-agent";
+import { useArchiveAgent } from "@/hooks/use-archive-agent";
+import { useQueryClient } from "@tanstack/react-query";
+import { agentHistoryQueryKey } from "@/hooks/agent-history-query-key";
 
 interface AgentListProps {
   agents: AggregatedAgent[];
@@ -28,13 +33,24 @@ interface AgentListProps {
   onAgentSelect?: () => void;
   listFooterComponent?: ReactElement | null;
   showAttentionIndicator?: boolean;
+  showHostColumn?: boolean;
 }
 
+type DateSectionKey = "today" | "yesterday" | "thisWeek" | "thisMonth" | "older";
+
+const DATE_SECTION_ORDER = [
+  "today",
+  "yesterday",
+  "thisWeek",
+  "thisMonth",
+  "older",
+] as const satisfies readonly DateSectionKey[];
+
 type FlatListItem =
-  | { type: "header"; key: string; title: string }
+  | { type: "header"; key: string; section: DateSectionKey }
   | { type: "agent"; key: string; agent: AggregatedAgent };
 
-function deriveDateSectionLabel(lastActivityAt: Date): string {
+function deriveDateSectionKey(lastActivityAt: Date): DateSectionKey {
   const now = new Date();
   const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
@@ -45,37 +61,35 @@ function deriveDateSectionLabel(lastActivityAt: Date): string {
   );
 
   if (activityStart.getTime() >= todayStart.getTime()) {
-    return "Today";
+    return "today";
   }
   if (activityStart.getTime() >= yesterdayStart.getTime()) {
-    return "Yesterday";
+    return "yesterday";
   }
 
   const diffTime = todayStart.getTime() - activityStart.getTime();
   const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
   if (diffDays <= 7) {
-    return "This week";
+    return "thisWeek";
   }
   if (diffDays <= 30) {
-    return "This month";
+    return "thisMonth";
   }
-  return "Older";
+  return "older";
 }
 
-function formatStatusLabel(status: AggregatedAgent["status"]): string {
-  switch (status) {
-    case "initializing":
-      return "Starting";
-    case "idle":
-      return "Idle";
-    case "running":
-      return "Running";
-    case "error":
-      return "Error";
-    case "closed":
-      return "Closed";
-    default:
-      return status;
+function formatDateSectionLabel(t: TFunction, section: DateSectionKey): string {
+  switch (section) {
+    case "today":
+      return t("agentList.dateSections.today");
+    case "yesterday":
+      return t("agentList.dateSections.yesterday");
+    case "thisWeek":
+      return t("agentList.dateSections.thisWeek");
+    case "thisMonth":
+      return t("agentList.dateSections.thisMonth");
+    case "older":
+      return t("agentList.dateSections.older");
   }
 }
 
@@ -88,24 +102,103 @@ function SessionBadge({
   icon?: ReactElement;
   tone?: "neutral" | "warning" | "danger";
 }) {
+  const badgeStyle = useMemo(
+    () => [
+      styles.badge,
+      tone === "warning" && styles.badgeWarning,
+      tone === "danger" && styles.badgeDanger,
+    ],
+    [tone],
+  );
+  const badgeTextStyle = useMemo(
+    () => [
+      styles.badgeText,
+      tone === "warning" && styles.badgeTextWarning,
+      tone === "danger" && styles.badgeTextDanger,
+    ],
+    [tone],
+  );
   return (
-    <View
-      style={[
-        styles.badge,
-        tone === "warning" && styles.badgeWarning,
-        tone === "danger" && styles.badgeDanger,
-      ]}
-    >
+    <View style={badgeStyle}>
       {icon}
-      <Text
-        style={[
-          styles.badgeText,
-          tone === "warning" && styles.badgeTextWarning,
-          tone === "danger" && styles.badgeTextDanger,
-        ]}
-      >
-        {label}
+      <Text style={badgeTextStyle}>{label}</Text>
+    </View>
+  );
+}
+
+function WorkspaceTitlePrefix({
+  visible,
+  workspaceName,
+  testID,
+  iconSize,
+  color,
+}: {
+  visible: boolean;
+  workspaceName: string;
+  testID: string;
+  iconSize: number;
+  color: string;
+}) {
+  if (!visible) {
+    return null;
+  }
+
+  return (
+    <>
+      <Text style={styles.workspaceTitleText} numberOfLines={1} testID={testID}>
+        {workspaceName}
       </Text>
+      <ChevronRight size={iconSize} color={color} />
+    </>
+  );
+}
+
+function SessionRowBadges({
+  agent,
+  archivedIcon,
+  pendingPermissionCount,
+  showDesktopAttention,
+}: {
+  agent: AggregatedAgent;
+  archivedIcon: ReactElement;
+  pendingPermissionCount: number;
+  showDesktopAttention: boolean;
+}) {
+  const { t } = useTranslation();
+  return (
+    <>
+      {agent.archivedAt ? (
+        <SessionBadge label={t("agentList.badges.archived")} icon={archivedIcon} />
+      ) : null}
+      {pendingPermissionCount > 0 ? (
+        <SessionBadge
+          label={t("agentList.badges.pending", { count: pendingPermissionCount })}
+          tone="warning"
+        />
+      ) : null}
+      {showDesktopAttention ? (
+        <SessionBadge label={t("agentList.badges.attention")} tone="danger" />
+      ) : null}
+    </>
+  );
+}
+
+function SessionRowTrailingAttention({
+  isMobile,
+  showAttentionIndicator,
+  requiresAttention,
+}: {
+  isMobile: boolean;
+  showAttentionIndicator: boolean;
+  requiresAttention: boolean | undefined;
+}) {
+  const { t } = useTranslation();
+  if (!isMobile || !showAttentionIndicator || !requiresAttention) {
+    return null;
+  }
+  return (
+    <View style={styles.rowTrailing}>
+      <SessionBadge label={t("agentList.badges.attention")} tone="danger" />
     </View>
   );
 }
@@ -115,6 +208,7 @@ function SessionRow({
   isMobile,
   selectedAgentId,
   showAttentionIndicator,
+  showHostColumn,
   onPress,
   onLongPress,
 }: {
@@ -122,59 +216,103 @@ function SessionRow({
   isMobile: boolean;
   selectedAgentId?: string;
   showAttentionIndicator: boolean;
+  showHostColumn: boolean;
   onPress: (agent: AggregatedAgent) => void;
   onLongPress: (agent: AggregatedAgent) => void;
 }) {
   const { theme } = useUnistyles();
+  const { t } = useTranslation();
   const timeAgo = formatTimeAgo(agent.lastActivityAt);
   const agentKey = `${agent.serverId}:${agent.id}`;
   const isSelected = selectedAgentId === agentKey;
-  const statusLabel = formatStatusLabel(agent.status);
-  const projectPath = shortenPath(agent.cwd);
+  const projectName = agent.projectPlacement?.projectName ?? "";
+  const branch = agent.projectPlacement?.checkout.currentBranch ?? "";
+  const workspaceName = agent.projectPlacement?.workspaceName ?? "";
+  const ProviderIcon = getProviderIcon(agent.provider);
+  const pendingPermissionCount = agent.pendingPermissionCount ?? 0;
+
+  const pressableStyle = useCallback(
+    ({ pressed, hovered = false }: PressableStateCallbackType & { hovered?: boolean }) => [
+      styles.row,
+      isSelected && styles.rowSelected,
+      Boolean(hovered) && styles.rowHovered,
+      pressed && styles.rowPressed,
+    ],
+    [isSelected],
+  );
+
+  const handlePress = useCallback(() => onPress(agent), [onPress, agent]);
+  const handleLongPress = useCallback(() => onLongPress(agent), [onLongPress, agent]);
+
+  const sessionTitleStyle = useMemo(
+    () => [styles.sessionTitle, isSelected && styles.sessionTitleHighlighted],
+    [isSelected],
+  );
+
+  const archivedIcon = useMemo(
+    () => <Archive size={theme.fontSize.xs} color={theme.colors.foregroundMuted} />,
+    [theme.fontSize.xs, theme.colors.foregroundMuted],
+  );
+  const showDesktopAttention =
+    !isMobile && showAttentionIndicator && Boolean(agent.requiresAttention);
 
   return (
     <Pressable
-      style={({ pressed, hovered }) => [
-        styles.row,
-        isSelected && styles.rowSelected,
-        hovered && styles.rowHovered,
-        pressed && styles.rowPressed,
-      ]}
-      onPress={() => onPress(agent)}
-      onLongPress={() => onLongPress(agent)}
+      style={pressableStyle}
+      onPress={handlePress}
+      onLongPress={handleLongPress}
       testID={`agent-row-${agent.serverId}-${agent.id}`}
     >
       <View style={styles.rowContent}>
         <View style={styles.rowTitleRow}>
-          <Text
-            style={[styles.sessionTitle, isSelected && styles.sessionTitleHighlighted]}
-            numberOfLines={1}
-          >
-            {agent.title || "New session"}
+          <WorkspaceTitlePrefix
+            visible={!isMobile && Boolean(workspaceName)}
+            workspaceName={workspaceName}
+            testID={`agent-row-workspace-${agent.serverId}-${agent.id}`}
+            iconSize={theme.iconSize.xs}
+            color={theme.colors.foregroundMuted}
+          />
+          <View style={styles.providerIconWrap}>
+            <ProviderIcon size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
+          </View>
+          <Text style={sessionTitleStyle} numberOfLines={1}>
+            {agent.title || t("agentList.fallbackTitle")}
           </Text>
-          {agent.archivedAt ? (
-            <SessionBadge
-              label="Archived"
-              icon={<Archive size={theme.fontSize.xs} color={theme.colors.foregroundMuted} />}
-            />
-          ) : null}
-          {(agent.pendingPermissionCount ?? 0) > 0 ? (
-            <SessionBadge label={`${agent.pendingPermissionCount} pending`} tone="warning" />
-          ) : null}
-          {!isMobile && showAttentionIndicator && agent.requiresAttention ? (
-            <SessionBadge label="Attention" tone="danger" />
-          ) : null}
+          <SessionRowBadges
+            agent={agent}
+            archivedIcon={archivedIcon}
+            pendingPermissionCount={pendingPermissionCount}
+            showDesktopAttention={showDesktopAttention}
+          />
         </View>
-        {isMobile && (
+        {isMobile ? (
           <View style={styles.rowMetaRow}>
-            <Text style={styles.sessionMetaText} numberOfLines={1}>
-              {projectPath}
+            <Text
+              style={styles.sessionMetaText}
+              numberOfLines={1}
+              testID={`agent-row-project-${agent.serverId}-${agent.id}`}
+            >
+              {projectName}
             </Text>
             <Text style={styles.sessionMetaSeparator}>·</Text>
-            <Text style={styles.sessionMetaText}>{statusLabel}</Text>
+            <Text
+              style={styles.sessionMetaText}
+              numberOfLines={1}
+              testID={`agent-row-branch-${agent.serverId}-${agent.id}`}
+            >
+              {branch}
+            </Text>
+            <Text style={styles.sessionMetaSeparator}>·</Text>
+            <Text
+              style={styles.sessionMetaText}
+              numberOfLines={1}
+              testID={`agent-row-workspace-${agent.serverId}-${agent.id}`}
+            >
+              {workspaceName}
+            </Text>
             <Text style={styles.sessionMetaSeparator}>·</Text>
             <Text style={styles.sessionMetaText}>{timeAgo}</Text>
-            {agent.serverLabel ? (
+            {showHostColumn && agent.serverLabel ? (
               <>
                 <Text style={styles.sessionMetaSeparator}>·</Text>
                 <Text style={styles.sessionMetaText} numberOfLines={1}>
@@ -183,22 +321,39 @@ function SessionRow({
               </>
             ) : null}
           </View>
-        )}
+        ) : null}
       </View>
-      {!isMobile && (
-        <>
-          <Text style={styles.columnMeta} numberOfLines={1}>
-            {projectPath}
+      {!isMobile ? (
+        <View style={styles.rowColumns}>
+          <Text
+            style={styles.columnMeta}
+            numberOfLines={1}
+            testID={`agent-row-project-${agent.serverId}-${agent.id}`}
+          >
+            {projectName}
           </Text>
-          <Text style={styles.columnMetaFixed}>{statusLabel}</Text>
-          <Text style={styles.columnMetaFixed}>{timeAgo}</Text>
-        </>
-      )}
-      {isMobile && showAttentionIndicator && agent.requiresAttention ? (
-        <View style={styles.rowTrailing}>
-          <SessionBadge label="Attention" tone="danger" />
+          {showHostColumn ? (
+            <Text style={styles.columnMetaHost} numberOfLines={1}>
+              {agent.serverLabel}
+            </Text>
+          ) : null}
+          <Text
+            style={styles.columnMeta}
+            numberOfLines={1}
+            testID={`agent-row-branch-${agent.serverId}-${agent.id}`}
+          >
+            {branch}
+          </Text>
+          <Text style={styles.columnMetaFixed} numberOfLines={1}>
+            {timeAgo}
+          </Text>
         </View>
       ) : null}
+      <SessionRowTrailingAttention
+        isMobile={isMobile}
+        showAttentionIndicator={showAttentionIndicator}
+        requiresAttention={agent.requiresAttention}
+      />
     </Pressable>
   );
 }
@@ -211,11 +366,15 @@ export function AgentList({
   onAgentSelect,
   listFooterComponent,
   showAttentionIndicator = true,
+  showHostColumn = false,
 }: AgentListProps) {
   const { theme } = useUnistyles();
+  const { t } = useTranslation();
   const insets = useSafeAreaInsets();
   const [actionAgent, setActionAgent] = useState<AggregatedAgent | null>(null);
   const isMobile = useIsCompactFormFactor();
+  const { archiveAgent } = useArchiveAgent();
+  const queryClient = useQueryClient();
 
   const actionClient = useSessionStore((state) =>
     actionAgent?.serverId ? (state.sessions[actionAgent.serverId]?.client ?? null) : null,
@@ -232,23 +391,54 @@ export function AgentList({
 
       const serverId = agent.serverId;
       const agentId = agent.id;
+      const openAgent = () => {
+        onAgentSelect?.();
+        navigateToAgent({
+          serverId,
+          agentId,
+          workspaceId: agent.workspaceId,
+          pin: false,
+        });
+      };
 
-      onAgentSelect?.();
+      if (agent.archivedAt) {
+        const client = useSessionStore.getState().sessions[serverId]?.client ?? null;
+        if (client) {
+          void client
+            .refreshAgent(agentId)
+            .then(() => {
+              openAgent();
+              return queryClient.invalidateQueries({
+                queryKey: agentHistoryQueryKey(serverId),
+              });
+            })
+            .catch(() => {});
+        }
+        return;
+      }
 
-      const route = prepareWorkspaceTab({
-        serverId,
-        workspaceId: agent.cwd,
-        target: { kind: "agent", agentId },
-        pin: Boolean(agent.archivedAt),
-      });
-      router.navigate(route);
+      openAgent();
     },
-    [isActionSheetVisible, onAgentSelect],
+    [isActionSheetVisible, onAgentSelect, queryClient],
   );
 
-  const handleAgentLongPress = useCallback((agent: AggregatedAgent) => {
-    setActionAgent(agent);
-  }, []);
+  const handleAgentLongPress = useCallback(
+    (agent: AggregatedAgent) => {
+      const isRunning = agent.status === "running";
+      if (isRunning) {
+        setActionAgent(agent);
+        return;
+      }
+
+      const client = useSessionStore.getState().sessions[agent.serverId]?.client ?? null;
+      if (!client) {
+        setActionAgent(agent);
+        return;
+      }
+      void archiveAgent({ serverId: agent.serverId, agentId: agent.id }).catch(() => {});
+    },
+    [archiveAgent],
+  );
 
   const handleCloseActionSheet = useCallback(() => {
     setActionAgent(null);
@@ -259,27 +449,26 @@ export function AgentList({
       return;
     }
     // Timeout errors are swallowed — the daemon will still process the archive
-    void actionClient.archiveAgent(actionAgent.id).catch(() => {});
+    void archiveAgent({ serverId: actionAgent.serverId, agentId: actionAgent.id }).catch(() => {});
     setActionAgent(null);
-  }, [actionAgent, actionClient]);
+  }, [actionAgent, actionClient, archiveAgent]);
 
   const flatItems = useMemo((): FlatListItem[] => {
-    const order = ["Today", "Yesterday", "This week", "This month", "Older"] as const;
-    const buckets = new Map<string, AggregatedAgent[]>();
+    const buckets = new Map<DateSectionKey, AggregatedAgent[]>();
     for (const agent of agents) {
-      const label = deriveDateSectionLabel(agent.lastActivityAt);
-      const existing = buckets.get(label) ?? [];
+      const section = deriveDateSectionKey(agent.lastActivityAt);
+      const existing = buckets.get(section) ?? [];
       existing.push(agent);
-      buckets.set(label, existing);
+      buckets.set(section, existing);
     }
 
     const result: FlatListItem[] = [];
-    for (const label of order) {
-      const data = buckets.get(label);
+    for (const section of DATE_SECTION_ORDER) {
+      const data = buckets.get(section);
       if (!data || data.length === 0) {
         continue;
       }
-      result.push({ type: "header", key: `header:${label}`, title: label });
+      result.push({ type: "header", key: `header:${section}`, section });
       for (const agent of data) {
         result.push({ type: "agent", key: `${agent.serverId}:${agent.id}`, agent });
       }
@@ -292,7 +481,7 @@ export function AgentList({
       if (item.type === "header") {
         return (
           <View style={styles.sectionHeading}>
-            <Text style={styles.sectionTitle}>{item.title}</Text>
+            <Text style={styles.sectionTitle}>{formatDateSectionLabel(t, item.section)}</Text>
           </View>
         );
       }
@@ -302,15 +491,50 @@ export function AgentList({
           isMobile={isMobile}
           selectedAgentId={selectedAgentId}
           showAttentionIndicator={showAttentionIndicator}
+          showHostColumn={showHostColumn}
           onPress={handleAgentPress}
           onLongPress={handleAgentLongPress}
         />
       );
     },
-    [handleAgentLongPress, handleAgentPress, isMobile, selectedAgentId, showAttentionIndicator],
+    [
+      handleAgentLongPress,
+      handleAgentPress,
+      isMobile,
+      selectedAgentId,
+      showAttentionIndicator,
+      showHostColumn,
+      t,
+    ],
   );
 
   const keyExtractor = useCallback((item: FlatListItem) => item.key, []);
+
+  const refreshColors = useMemo(
+    () => [theme.colors.foregroundMuted],
+    [theme.colors.foregroundMuted],
+  );
+  const sheetContainerStyle = useMemo(
+    () => [styles.sheetContainer, { paddingBottom: Math.max(insets.bottom, theme.spacing[6]) }],
+    [insets.bottom, theme.spacing],
+  );
+  const sheetArchiveTextStyle = useMemo(
+    () => [styles.sheetArchiveText, isActionDaemonUnavailable && styles.sheetArchiveTextDisabled],
+    [isActionDaemonUnavailable],
+  );
+
+  const refreshControl = useMemo(
+    () =>
+      onRefresh ? (
+        <RefreshControl
+          refreshing={isRefreshing}
+          onRefresh={onRefresh}
+          tintColor={theme.colors.foregroundMuted}
+          colors={refreshColors}
+        />
+      ) : undefined,
+    [onRefresh, isRefreshing, theme.colors.foregroundMuted, refreshColors],
+  );
 
   return (
     <>
@@ -323,16 +547,7 @@ export function AgentList({
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
         ListFooterComponent={listFooterComponent}
-        refreshControl={
-          onRefresh ? (
-            <RefreshControl
-              refreshing={isRefreshing}
-              onRefresh={onRefresh}
-              tintColor={theme.colors.foregroundMuted}
-              colors={[theme.colors.foregroundMuted]}
-            />
-          ) : undefined
-        }
+        refreshControl={refreshControl}
       />
 
       <Modal
@@ -343,38 +558,28 @@ export function AgentList({
       >
         <View style={styles.sheetOverlay}>
           <Pressable style={styles.sheetBackdrop} onPress={handleCloseActionSheet} />
-          <View
-            style={[
-              styles.sheetContainer,
-              { paddingBottom: Math.max(insets.bottom, theme.spacing[6]) },
-            ]}
-          >
+          <View style={sheetContainerStyle}>
             <View style={styles.sheetHandle} />
             <Text style={styles.sheetTitle}>
-              {isActionDaemonUnavailable ? "Host offline" : "Archive this session?"}
+              {isActionDaemonUnavailable
+                ? t("agentList.archiveSheet.hostOffline")
+                : t("agentList.archiveSheet.runningAgent")}
             </Text>
             <View style={styles.sheetButtonRow}>
               <Pressable
-                style={[styles.sheetButton, styles.sheetCancelButton]}
+                style={SHEET_CANCEL_BUTTON_STYLE}
                 onPress={handleCloseActionSheet}
                 testID="agent-action-cancel"
               >
-                <Text style={styles.sheetCancelText}>Cancel</Text>
+                <Text style={styles.sheetCancelText}>{t("common.actions.cancel")}</Text>
               </Pressable>
               <Pressable
                 disabled={isActionDaemonUnavailable}
-                style={[styles.sheetButton, styles.sheetArchiveButton]}
+                style={SHEET_ARCHIVE_BUTTON_STYLE}
                 onPress={handleArchiveAgent}
                 testID="agent-action-archive"
               >
-                <Text
-                  style={[
-                    styles.sheetArchiveText,
-                    isActionDaemonUnavailable && styles.sheetArchiveTextDisabled,
-                  ]}
-                >
-                  Archive
-                </Text>
+                <Text style={sheetArchiveTextStyle}>{t("agentList.archiveSheet.archive")}</Text>
               </Pressable>
             </View>
           </View>
@@ -428,12 +633,25 @@ const styles = StyleSheet.create((theme) => ({
   rowContent: {
     flex: 1,
     minWidth: 0,
+    overflow: "hidden",
   },
   rowTitleRow: {
     flexDirection: "row",
     alignItems: "center",
-    flexWrap: "wrap",
+    flexWrap: "nowrap",
     gap: theme.spacing[2],
+    overflow: "hidden",
+  },
+  providerIconWrap: {
+    width: theme.iconSize.md,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  workspaceTitleText: {
+    flexShrink: 0,
+    maxWidth: 220,
+    fontSize: theme.fontSize.sm,
+    color: theme.colors.foregroundMuted,
   },
   rowMetaRow: {
     flexDirection: "row",
@@ -456,6 +674,7 @@ const styles = StyleSheet.create((theme) => ({
   },
   sessionTitle: {
     flexShrink: 1,
+    minWidth: 0,
     fontSize: theme.fontSize.sm,
     fontWeight: "400",
     color: theme.colors.foreground,
@@ -474,13 +693,17 @@ const styles = StyleSheet.create((theme) => ({
     color: theme.colors.foregroundMuted,
     opacity: 0.7,
   },
+  rowColumns: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexShrink: 0,
+    gap: theme.spacing[3],
+  },
   columnMeta: {
     fontSize: theme.fontSize.sm,
     color: theme.colors.foregroundMuted,
-    flexShrink: 1,
-    minWidth: 60,
-    maxWidth: 200,
-    marginLeft: theme.spacing[4],
+    flexShrink: 0,
+    width: 132,
   },
   columnMetaFixed: {
     fontSize: theme.fontSize.sm,
@@ -489,9 +712,18 @@ const styles = StyleSheet.create((theme) => ({
     width: 72,
     textAlign: "right" as const,
   },
+  columnMetaHost: {
+    fontSize: theme.fontSize.sm,
+    color: theme.colors.foregroundMuted,
+    flexShrink: 0,
+    width: 120,
+    marginLeft: theme.spacing[4],
+    textAlign: "right" as const,
+  },
   badge: {
     flexDirection: "row",
     alignItems: "center",
+    flexShrink: 0,
     gap: theme.spacing[1],
     paddingHorizontal: theme.spacing[2],
     paddingVertical: theme.spacing[1],
@@ -580,3 +812,6 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: theme.fontSize.base,
   },
 }));
+
+const SHEET_CANCEL_BUTTON_STYLE = [styles.sheetButton, styles.sheetCancelButton];
+const SHEET_ARCHIVE_BUTTON_STYLE = [styles.sheetButton, styles.sheetArchiveButton];

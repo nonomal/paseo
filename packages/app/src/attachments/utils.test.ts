@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { pathToFileUri } from "./utils";
+import {
+  createImageSourceCacheKey,
+  fileUriToPath,
+  localFileSourceToPath,
+  parseDataUrl,
+  parseImageDataUrl,
+  pathToFileUri,
+} from "./utils";
 
 describe("pathToFileUri", () => {
   it("converts POSIX absolute paths to file URIs", () => {
@@ -20,5 +27,59 @@ describe("pathToFileUri", () => {
 
   it("passes through relative paths unchanged", () => {
     expect(pathToFileUri("relative/path")).toBe("relative/path");
+  });
+});
+
+describe("fileUriToPath", () => {
+  it("converts Windows drive-letter file URIs back to paths", () => {
+    expect(fileUriToPath("file:///C:/Users/file.txt")).toBe("C:/Users/file.txt");
+  });
+});
+
+describe("localFileSourceToPath", () => {
+  it("decodes markdown-encoded Windows drive-letter paths", () => {
+    expect(localFileSourceToPath("C:%5CUsers%5Cfile.txt")).toBe("C:/Users/file.txt");
+  });
+
+  it("preserves literal percent sequences in plain local paths", () => {
+    expect(localFileSourceToPath("/tmp/image%20with%20literal%20percent.png")).toBe(
+      "/tmp/image%20with%20literal%20percent.png",
+    );
+  });
+});
+
+describe("parseDataUrl", () => {
+  it("accepts base64 data URLs with media-type parameters", () => {
+    expect(parseDataUrl("data:image/png;charset=utf-8;name=preview;base64,AAECAw==")).toEqual({
+      mimeType: "image/png",
+      base64: "AAECAw==",
+    });
+  });
+
+  it("rejects non-base64 data URLs", () => {
+    expect(() => parseDataUrl("data:image/png,not-base64")).toThrow(
+      "Attachment data URL is not base64 encoded.",
+    );
+  });
+});
+
+describe("parseImageDataUrl", () => {
+  it("returns a compact cache key for image data URLs", () => {
+    const dataUrl = `data:image/png;base64,${"a".repeat(512)}`;
+
+    expect(parseImageDataUrl(dataUrl)).toMatchObject({
+      mimeType: "image/png",
+      base64: "a".repeat(512),
+    });
+    expect(createImageSourceCacheKey(dataUrl)).toMatch(/^data-image:image\/png:512:/);
+    expect(createImageSourceCacheKey(dataUrl)).not.toContain("a".repeat(128));
+  });
+
+  it("ignores non-image data URLs", () => {
+    expect(parseImageDataUrl("data:text/plain;base64,SGVsbG8=")).toBeNull();
+  });
+
+  it("ignores SVG data URLs", () => {
+    expect(parseImageDataUrl("data:image/svg+xml;base64,PHN2ZyAvPg==")).toBeNull();
   });
 });

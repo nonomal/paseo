@@ -1,45 +1,53 @@
-import { router } from "expo-router";
 import { useCallback } from "react";
-import { useToast } from "@/contexts/toast-context";
-import { useHostRuntimeClient } from "@/runtime/host-runtime";
-import { normalizeWorkspaceDescriptor, useSessionStore } from "@/stores/session-store";
-import { prepareWorkspaceTab } from "@/utils/workspace-navigation";
+import { useQueryClient } from "@tanstack/react-query";
+import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
+import { projectsQueryKey } from "@/hooks/use-projects";
+import { useSessionStore } from "@/stores/session-store";
+import { openProjectDirectly, type OpenProjectResult } from "@/hooks/open-project";
 
-export function useOpenProject(serverId: string | null): (path: string) => Promise<boolean> {
+export function useOpenProject(
+  serverId: string | null,
+): (path: string) => Promise<OpenProjectResult> {
   const normalizedServerId = serverId?.trim() ?? "";
-  const toast = useToast();
   const client = useHostRuntimeClient(normalizedServerId);
-  const mergeWorkspaces = useSessionStore((state) => state.mergeWorkspaces);
+  const isConnected = useHostRuntimeIsConnected(normalizedServerId);
+  const queryClient = useQueryClient();
+  const canAddProject = useSessionStore((state) =>
+    normalizedServerId
+      ? state.sessions[normalizedServerId]?.serverInfo?.features?.projectAdd === true
+      : false,
+  );
+  const addEmptyProject = useSessionStore((state) => state.addEmptyProject);
   const setHasHydratedWorkspaces = useSessionStore((state) => state.setHasHydratedWorkspaces);
 
   return useCallback(
     async (path: string) => {
-      const trimmedPath = path.trim();
-      if (!trimmedPath || !client || !normalizedServerId) {
-        return false;
+      const result = await openProjectDirectly({
+        serverId: normalizedServerId,
+        projectPath: path,
+        isConnected,
+        canAddProject,
+        client,
+        addEmptyProject,
+        setHasHydratedWorkspaces,
+      });
+      // The aggregated projects query derives the project list from a fetch
+      // that now includes empty projects; refetch so a freshly-added project
+      // (no workspace yet) is immediately editable instead of only after a
+      // restart.
+      if (result.ok) {
+        void queryClient.invalidateQueries({ queryKey: projectsQueryKey });
       }
-
-      try {
-        const payload = await client.openProject(trimmedPath);
-        if (payload.error || !payload.workspace) {
-          throw new Error(payload.error || "Failed to open project");
-        }
-
-        mergeWorkspaces(normalizedServerId, [normalizeWorkspaceDescriptor(payload.workspace)]);
-        setHasHydratedWorkspaces(normalizedServerId, true);
-        router.replace(
-          prepareWorkspaceTab({
-            serverId: normalizedServerId,
-            workspaceId: payload.workspace.id,
-            target: { kind: "draft", draftId: "new" },
-          }) as any,
-        );
-        return true;
-      } catch (error) {
-        toast.error(error instanceof Error ? error.message : "Failed to open project");
-        return false;
-      }
+      return result;
     },
-    [client, mergeWorkspaces, normalizedServerId, setHasHydratedWorkspaces, toast],
+    [
+      addEmptyProject,
+      canAddProject,
+      client,
+      isConnected,
+      normalizedServerId,
+      queryClient,
+      setHasHydratedWorkspaces,
+    ],
   );
 }

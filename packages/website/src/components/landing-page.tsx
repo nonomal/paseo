@@ -5,10 +5,32 @@ import {
   useInView,
   useScroll,
   useTransform,
-  useMotionValueEvent,
+  type Transition,
 } from "framer-motion";
+
+// Shared motion presets — hoisted so every JSX site receives the same object
+// reference and doesn't trigger jsx-no-new-object-as-prop.
+const FADE_IN_UP = { opacity: 0, y: 20 };
+const FADE_IN = { opacity: 1, y: 0 };
+const FADE_IN_UP_TINY = { opacity: 0, y: -10 };
+const FADE_IN_UP_XL = { opacity: 0, y: 30 };
+const FADE_IN_UP_40 = { opacity: 0, y: 40 };
+const FADE_IN_UP_4 = { opacity: 0, y: 4 };
+const FADE_OUT_UP_4 = { opacity: 0, y: 4 };
+
+const EASE_OUT_06_DELAY_01: Transition = { duration: 0.6, delay: 0.1, ease: "easeOut" };
+const EASE_OUT_08_DELAY_05: Transition = { duration: 0.8, delay: 0.5, ease: "easeOut" };
+const EASE_OUT_05: Transition = { duration: 0.5, ease: "easeOut" };
+const EASE_OUT_015: Transition = { duration: 0.15, ease: "easeOut" };
+const DURATION_05: Transition = { duration: 0.5 };
+
+const VIEWPORT_60 = { once: true, margin: "-60px" };
+
+const SVG_OVERFLOW_VISIBLE_STYLE = { overflow: "visible" as const };
+const PHONE_PERSPECTIVE_STYLE = { minHeight: 480, perspective: 1200 };
 import { CursorFieldProvider } from "~/components/butterfly";
 import { CommandDialog } from "~/components/command-dialog";
+import { AGENT_PAGES } from "~/data/agent-pages";
 import {
   appStoreUrl,
   playStoreUrl,
@@ -16,7 +38,7 @@ import {
   getDownloadOptions,
   useDetectedPlatform,
   AppleIcon,
-  AndroidIcon,
+  PlayStoreIcon,
   TerminalIcon,
   GlobeIcon,
 } from "~/downloads";
@@ -24,6 +46,8 @@ import { useRelease } from "~/routes/__root";
 import { Mic } from "lucide-react";
 import { HeroMockup } from "~/components/hero-mockup";
 import { ClaudeIcon } from "~/components/mockup";
+import { FAQItem } from "~/components/faq-item";
+import { SiteFooter } from "~/components/site-footer";
 import { SiteHeader } from "~/components/site-header";
 import "~/styles.css";
 
@@ -45,9 +69,9 @@ export function LandingPage({ title, subtitle }: LandingPageProps) {
 
         {/* Mockup - inside hero so it's above the gradient, positioned to overflow into black section */}
         <motion.div
-          initial={{ opacity: 0, y: 40 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.8, delay: 0.5, ease: "easeOut" }}
+          initial={FADE_IN_UP_40}
+          animate={FADE_IN}
+          transition={EASE_OUT_08_DELAY_05}
           className="relative px-6 md:px-8 pb-8 md:pb-16"
         >
           <div className="max-w-7xl mx-auto">
@@ -63,8 +87,12 @@ export function LandingPage({ title, subtitle }: LandingPageProps) {
       <div className="bg-background">
         <main className="p-6 md:p-20 md:pt-40 max-w-5xl mx-auto">
           <div className="space-y-24">
+            <SocialProofWall />
             <MultiProviderSection />
             <SelfHostedSection />
+            <WorkflowSection />
+            <SplitPanelsSection />
+            <ServiceProxySection />
             <ShortcutsSection />
             <LocalVoiceSection />
             <CLISection />
@@ -72,126 +100,7 @@ export function LandingPage({ title, subtitle }: LandingPageProps) {
             <SponsorCTA />
           </div>
         </main>
-        <footer className="p-6 md:p-20 md:pt-0 max-w-5xl mx-auto">
-          <div className="border-t border-white/10 pt-8 pb-4 grid grid-cols-2 sm:grid-cols-4 gap-8 text-xs">
-            <div className="space-y-3">
-              <p className="text-white/60 font-medium">Product</p>
-              <div className="space-y-2">
-                <a
-                  href="/blog"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  Blog
-                </a>
-                <a
-                  href="/docs"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  Docs
-                </a>
-                <a
-                  href="/changelog"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  Changelog
-                </a>
-                <a
-                  href="/docs/cli"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  CLI
-                </a>
-                <a
-                  href="/privacy"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  Privacy
-                </a>
-              </div>
-            </div>
-            <div className="space-y-3">
-              <p className="text-white/60 font-medium">Agents</p>
-              <div className="space-y-2">
-                <a
-                  href="/claude-code"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  Claude Code
-                </a>
-                <a
-                  href="/codex"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  Codex
-                </a>
-                <a
-                  href="/opencode"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  OpenCode
-                </a>
-              </div>
-            </div>
-            <div className="space-y-3">
-              <p className="text-white/60 font-medium">Community</p>
-              <div className="space-y-2">
-                <a
-                  href="https://discord.gg/jz8T2uahpH"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  Discord
-                </a>
-                <a
-                  href="https://github.com/getpaseo/paseo"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  GitHub
-                </a>
-              </div>
-            </div>
-            <div className="space-y-3">
-              <p className="text-white/60 font-medium">Download</p>
-              <div className="space-y-2">
-                <a
-                  href={appStoreUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  App Store
-                </a>
-                <a
-                  href={playStoreUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  Google Play
-                </a>
-                <a
-                  href="https://github.com/getpaseo/paseo/releases"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  Desktop
-                </a>
-                <a
-                  href={webAppUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="block text-white/40 hover:text-white/60 transition-colors"
-                >
-                  Web App
-                </a>
-              </div>
-            </div>
-          </div>
-        </footer>
+        <SiteFooter />
       </div>
     </CursorFieldProvider>
   );
@@ -208,43 +117,122 @@ function Nav() {
 function Hero({ title, subtitle }: { title: React.ReactNode; subtitle: string }) {
   return (
     <div className="space-y-6">
-      <motion.h1
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.6, ease: "easeOut" }}
-        className="text-3xl md:text-5xl font-medium tracking-tight"
-      >
-        {title}
-      </motion.h1>
-      <motion.p
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.6, delay: 0.15, ease: "easeOut" }}
-        className="text-white/70 text-lg leading-relaxed max-w-lg"
-      >
-        {subtitle}
-      </motion.p>
+      <h1 className="text-3xl md:text-5xl font-medium tracking-tight">{title}</h1>
+      <p className="text-white/70 text-lg leading-relaxed max-w-lg">{subtitle}</p>
     </div>
   );
 }
 
+const CLAUDE_CODE_BADGE_ICON = <ClaudeCodeIcon className="h-6 w-6" />;
+const CODEX_BADGE_ICON = <CodexIcon className="h-6 w-6" />;
+const OPENCODE_BADGE_ICON = <OpenCodeIcon className="h-6 w-6" />;
+const PI_BADGE_ICON = <PiIcon className="h-6 w-6" />;
+const CURSOR_BADGE_ICON = <CursorIcon className="h-6 w-6" />;
+
+const FEATURED_AGENT_COUNT = 5;
+const ADDITIONAL_AGENT_COUNT = AGENT_PAGES.length - FEATURED_AGENT_COUNT;
+
+const SOCIAL_PROOF_TWEETS = [
+  {
+    name: "Cam",
+    handle: "@ceeebeeebeee",
+    date: "Apr 6, 2026",
+    avatar: "/social-proof/ceeebeeebeee.jpg",
+    url: "https://x.com/ceeebeeebeee/status/2041008798798864537",
+    text: "without a doubt the most slept on orchestrator right now. Open source, every OS, and a mobile experience that truly blew me away.",
+  },
+  {
+    name: "Erik Sherman",
+    handle: "@erikksherman",
+    date: "Apr 11, 2026",
+    avatar: "/social-proof/erikksherman.jpg",
+    url: "https://x.com/erikksherman/status/2043011630590751008",
+    text: "control agents from anywhere - mac, phone, web. one simple change transformed my health while INCREASING productivity",
+  },
+  {
+    name: "Aman Kumar Jagdev",
+    handle: "@amankumarjagdev",
+    date: "Apr 16, 2026",
+    avatar: "/social-proof/amankumarjagdev.jpg",
+    url: "https://x.com/amankumarjagdev/status/2044815258414674307",
+    text: "I have tried 100s of agent orchestrator, cli and gui. the best one i have found. Please give it a try! it's really good",
+  },
+  {
+    name: "RUI",
+    handle: "@tietougongshiba",
+    date: "May 3, 2026",
+    avatar: "/social-proof/tietougongshiba.jpg",
+    url: "https://x.com/tietougongshiba/status/2050886374941925754",
+    text: "Being able to check and manage agent progress from my phone while I'm out is so convenient.",
+  },
+  {
+    name: "Jason Torres",
+    handle: "@jasontorres",
+    date: "May 11, 2026",
+    avatar: "/social-proof/jasontorres.jpg",
+    url: "https://x.com/jasontorres/status/2053875385515790731",
+    text: "Can interchange between Codex, Claude Code, Opencode, Pi. Stable mobile and desktop apps connected through a secure relay from your VMs.",
+  },
+  {
+    name: "A9",
+    handle: "@aadtyn",
+    date: "May 29, 2026",
+    avatar: "/social-proof/aadtyn.jpg",
+    url: "https://x.com/aadtyn/status/2060371229773803943",
+    text: "cross platform agent orchestration with inbuilt relay and tailscale / self host daemon options + the best UI ive seen in this segment",
+  },
+  {
+    name: "boris evstratov",
+    handle: "@bevstratov",
+    date: "May 30, 2026",
+    avatar: "/social-proof/bevstratov.jpg",
+    url: "https://x.com/bevstratov/status/2060733983042781550",
+    text: "It’s an incredible piece of software. The last building block I needed to fully work from my phone. everything super smooth.",
+  },
+  {
+    name: "Arnold Gamboa",
+    handle: "@arnoldgamboa",
+    date: "May 28, 2026",
+    avatar: "/social-proof/arnoldgamboa.jpg",
+    url: "https://x.com/arnoldgamboa/status/2059832028099436921",
+    text: "Paseo is a really good interface for Pi. It’s not the only thing it does, but that’s my current use case for now.",
+  },
+  {
+    name: "Dong",
+    handle: "@dongnaebi",
+    date: "Apr 12, 2026",
+    avatar: "/social-proof/dongnaebi.jpg",
+    url: "https://x.com/dongnaebi/status/2043162391941398735",
+    text: "Paseo is the best software I've used this year. Absolutely amazing!",
+  },
+] as const;
+
+const SOCIAL_PROOF_ROWS = [
+  { id: "top", tweets: SOCIAL_PROOF_TWEETS.slice(0, 5), reverse: false },
+  { id: "bottom", tweets: SOCIAL_PROOF_TWEETS.slice(5), reverse: true },
+] as const;
+
+type SocialProofTweet = (typeof SOCIAL_PROOF_TWEETS)[number];
+
 function AgentBadge({ name, icon }: { name: string; icon: React.ReactNode }) {
   const [hovered, setHovered] = React.useState(false);
+  const handleMouseEnter = React.useCallback(() => setHovered(true), []);
+  const handleMouseLeave = React.useCallback(() => setHovered(false), []);
 
   return (
     <span
       className="relative inline-flex items-center justify-center rounded-full p-1.5 text-white/60"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
     >
       {icon}
       <AnimatePresence>
         {hovered && (
           <motion.span
-            initial={{ opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 4 }}
-            transition={{ duration: 0.15, ease: "easeOut" }}
+            initial={FADE_IN_UP_4}
+            animate={FADE_IN}
+            exit={FADE_OUT_UP_4}
+            transition={EASE_OUT_015}
             className="absolute -top-8 left-1/2 -translate-x-1/2 px-2 py-1 rounded bg-white text-black text-xs whitespace-nowrap pointer-events-none"
           >
             {name}
@@ -266,34 +254,101 @@ function FeatureSection({
 }) {
   return (
     <motion.section
-      initial={{ opacity: 0, y: 20 }}
-      whileInView={{ opacity: 1, y: 0 }}
-      viewport={{ once: true, margin: "-60px" }}
-      transition={{ duration: 0.5, ease: "easeOut" }}
-      className="space-y-8"
+      initial={FADE_IN_UP}
+      whileInView={FADE_IN}
+      viewport={VIEWPORT_60}
+      transition={EASE_OUT_05}
     >
-      <div className="space-y-2">
-        <h2 className="text-3xl font-medium">{title}</h2>
-        <p className="text-base text-muted-foreground max-w-lg">{description}</p>
-      </div>
+      <SectionTitle title={title} description={description} />
       {children}
     </motion.section>
   );
 }
 
-function PrinciplesSection() {
+function SectionTitle({ title, description }: { title: string; description: string }) {
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 16 }}
-      whileInView={{ opacity: 1, y: 0 }}
-      viewport={{ once: true, margin: "-40px" }}
-      transition={{ duration: 0.5, ease: "easeOut" }}
-      className="py-32 px-6 md:px-20 max-w-3xl mx-auto text-center"
+    <div className="mb-12 space-y-2">
+      <h2 className="text-3xl font-medium">{title}</h2>
+      <p className="text-base text-muted-foreground max-w-lg">{description}</p>
+    </div>
+  );
+}
+
+function SocialProofWall() {
+  return (
+    <motion.section
+      initial={FADE_IN_UP}
+      whileInView={FADE_IN}
+      viewport={VIEWPORT_60}
+      transition={EASE_OUT_05}
     >
-      <p className="text-2xl md:text-4xl font-medium text-white/90">
-        Here's what's under the hood.
-      </p>
-    </motion.div>
+      <SectionTitle
+        title="Loved by developers"
+        description="See what developers are saying about Paseo."
+      />
+
+      <div className="social-proof-marquee space-y-4 overflow-hidden">
+        {SOCIAL_PROOF_ROWS.map((row) => (
+          <SocialProofRow key={row.id} tweets={row.tweets} reverse={row.reverse} />
+        ))}
+      </div>
+    </motion.section>
+  );
+}
+
+function SocialProofRow({
+  tweets,
+  reverse,
+}: {
+  tweets: readonly SocialProofTweet[];
+  reverse: boolean;
+}) {
+  return (
+    <div className="social-proof-row">
+      <div className={`social-proof-track ${reverse ? "social-proof-track-reverse" : ""}`}>
+        <div className="flex shrink-0 gap-4 pr-4">
+          {tweets.map((tweet) => (
+            <SocialProofCard key={tweet.url} tweet={tweet} />
+          ))}
+        </div>
+        <div className="flex shrink-0 gap-4 pr-4" aria-hidden="true">
+          {tweets.map((tweet) => (
+            <SocialProofCard key={`${tweet.url}-clone`} tweet={tweet} inert />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SocialProofCard({ tweet, inert }: { tweet: SocialProofTweet; inert?: boolean }) {
+  return (
+    <a
+      href={tweet.url}
+      target="_blank"
+      rel="noreferrer"
+      tabIndex={inert ? -1 : undefined}
+      className="group flex h-[154px] w-[320px] shrink-0 flex-col justify-between overflow-hidden rounded-2xl border border-white/10 bg-white/[0.03] p-4 transition-colors hover:border-white/20 hover:bg-white/[0.05] md:w-[420px]"
+      aria-label={`Read ${tweet.name}'s original post`}
+    >
+      <div>
+        <div className="flex min-w-0 items-center gap-3">
+          <img
+            src={tweet.avatar}
+            alt=""
+            width={28}
+            height={28}
+            loading="lazy"
+            decoding="async"
+            className="h-7 w-7 shrink-0 rounded-full bg-white/10 object-cover"
+          />
+          <p className="truncate text-sm font-medium text-white/60">{tweet.handle}</p>
+        </div>
+        <p className="social-proof-card-text mt-4 text-sm leading-relaxed text-white/72">
+          {tweet.text}
+        </p>
+      </div>
+    </a>
   );
 }
 
@@ -302,17 +357,17 @@ function MultiProviderSection() {
     { name: "Claude Code", icon: <ClaudeIcon size={28} /> },
     { name: "Codex", icon: <CodexIcon className="w-7 h-7" /> },
     { name: "OpenCode", icon: <OpenCodeIcon className="w-7 h-7" /> },
-    { name: "Copilot", icon: <CopilotIcon className="w-7 h-7" /> },
     { name: "Pi", icon: <PiIcon className="w-7 h-7" /> },
+    { name: "Cursor", icon: <CursorIcon className="w-7 h-7" /> },
   ];
 
   return (
     <FeatureSection
-      title="Use the best agent for the job"
-      description="Run multiple providers from a single interface. Paseo runs the native agent harness as you'd normally run it, with your skills, config and MCP servers intact."
+      title="Works with your tools"
+      description="Run your agents from one interface. Paseo uses each provider's native harness, so your subscriptions, skills, config, and MCP servers keep working."
     >
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        {providers.slice(0, 3).map((p) => (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        {providers.map((p) => (
           <div
             key={p.name}
             className="flex items-center justify-center gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-5 py-4"
@@ -321,17 +376,12 @@ function MultiProviderSection() {
             <span className="font-medium">{p.name}</span>
           </div>
         ))}
-      </div>
-      <div className="grid grid-cols-2 gap-4 sm:w-2/3">
-        {providers.slice(3).map((p) => (
-          <div
-            key={p.name}
-            className="flex items-center justify-center gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-5 py-4"
-          >
-            <span className="text-white/80">{p.icon}</span>
-            <span className="font-medium">{p.name}</span>
-          </div>
-        ))}
+        <a
+          href="/agents"
+          className="flex items-center justify-center gap-3 rounded-xl border border-dashed border-white/10 bg-white/[0.01] px-5 py-4 text-white/50 hover:text-white/80 hover:border-white/20 hover:bg-white/[0.03] transition-colors"
+        >
+          <span className="font-medium">+{ADDITIONAL_AGENT_COUNT} more</span>
+        </a>
       </div>
     </FeatureSection>
   );
@@ -417,6 +467,19 @@ function SelfHostedDiagram() {
   const clientRefs = React.useRef<(HTMLDivElement | null)[]>([]);
   const hostRefs = React.useRef<(HTMLDivElement | null)[]>([]);
   const centerRef = React.useRef<HTMLDivElement>(null);
+
+  const setClientRef = React.useCallback(
+    (index: number) => (el: HTMLDivElement | null) => {
+      clientRefs.current[index] = el;
+    },
+    [],
+  );
+  const setHostRef = React.useCallback(
+    (index: number) => (el: HTMLDivElement | null) => {
+      hostRefs.current[index] = el;
+    },
+    [],
+  );
   const [paths, setPaths] = React.useState<{ left: string[]; right: string[] }>({
     left: [],
     right: [],
@@ -516,13 +579,13 @@ function SelfHostedDiagram() {
         {/* SVG curves */}
         <svg
           className="absolute inset-0 w-full h-full pointer-events-none"
-          style={{ overflow: "visible" }}
+          style={SVG_OVERFLOW_VISIBLE_STYLE}
         >
           {[...paths.left, ...paths.right].map(
-            (d, i) =>
+            (d) =>
               d && (
                 <path
-                  key={i}
+                  key={d}
                   d={d}
                   fill="none"
                   stroke="rgba(255,255,255,0.25)"
@@ -538,9 +601,7 @@ function SelfHostedDiagram() {
           {clients.map((c, i) => (
             <div
               key={c.name}
-              ref={(el) => {
-                clientRefs.current[i] = el;
-              }}
+              ref={setClientRef(i)}
               className="flex items-center gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-5 py-4 backdrop-blur-sm"
             >
               <span className="text-white/80">{c.icon}</span>
@@ -570,9 +631,7 @@ function SelfHostedDiagram() {
           {hosts.map((h, i) => (
             <div
               key={h}
-              ref={(el) => {
-                hostRefs.current[i] = el;
-              }}
+              ref={setHostRef(i)}
               className="flex items-center gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-5 py-4 backdrop-blur-sm"
             >
               <span className="text-white/80">
@@ -604,10 +663,259 @@ function SelfHostedDiagram() {
 function SelfHostedSection() {
   return (
     <FeatureSection
-      title="Your agents, every surface"
-      description="Run agents on your laptop, a VM, or a dev server. Control them from any device with a direct connection or an E2E encrypted relay."
+      title="Runs where you work"
+      description="Start agents on your laptop, a VM, or a dev server. Use them from any device over a direct connection or the end-to-end encrypted relay."
     >
       <SelfHostedDiagram />
+    </FeatureSection>
+  );
+}
+
+const WORKFLOW_STEPS = ["Worktree", "Preview", "Review", "Commit", "PR", "Merge"] as const;
+
+const REVIEW_FILES = [
+  { path: "src/auth/session.ts", delta: "+42" },
+  { path: "src/auth/middleware.ts", delta: "+18 -9" },
+  { path: "tests/auth.test.ts", delta: "+31" },
+] as const;
+
+function WorkflowSection() {
+  return (
+    <FeatureSection
+      title="Review, preview, ship"
+      description="Create branches, preview the app in the browser, review the diff inline, then commit, open a PR, and merge without leaving Paseo."
+    >
+      <div className="overflow-hidden rounded-2xl border border-white/10 bg-white/[0.02]">
+        <WorkflowHeader />
+        <div className="grid gap-4 p-4 md:grid-cols-[1.1fr_0.9fr]">
+          <WorkflowPreview />
+          <WorkflowReviewAndShip />
+        </div>
+      </div>
+    </FeatureSection>
+  );
+}
+
+function WorkflowHeader() {
+  return (
+    <div className="flex flex-col gap-3 border-b border-white/10 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex items-center gap-2.5">
+        <div className="h-2 w-2 rounded-full bg-emerald-400" />
+        <span className="text-sm text-white/80">fix-auth</span>
+        <span className="rounded-full bg-white/10 px-2 py-0.5 text-xs text-white/40">worktree</span>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 text-xs text-white/40">
+        {WORKFLOW_STEPS.map((step) => (
+          <span key={step} className="rounded-full border border-white/10 px-2 py-1">
+            {step}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function WorkflowPreview() {
+  return (
+    <div className="overflow-hidden rounded-xl border border-white/10 bg-black/20">
+      <BrowserChrome />
+      <div className="space-y-5 p-5">
+        <PreviewHeader />
+        <div className="grid gap-3 sm:grid-cols-2">
+          <PreviewFormCard titleWidth="w-16" ctaClassName="bg-white/[0.06]" />
+          <PreviewFormCard titleWidth="w-20" ctaClassName="bg-emerald-400/20" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BrowserChrome() {
+  return (
+    <div className="flex items-center gap-2 border-b border-white/10 bg-white/[0.03] px-3 py-2">
+      <div className="flex gap-1.5">
+        <span className="h-2.5 w-2.5 rounded-full bg-red-400/60" />
+        <span className="h-2.5 w-2.5 rounded-full bg-amber-300/60" />
+        <span className="h-2.5 w-2.5 rounded-full bg-emerald-400/60" />
+      </div>
+      <div className="min-w-0 flex-1 rounded-md bg-black/30 px-2 py-1 text-center font-mono text-[10px] text-white/35">
+        web.fix-auth.my-app.localhost
+      </div>
+    </div>
+  );
+}
+
+function PreviewHeader() {
+  return (
+    <div className="space-y-2">
+      <div className="h-3 w-28 rounded-full bg-white/25" />
+      <div className="h-2 w-44 rounded-full bg-white/10" />
+    </div>
+  );
+}
+
+function PreviewFormCard({
+  titleWidth,
+  ctaClassName,
+}: {
+  titleWidth: string;
+  ctaClassName: string;
+}) {
+  return (
+    <div className="space-y-3 rounded-lg border border-white/10 bg-white/[0.03] p-4">
+      <div className={`h-2 rounded-full bg-white/15 ${titleWidth}`} />
+      <div className="h-8 rounded-md bg-white/10" />
+      <div className={`h-8 rounded-md ${ctaClassName}`} />
+    </div>
+  );
+}
+
+function WorkflowReviewAndShip() {
+  return (
+    <div className="space-y-4">
+      <InlineReviewPanel />
+      <ShipPanel />
+    </div>
+  );
+}
+
+function InlineReviewPanel() {
+  return (
+    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <span className="text-sm text-white/80">Inline review</span>
+        <span className="text-xs text-white/35">3 files changed</span>
+      </div>
+      <div className="space-y-2">
+        {REVIEW_FILES.map((file) => (
+          <ReviewFileRow key={file.path} path={file.path} delta={file.delta} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ReviewFileRow({ path, delta }: { path: string; delta: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3 text-xs">
+      <span className="truncate font-mono text-white/50">{path}</span>
+      <span className="flex gap-1 font-mono">
+        {delta.split(" ").map((part) => (
+          <span
+            key={part}
+            className={part.startsWith("-") ? "text-red-300/70" : "text-emerald-300/70"}
+          >
+            {part}
+          </span>
+        ))}
+      </span>
+    </div>
+  );
+}
+
+function ShipPanel() {
+  return (
+    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
+      <div className="mb-4 flex items-center justify-between gap-3">
+        <span className="text-sm text-white/80">Ready to ship</span>
+        <span className="rounded-full bg-emerald-400/10 px-2 py-1 text-xs text-emerald-300">
+          checks passed
+        </span>
+      </div>
+      <div className="grid grid-cols-3 gap-2 text-center text-xs">
+        <div className="rounded-lg border border-white/10 bg-white/10 px-3 py-2 text-white/70">
+          Commit
+        </div>
+        <div className="rounded-lg border border-white/10 bg-white/10 px-3 py-2 text-white/70">
+          Open PR
+        </div>
+        <div className="rounded-lg border border-emerald-400/20 bg-emerald-400/15 px-3 py-2 text-emerald-200">
+          Merge
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SplitPanelsSection() {
+  return (
+    <FeatureSection
+      title="Split panels"
+      description="Open agents, browsers, terminals, diffs, and logs in the same workspace. Split them side by side or group them in tabs."
+    >
+      <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
+        <div className="grid gap-3 md:h-[360px] md:grid-cols-[1.05fr_0.95fr]">
+          <PanelTile label="Agent" className="min-h-48 md:min-h-0" />
+          <div className="grid gap-3 md:grid-rows-[1fr_0.75fr]">
+            <PanelTile label="Browser" className="min-h-36" />
+            <div className="grid gap-3 sm:grid-cols-2">
+              <PanelTile label="Terminal" className="min-h-28" />
+              <PanelTile label="Diff" className="min-h-28" />
+            </div>
+          </div>
+        </div>
+      </div>
+    </FeatureSection>
+  );
+}
+
+function PanelTile({ label, className }: { label: string; className: string }) {
+  return (
+    <div
+      className={`flex items-center justify-center rounded-xl border border-white/10 bg-white/[0.03] text-sm text-white/70 ${className}`}
+    >
+      {label}
+    </div>
+  );
+}
+
+function ServiceProxySection() {
+  const workspaces = [
+    { name: "fix-auth", url: "web.fix-auth.my-app.localhost" },
+    { name: "add-search", url: "web.add-search.my-app.localhost" },
+    { name: "upgrade-deps", url: "web.upgrade-deps.my-app.localhost" },
+  ];
+
+  return (
+    <FeatureSection
+      title="Forget about ports"
+      description="When agents work in parallel, they all run dev servers. Paseo gives each one a URL based on the branch name, no port conflicts, no guessing."
+    >
+      <div className="rounded-2xl border border-white/10 bg-white/[0.02] overflow-hidden">
+        <div className="px-5 py-4 space-y-3">
+          {/* Project */}
+          <div className="flex items-center gap-2.5">
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="text-white/40"
+            >
+              <path d="M3 7V17C3 18.1046 3.89543 19 5 19H19C20.1046 19 21 18.1046 21 17V9C21 7.89543 20.1046 7 19 7H13L11 5H5C3.89543 5 3 5.89543 3 7Z" />
+            </svg>
+            <span className="text-sm font-medium text-white/60">my-app</span>
+          </div>
+
+          {/* Workspaces indented */}
+          <div className="pl-6 space-y-2">
+            {workspaces.map((ws) => (
+              <div key={ws.name} className="flex items-center justify-between">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                  <span className="text-sm text-white/80">{ws.name}</span>
+                  <span className="text-xs text-white/25 font-mono">npm run dev</span>
+                </div>
+                <span className="text-xs font-mono text-white/30">{ws.url}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
     </FeatureSection>
   );
 }
@@ -651,38 +959,43 @@ function ShortcutsSection() {
   );
 }
 
+interface VoiceBarProps {
+  index: number;
+  barCount: number;
+}
+
+function VoiceBar({ index, barCount }: VoiceBarProps) {
+  const style = React.useMemo(() => {
+    const center = barCount / 2;
+    const dist = Math.abs(index - center) / center;
+    const envelope = 1 - dist * dist;
+    const minH = 4;
+    const maxH = 56;
+    const baseH = minH + (maxH - minH) * envelope;
+    const jitter = Math.sin(index * 2.3) * 0.3 + Math.cos(index * 1.7) * 0.2;
+    const h = Math.max(minH, baseH * (0.5 + 0.5 * Math.abs(jitter + Math.sin(index * 0.8))));
+    return {
+      height: h,
+      animationName: "voice-bar",
+      animationDuration: `${800 + (index % 5) * 200}ms`,
+      animationTimingFunction: "ease-in-out",
+      animationIterationCount: "infinite",
+      animationDirection: "alternate" as const,
+      animationDelay: `${(index % 7) * 80}ms`,
+    };
+  }, [index, barCount]);
+  return <div className="w-[3px] rounded-full bg-white/30" style={style} />;
+}
+
+const VOICE_BAR_COUNT = 48;
+const VOICE_BAR_INDICES = Array.from({ length: VOICE_BAR_COUNT }, (_, i) => i);
+
 function VoiceWaveform() {
-  const barCount = 48;
   return (
     <div className="flex items-center justify-center gap-[3px] h-16">
-      {Array.from({ length: barCount }).map((_, i) => {
-        // Create a natural-looking waveform envelope — louder in center, quieter at edges
-        const center = barCount / 2;
-        const dist = Math.abs(i - center) / center;
-        const envelope = 1 - dist * dist; // quadratic falloff
-        const minH = 4;
-        const maxH = 56;
-        const baseH = minH + (maxH - minH) * envelope;
-        // Vary per-bar so it doesn't look uniform
-        const jitter = Math.sin(i * 2.3) * 0.3 + Math.cos(i * 1.7) * 0.2;
-        const h = Math.max(minH, baseH * (0.5 + 0.5 * Math.abs(jitter + Math.sin(i * 0.8))));
-
-        return (
-          <div
-            key={i}
-            className="w-[3px] rounded-full bg-white/30"
-            style={{
-              height: h,
-              animationName: "voice-bar",
-              animationDuration: `${800 + (i % 5) * 200}ms`,
-              animationTimingFunction: "ease-in-out",
-              animationIterationCount: "infinite",
-              animationDirection: "alternate",
-              animationDelay: `${(i % 7) * 80}ms`,
-            }}
-          />
-        );
-      })}
+      {VOICE_BAR_INDICES.map((i) => (
+        <VoiceBar key={`voice-bar-${i}`} index={i} barCount={VOICE_BAR_COUNT} />
+      ))}
     </div>
   );
 }
@@ -793,6 +1106,25 @@ function useVoiceConversation() {
   return { dictationWordIndex, responseWordIndex, showResponse };
 }
 
+function makeWordKey(words: string[], i: number): string {
+  const word = words[i];
+  let occurrence = 0;
+  for (let j = 0; j < i; j++) {
+    if (words[j] === word) occurrence++;
+  }
+  return `${word}#${occurrence}`;
+}
+
+function WordSpan({ word, confirmed }: { word: string; confirmed: boolean }) {
+  return (
+    <span
+      className={`transition-colors duration-300 ${confirmed ? "text-white/90" : "text-white/40"}`}
+    >
+      {word}{" "}
+    </span>
+  );
+}
+
 function StreamingWords({
   words,
   wordIndex,
@@ -813,14 +1145,7 @@ function StreamingWords({
         {words.map((word, i) => {
           if (i >= wordIndex) return null;
           const confirmed = i < wordIndex - confirmLag;
-          return (
-            <span
-              key={i}
-              className={`transition-colors duration-300 ${confirmed ? "text-white/90" : "text-white/40"}`}
-            >
-              {word}{" "}
-            </span>
-          );
+          return <WordSpan key={makeWordKey(words, i)} word={word} confirmed={confirmed} />;
         })}
       </p>
     </div>
@@ -832,7 +1157,7 @@ function LocalVoiceSection() {
 
   return (
     <FeatureSection
-      title="Local voice"
+      title="Voice control, fully local"
       description="Fully local voice stack. Speech-to-text and text-to-speech run entirely on your machine, nothing leaves your network."
     >
       <div className="relative w-full rounded-2xl border border-white/10 bg-white/[0.02] overflow-hidden">
@@ -879,12 +1204,7 @@ function LocalVoiceSection() {
 
 function GetStarted() {
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.6, delay: 0.4, ease: "easeOut" }}
-      className="pt-10"
-    >
+    <div className="pt-10">
       <div className="flex flex-row flex-wrap gap-3">
         <DownloadButton />
         <a
@@ -912,33 +1232,42 @@ function GetStarted() {
           className="inline-flex items-center justify-center rounded-lg border border-white/20 px-3 py-2 text-white hover:bg-white/10 transition-colors"
           aria-label="Google Play"
         >
-          <AndroidIcon className="h-5 w-5" />
+          <PlayStoreIcon className="h-5 w-5" />
         </a>
         <ServerInstallButton />
       </div>
       <div className="pt-3">
-        <a href="/download" className="text-xs text-white/40 hover:text-white/70 transition-colors">
+        <a
+          href="/download"
+          className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+        >
           All download options
         </a>
       </div>
       <div className="flex items-center gap-2 pt-6">
-        <span className="text-xs text-white/40">Supports</span>
+        <span className="text-xs text-muted-foreground">Supports</span>
         <div className="flex items-center gap-1">
-          <AgentBadge name="Claude Code" icon={<ClaudeCodeIcon className="h-6 w-6" />} />
-          <AgentBadge name="Codex" icon={<CodexIcon className="h-6 w-6" />} />
-          <AgentBadge name="OpenCode" icon={<OpenCodeIcon className="h-6 w-6" />} />
-          <AgentBadge name="Copilot" icon={<CopilotIcon className="h-6 w-6" />} />
-          <AgentBadge name="Pi" icon={<PiIcon className="h-6 w-6" />} />
+          <AgentBadge name="Claude Code" icon={CLAUDE_CODE_BADGE_ICON} />
+          <AgentBadge name="Codex" icon={CODEX_BADGE_ICON} />
+          <AgentBadge name="OpenCode" icon={OPENCODE_BADGE_ICON} />
+          <AgentBadge name="Pi" icon={PI_BADGE_ICON} />
+          <AgentBadge name="Cursor" icon={CURSOR_BADGE_ICON} />
         </div>
+        <a
+          href="/agents"
+          className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+        >
+          +{ADDITIONAL_AGENT_COUNT} more
+        </a>
       </div>
-    </motion.div>
+    </div>
   );
 }
 
 function DownloadButton() {
-  const { version } = useRelease();
+  const release = useRelease();
   const detectedPlatform = useDetectedPlatform();
-  const primary = getDownloadOptions(version).find((o) => o.platform === detectedPlatform)!;
+  const primary = getDownloadOptions(release).find((o) => o.platform === detectedPlatform)!;
   const PrimaryIcon = primary.icon;
 
   return (
@@ -954,23 +1283,27 @@ function DownloadButton() {
   );
 }
 
+const SERVER_INSTALL_TRIGGER = (
+  <span className="inline-flex items-center justify-center rounded-lg border border-white/20 px-3 py-2 text-white hover:bg-white/10 transition-colors">
+    <TerminalIcon className="h-5 w-5" />
+  </span>
+);
+
+const SERVER_INSTALL_FOOTNOTE = (
+  <>
+    Requires Node.js 18+. Run <span className="font-mono text-white/40">paseo</span> to start the
+    daemon.
+  </>
+);
+
 function ServerInstallButton() {
   return (
     <CommandDialog
-      trigger={
-        <span className="inline-flex items-center justify-center rounded-lg border border-white/20 px-3 py-2 text-white hover:bg-white/10 transition-colors">
-          <TerminalIcon className="h-5 w-5" />
-        </span>
-      }
+      trigger={SERVER_INSTALL_TRIGGER}
       title="Run agents on a remote machine"
       description="For headless machines you want to connect to from the Paseo apps. The desktop app already includes a built-in daemon."
       command="npm install -g @getpaseo/cli && paseo"
-      footnote={
-        <>
-          Requires Node.js 18+. Run <span className="font-mono text-white/40">paseo</span> to start
-          the daemon.
-        </>
-      }
+      footnote={SERVER_INSTALL_FOOTNOTE}
     />
   );
 }
@@ -1024,20 +1357,16 @@ function OpenCodeIcon(props: React.SVGProps<SVGSVGElement>) {
   );
 }
 
-function CopilotIcon(props: React.SVGProps<SVGSVGElement>) {
+function CursorIcon(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg
       xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 512 416"
+      viewBox="0 0 466.73 532.09"
       fill="currentColor"
       aria-hidden="true"
       {...props}
     >
-      <path
-        d="M181.33 266.143c0-11.497 9.32-20.818 20.818-20.818 11.498 0 20.819 9.321 20.819 20.818v38.373c0 11.497-9.321 20.818-20.819 20.818-11.497 0-20.818-9.32-20.818-20.818v-38.373zM308.807 245.325c-11.477 0-20.798 9.321-20.798 20.818v38.373c0 11.497 9.32 20.818 20.798 20.818 11.497 0 20.818-9.32 20.818-20.818v-38.373c0-11.497-9.32-20.818-20.818-20.818z"
-        fillRule="evenodd"
-      />
-      <path d="M512.002 246.393v57.384c-.02 7.411-3.696 14.638-9.67 19.011C431.767 374.444 344.695 416 256 416c-98.138 0-196.379-56.542-246.33-93.21-5.975-4.374-9.65-11.6-9.671-19.012v-57.384a35.347 35.347 0 016.857-20.922l15.583-21.085c8.336-11.312 20.757-14.31 33.98-14.31 4.988-56.953 16.794-97.604 45.024-127.354C155.194 5.77 226.56 0 256 0c29.441 0 100.807 5.77 154.557 62.722 28.19 29.75 40.036 70.401 45.025 127.354 13.263 0 25.602 2.936 33.958 14.31l15.583 21.127c4.476 6.077 6.878 13.345 6.878 20.88zm-97.666-26.075c-.677-13.058-11.292-18.19-22.338-21.824-11.64 7.309-25.848 10.183-39.46 10.183-14.454 0-41.432-3.47-63.872-25.869-5.667-5.625-9.527-14.454-12.155-24.247a212.902 212.902 0 00-20.469-1.088c-6.098 0-13.099.349-20.551 1.088-2.628 9.793-6.509 18.622-12.155 24.247-22.4 22.4-49.418 25.87-63.872 25.87-13.612 0-27.86-2.855-39.501-10.184-11.005 3.613-21.558 8.828-22.277 21.824-1.17 24.555-1.272 49.11-1.375 73.645-.041 12.318-.082 24.658-.288 36.976.062 7.166 4.374 13.818 10.882 16.774 52.97 24.124 103.045 36.278 149.137 36.278 46.01 0 96.085-12.154 149.014-36.278 6.508-2.956 10.84-9.608 10.881-16.774.637-36.832.124-73.809-1.642-110.62h.041zM107.521 168.97c8.643 8.623 24.966 14.392 42.56 14.392 13.448 0 39.03-2.874 60.156-24.329 9.28-8.951 15.05-31.35 14.413-54.079-.657-18.231-5.769-33.28-13.448-39.665-8.315-7.371-27.203-10.574-48.33-8.644-22.399 2.238-41.267 9.588-50.875 19.833-20.798 22.728-16.323 80.317-4.476 92.492zm130.556-56.008c.637 3.51.965 7.35 1.273 11.517 0 2.875 0 5.77-.308 8.952 6.406-.636 11.847-.636 16.959-.636s10.553 0 16.959.636c-.329-3.182-.329-6.077-.329-8.952.329-4.167.657-8.007 1.294-11.517-6.735-.637-12.812-.965-17.924-.965s-11.21.328-17.924.965zm49.275-8.008c-.637 22.728 5.133 45.128 14.413 54.08 21.105 21.454 46.708 24.328 60.155 24.328 17.596 0 33.918-5.769 42.561-14.392 11.847-12.175 16.322-69.764-4.476-92.492-9.608-10.245-28.476-17.595-50.875-19.833-21.127-1.93-40.015 1.273-48.33 8.644-7.679 6.385-12.791 21.434-13.448 39.665z" />
+      <path d="M457.43,125.94L244.42,2.96c-6.84-3.95-15.28-3.95-22.12,0L9.3,125.94c-5.75,3.32-9.3,9.46-9.3,16.11v247.99c0,6.65,3.55,12.79,9.3,16.11l213.01,122.98c6.84,3.95,15.28,3.95,22.12,0l213.01-122.98c5.75-3.32,9.3-9.46,9.3-16.11v-247.99c0-6.65-3.55-12.79-9.3-16.11h-.01ZM444.05,151.99l-205.63,356.16c-1.39,2.4-5.06,1.42-5.06-1.36v-233.21c0-4.66-2.49-8.97-6.53-11.31L24.87,145.67c-2.4-1.39-1.42-5.06,1.36-5.06h411.26c5.84,0,9.49,6.33,6.57,11.39h-.01Z" />
     </svg>
   );
 }
@@ -1060,61 +1389,6 @@ function PiIcon(props: React.SVGProps<SVGSVGElement>) {
   );
 }
 
-function AppStoreIcon(props: React.SVGProps<SVGSVGElement>) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 960 960"
-      fill="currentColor"
-      aria-hidden="true"
-      {...props}
-    >
-      <path d="M342.277 86.6927C463.326 84.6952 587.87 65.619 705.523 104.97C830.467 143.522 874.012 278.153 872.814 397.105C873.713 481.299 874.012 566.193 858.931 649.19C834.262 804.895 746.172 873.01 590.666 874.608C422.377 880.301 172.489 908.965 104.474 711.012C76.5092 599.452 86.6964 481.1 88.1946 366.843C98.9811 200.75 163.301 90.2882 342.277 86.6927ZM715.411 596.156C758.856 591.362 754.362 524.645 710.816 524.545C610.542 525.244 639.605 550.513 594.462 456.83C577.383 418.778 540.529 337.279 496.085 396.006C479.206 431.062 516.359 464.121 528.844 495.382C569.892 560.6 606.647 628.515 648.494 693.334C667.77 724.495 716.509 696.73 697.333 663.372C685.048 642.298 677.258 619.726 665.773 598.253C682.452 597.854 698.831 598.053 715.411 596.156Z" />
-      <path
-        d="M697.234 663.371C716.41 696.729 667.671 724.494 648.395 693.333C606.548 628.614 569.794 560.699 528.745 495.381C516.161 464.219 479.107 431.161 495.986 396.005C540.43 337.178 577.384 418.776 594.363 456.829C639.506 550.512 610.443 525.243 710.717 524.544C754.263 524.644 758.757 591.361 715.312 596.155C698.732 598.052 682.453 597.852 665.674 598.252C677.159 619.725 684.95 642.297 697.234 663.371Z"
-        fill="black"
-      />
-      <path
-        d="M474.312 257.679C486.597 230.913 517.059 198.453 545.224 224.92C564.3 242.298 551.316 269.465 538.332 287.242C489.194 363.747 450.242 445.844 405.598 524.845C445.448 528.341 485.598 525.844 525.149 532.835C564.1 539.827 558.907 597.455 519.256 598.353C442.153 601.35 365.049 595.457 287.845 599.652C260.28 597.554 225.024 612.336 203.751 589.065C161.104 516.456 275.761 527.442 317.608 524.546C343.776 499.377 356.659 456.93 377.833 425.769C395.311 394.608 412.39 363.147 429.868 331.986C432.964 322.199 418.982 314.109 415.486 305.12C349.169 230.713 442.153 172.885 474.312 257.679Z"
-        fill="black"
-      />
-      <path
-        d="M265.471 626.12C284.647 595.758 329.491 609.042 330.39 643.199C325.296 664.872 313.511 684.647 298.53 701.027C275.758 724.997 235.009 703.124 242.5 670.864C246.195 654.485 256.882 640.302 265.471 626.12Z"
-        fill="black"
-      />
-    </svg>
-  );
-}
-
-function ChevronDownIcon(props: React.SVGProps<SVGSVGElement>) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-      {...props}
-    >
-      <path d="m6 9 6 6 6-6" />
-    </svg>
-  );
-}
-
-function Step({ number, children }: { number: number; children: React.ReactNode }) {
-  return (
-    <div className="flex gap-4">
-      <span className="flex-shrink-0 w-6 h-6 rounded-full bg-white/20 flex items-center justify-center text-xs font-medium">
-        {number}
-      </span>
-      <div className="space-y-2 flex-1">{children}</div>
-    </div>
-  );
-}
-
 const bashKeywords = new Set([
   "while",
   "do",
@@ -1129,167 +1403,134 @@ const bashKeywords = new Set([
 ]);
 const bashCommands = new Set(["paseo", "echo", "jq"]);
 
+function tokenizeBashComment(code: string, i: number): { node: React.ReactNode; len: number } {
+  const end = code.indexOf("\n", i);
+  const comment = end === -1 ? code.slice(i) : code.slice(i, end);
+  return {
+    node: <span className="text-white/30 italic">{comment}</span>,
+    len: comment.length,
+  };
+}
+
+function tokenizeBashDoubleQuoted(code: string, i: number): { node: React.ReactNode; len: number } {
+  let j = i + 1;
+  while (j < code.length && code[j] !== '"') {
+    if (code[j] === "\\") j++;
+    j++;
+  }
+  const str = code.slice(i, j + 1);
+  return { node: <span className="text-green-400/80">{str}</span>, len: str.length };
+}
+
+function tokenizeBashSingleQuoted(code: string, i: number): { node: React.ReactNode; len: number } {
+  let j = i + 1;
+  while (j < code.length && code[j] !== "'") j++;
+  const str = code.slice(i, j + 1);
+  return { node: <span className="text-green-400/80">{str}</span>, len: str.length };
+}
+
+function tokenizeBashDollar(code: string, i: number): { node: React.ReactNode; len: number } {
+  if (code[i + 1] === "(") {
+    return { node: <span className="text-amber-300/70">$(</span>, len: 2 };
+  }
+  let j = i + 1;
+  while (j < code.length && /\w/.test(code[j])) j++;
+  return {
+    node: <span className="text-amber-300/70">{code.slice(i, j)}</span>,
+    len: j - i,
+  };
+}
+
+function tokenizeBashFlag(code: string, i: number): { node: React.ReactNode; len: number } {
+  let j = i;
+  if (code[j + 1] === "-") j++;
+  j++;
+  while (j < code.length && /[\w-]/.test(code[j])) j++;
+  return {
+    node: <span className="text-sky-300/70">{code.slice(i, j)}</span>,
+    len: j - i,
+  };
+}
+
+function tokenizeBashWord(code: string, i: number): { node: React.ReactNode; len: number } {
+  let j = i;
+  while (j < code.length && /\w/.test(code[j])) j++;
+  const word = code.slice(i, j);
+  const len = j - i;
+  if (bashKeywords.has(word)) {
+    return { node: <span className="text-purple-400">{word}</span>, len };
+  }
+  if (bashCommands.has(word)) {
+    return { node: <span className="text-white">{word}</span>, len };
+  }
+  return { node: word, len };
+}
+
+function isBashFlagStart(code: string, i: number): boolean {
+  return (
+    code[i] === "-" &&
+    (i === 0 || /\s/.test(code[i - 1])) &&
+    i + 1 < code.length &&
+    /[\w-]/.test(code[i + 1])
+  );
+}
+
+function isBashCommentStart(code: string, i: number): boolean {
+  return code[i] === "#" && (i === 0 || /[\s(]/.test(code[i - 1]));
+}
+
+function tokenizeBashChar(code: string, i: number): { node: React.ReactNode; len: number } {
+  const c = code[i];
+  if (c === "|" || (c === "&" && code[i + 1] === "&")) {
+    const op = c === "|" ? "|" : "&&";
+    return { node: <span className="text-white/40">{op}</span>, len: op.length };
+  }
+  if (c === "\\") return { node: <span className="text-white/40">\</span>, len: 1 };
+  if (c === ")") return { node: <span className="text-amber-300/70">)</span>, len: 1 };
+  return { node: c, len: 1 };
+}
+
+function nextBashToken(code: string, i: number): { node: React.ReactNode; len: number } {
+  if (isBashCommentStart(code, i)) return tokenizeBashComment(code, i);
+  if (code[i] === '"') return tokenizeBashDoubleQuoted(code, i);
+  if (code[i] === "'") return tokenizeBashSingleQuoted(code, i);
+  if (code[i] === "$") return tokenizeBashDollar(code, i);
+  if (isBashFlagStart(code, i)) return tokenizeBashFlag(code, i);
+  if (/[a-zA-Z_]/.test(code[i])) return tokenizeBashWord(code, i);
+  return tokenizeBashChar(code, i);
+}
+
 function highlightBash(code: string): React.ReactNode {
   const tokens: React.ReactNode[] = [];
   let i = 0;
   let key = 0;
 
   while (i < code.length) {
-    if (code[i] === "#" && (i === 0 || /[\s(]/.test(code[i - 1]))) {
-      const end = code.indexOf("\n", i);
-      const comment = end === -1 ? code.slice(i) : code.slice(i, end);
-      tokens.push(
-        <span key={key++} className="text-white/30 italic">
-          {comment}
-        </span>,
-      );
-      i += comment.length;
-      continue;
+    const { node, len } = nextBashToken(code, i);
+    if (React.isValidElement(node)) {
+      tokens.push(React.cloneElement(node, { key: key++ }));
+    } else {
+      tokens.push(node);
     }
-
-    if (code[i] === '"') {
-      let j = i + 1;
-      while (j < code.length && code[j] !== '"') {
-        if (code[j] === "\\") j++;
-        j++;
-      }
-      const str = code.slice(i, j + 1);
-      tokens.push(
-        <span key={key++} className="text-green-400/80">
-          {str}
-        </span>,
-      );
-      i = j + 1;
-      continue;
-    }
-
-    if (code[i] === "'") {
-      let j = i + 1;
-      while (j < code.length && code[j] !== "'") j++;
-      const str = code.slice(i, j + 1);
-      tokens.push(
-        <span key={key++} className="text-green-400/80">
-          {str}
-        </span>,
-      );
-      i = j + 1;
-      continue;
-    }
-
-    if (code[i] === "$") {
-      if (code[i + 1] === "(") {
-        tokens.push(
-          <span key={key++} className="text-amber-300/70">
-            $(
-          </span>,
-        );
-        i += 2;
-        continue;
-      }
-      let j = i + 1;
-      while (j < code.length && /\w/.test(code[j])) j++;
-      tokens.push(
-        <span key={key++} className="text-amber-300/70">
-          {code.slice(i, j)}
-        </span>,
-      );
-      i = j;
-      continue;
-    }
-
-    if (
-      code[i] === "-" &&
-      (i === 0 || /\s/.test(code[i - 1])) &&
-      i + 1 < code.length &&
-      /[\w-]/.test(code[i + 1])
-    ) {
-      let j = i;
-      if (code[j + 1] === "-") j++;
-      j++;
-      while (j < code.length && /[\w-]/.test(code[j])) j++;
-      tokens.push(
-        <span key={key++} className="text-sky-300/70">
-          {code.slice(i, j)}
-        </span>,
-      );
-      i = j;
-      continue;
-    }
-
-    if (/[a-zA-Z_]/.test(code[i])) {
-      let j = i;
-      while (j < code.length && /\w/.test(code[j])) j++;
-      const word = code.slice(i, j);
-      if (bashKeywords.has(word)) {
-        tokens.push(
-          <span key={key++} className="text-purple-400">
-            {word}
-          </span>,
-        );
-      } else if (bashCommands.has(word)) {
-        tokens.push(
-          <span key={key++} className="text-white">
-            {word}
-          </span>,
-        );
-      } else {
-        tokens.push(word);
-        key++;
-      }
-      i = j;
-      continue;
-    }
-
-    if (code[i] === "|" || (code[i] === "&" && code[i + 1] === "&")) {
-      const op = code[i] === "|" ? "|" : "&&";
-      tokens.push(
-        <span key={key++} className="text-white/40">
-          {op}
-        </span>,
-      );
-      i += op.length;
-      continue;
-    }
-
-    if (code[i] === "\\") {
-      tokens.push(
-        <span key={key++} className="text-white/40">
-          \
-        </span>,
-      );
-      i++;
-      continue;
-    }
-
-    if (code[i] === ")") {
-      tokens.push(
-        <span key={key++} className="text-amber-300/70">
-          )
-        </span>,
-      );
-      i++;
-      continue;
-    }
-
-    tokens.push(code[i]);
-    i++;
+    i += len;
   }
 
-  return <>{tokens}</>;
+  return tokens;
 }
 
 function CLICodeBlock({ children }: { children: string }) {
   const [copied, setCopied] = React.useState(false);
 
-  function handleCopy() {
+  const handleCopy = React.useCallback(() => {
     navigator.clipboard.writeText(children);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
-  }
+  }, [children]);
 
   return (
     <div className="relative bg-white/5 rounded-lg overflow-hidden">
       <button
+        type="button"
         onClick={handleCopy}
         className="absolute top-3 right-3 text-white/30 hover:text-white/70 transition-colors p-1"
         title="Copy to clipboard"
@@ -1395,13 +1636,24 @@ function PhoneShowcase() {
   const leftX = useTransform(scrollYProgress, [0.2, 0.6], [0, -slideDistance]);
   const rightX = useTransform(scrollYProgress, [0.2, 0.6], [0, slideDistance]);
 
+  const leftPhoneStyle = React.useMemo(
+    () => ({ opacity: sideOpacity, x: leftX, rotateY: -15, scale: 0.97 }),
+    [sideOpacity, leftX],
+  );
+  const rightPhoneStyle = React.useMemo(
+    () => ({ opacity: sideOpacity, x: rightX, rotateY: 15, scale: 0.97 }),
+    [sideOpacity, rightX],
+  );
+  const centerPhoneAnimate = React.useMemo(() => (textInView ? FADE_IN : {}), [textInView]);
+  const textAnimate = React.useMemo(() => (textInView ? FADE_IN : {}), [textInView]);
+
   return (
     <div ref={containerRef} className="flex flex-col items-center pt-4 pb-16 gap-20">
       {/* Arrow + text */}
       <motion.div
-        initial={{ opacity: 0, y: -10 }}
-        animate={textInView ? { opacity: 1, y: 0 } : {}}
-        transition={{ duration: 0.5 }}
+        initial={FADE_IN_UP_TINY}
+        animate={textAnimate}
+        transition={DURATION_05}
         className="flex flex-col items-center gap-1.5 px-6"
       >
         <svg
@@ -1429,47 +1681,86 @@ function PhoneShowcase() {
       {/* Phone trio — side phones are absolute, start behind center, slide outward with perspective rotation */}
       <div
         className="relative flex items-center justify-center overflow-x-clip w-full"
-        style={{ minHeight: 480, perspective: 1200 }}
+        style={PHONE_PERSPECTIVE_STYLE}
       >
         {/* Left phone — rotated to face inward */}
-        <motion.div
-          style={{ opacity: sideOpacity, x: leftX, rotateY: -15, scale: 0.97 }}
-          className="w-[160px] md:w-[240px] absolute"
-        >
+        <motion.div style={leftPhoneStyle} className="w-[160px] md:w-[240px] absolute">
           <img
-            src="/phone-1.png"
+            src="/phone-1-480.webp"
+            srcSet="/phone-1-320.webp 320w, /phone-1-480.webp 480w"
+            sizes="(min-width: 768px) 240px, 160px"
             alt="Paseo sessions list"
+            width={480}
+            height={1044}
+            loading="lazy"
+            decoding="async"
             className="w-full rounded-[40px] shadow-2xl border-[3px] border-black outline-[3px] outline-white/20"
           />
         </motion.div>
 
         {/* Center phone */}
         <motion.div
-          initial={{ opacity: 0, y: 30 }}
-          animate={textInView ? { opacity: 1, y: 0 } : {}}
-          transition={{ duration: 0.6, delay: 0.1, ease: "easeOut" }}
+          initial={FADE_IN_UP_XL}
+          animate={centerPhoneAnimate}
+          transition={EASE_OUT_06_DELAY_01}
           className="w-[220px] md:w-[240px] relative z-10"
         >
           <img
-            src="/phone-2.png"
+            src="/phone-2-480.webp"
+            srcSet="/phone-2-320.webp 320w, /phone-2-480.webp 480w"
+            sizes="(min-width: 768px) 240px, 220px"
             alt="Paseo agent chat"
+            width={480}
+            height={1044}
+            loading="lazy"
+            decoding="async"
             className="w-full rounded-[40px] shadow-2xl border-[3px] border-black outline-[3px] outline-white/20"
           />
         </motion.div>
 
         {/* Right phone — rotated to face inward */}
-        <motion.div
-          style={{ opacity: sideOpacity, x: rightX, rotateY: 15, scale: 0.97 }}
-          className="w-[160px] md:w-[240px] absolute"
-        >
+        <motion.div style={rightPhoneStyle} className="w-[160px] md:w-[240px] absolute">
           <img
-            src="/phone-3.png"
+            src="/phone-3-480.webp"
+            srcSet="/phone-3-320.webp 320w, /phone-3-480.webp 480w"
+            sizes="(min-width: 768px) 240px, 160px"
             alt="Paseo diff view"
+            width={480}
+            height={1044}
+            loading="lazy"
+            decoding="async"
             className="w-full rounded-[40px] shadow-2xl border-[3px] border-black outline-[3px] outline-white/20"
           />
         </motion.div>
       </div>
     </div>
+  );
+}
+
+function CLITabButton({
+  title,
+  index,
+  active,
+  onSelect,
+}: {
+  title: string;
+  index: number;
+  active: boolean;
+  onSelect: (i: number) => void;
+}) {
+  const handleClick = React.useCallback(() => onSelect(index), [onSelect, index]);
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${
+        active
+          ? "border-white/40 text-white bg-white/10"
+          : "border-white/15 text-white/50 hover:text-white/80 hover:border-white/30"
+      }`}
+    >
+      {title}
+    </button>
   );
 }
 
@@ -1482,29 +1773,25 @@ function CLISection() {
       title="Fully scriptable"
       description="Everything you can do in the app, you can do from the terminal."
     >
-      <div className="flex flex-wrap gap-2">
+      <div className="mb-3 flex flex-wrap gap-2">
         {cliExamples.map((example, i) => (
-          <button
+          <CLITabButton
             key={example.title}
-            onClick={() => setActiveIndex(i)}
-            className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${
-              i === activeIndex
-                ? "border-white/40 text-white bg-white/10"
-                : "border-white/15 text-white/50 hover:text-white/80 hover:border-white/30"
-            }`}
-          >
-            {example.title}
-          </button>
+            title={example.title}
+            index={i}
+            active={i === activeIndex}
+            onSelect={setActiveIndex}
+          />
         ))}
       </div>
 
-      <div className="space-y-3">
+      <div className="mb-3">
         <CLICodeBlock>{active.code}</CLICodeBlock>
       </div>
 
       <a
         href="/docs/cli"
-        className="inline-flex items-center gap-1.5 text-xs text-white/40 hover:text-white/70 transition-colors"
+        className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
       >
         Full CLI reference
         <svg
@@ -1528,30 +1815,30 @@ function CLISection() {
 function FAQ() {
   return (
     <motion.div
-      initial={{ opacity: 0, y: 20 }}
-      whileInView={{ opacity: 1, y: 0 }}
-      viewport={{ once: true, margin: "-60px" }}
-      transition={{ duration: 0.5, ease: "easeOut" }}
+      initial={FADE_IN_UP}
+      whileInView={FADE_IN}
+      viewport={VIEWPORT_60}
+      transition={EASE_OUT_05}
       className="space-y-6"
     >
       <h2 className="text-3xl font-medium">FAQ</h2>
       <div className="space-y-6">
         <FAQItem question="Is this free?">
-          Yes. Paseo is free and open source. You need Claude Code, Codex, or OpenCode installed
-          with your own credentials. Voice is local-first by default and can optionally use OpenAI
-          speech providers if you configure them.
+          Yes. Paseo is free and open source. You need Claude Code, Codex, Cursor, OpenCode, or Pi
+          installed with your own credentials. Voice is local-first by default and can optionally
+          use OpenAI speech providers if you configure them.
         </FAQItem>
         <FAQItem question="Does my code leave my machine?">
-          Paseo doesn't send your code anywhere. Agents run locally and talk to their own APIs as
-          they normally would. For remote access, you can use the optional{" "}
+          Paseo doesn&apos;t send your code anywhere. Agents run locally and talk to their own APIs
+          as they normally would. For remote access, you can use the optional{" "}
           <a href="/docs/security" className="underline hover:text-white/80">
             end-to-end encrypted relay
           </a>
           , connect directly over your local network, or use your own tunnel.
         </FAQItem>
         <FAQItem question="What agents does it support?">
-          Claude Code, Codex, and OpenCode. Each agent runs as its own process using its own CLI.
-          Paseo doesn't modify or wrap their behavior.
+          Claude Code, Codex, Cursor, OpenCode, and Pi. Each agent runs as its own process using its
+          own CLI or local integration. Paseo doesn&apos;t modify or wrap their behavior.
         </FAQItem>
         <FAQItem question="Do I need the desktop app?">
           No. You can run the daemon headless with{" "}
@@ -1571,9 +1858,9 @@ function FAQ() {
           .
         </FAQItem>
         <FAQItem question="Can I connect from outside my network?">
-          Yes. You can use the hosted relay (end-to-end encrypted, Paseo can't read your traffic),
-          set up your own tunnel (Tailscale, Cloudflare Tunnel, etc.), or expose the daemon port
-          directly. See{" "}
+          Yes. You can use the hosted relay (end-to-end encrypted, Paseo can&apos;t read your
+          traffic), set up your own tunnel (Tailscale, Cloudflare Tunnel, etc.), or expose the
+          daemon port directly. See{" "}
           <a href="/docs/configuration" className="underline hover:text-white/80">
             configuration
           </a>
@@ -1581,17 +1868,17 @@ function FAQ() {
         </FAQItem>
         <FAQItem question="Do I need git or GitHub?">
           No. Paseo works in any directory. Worktrees are optional and only relevant if you use git.
-          You can run agents anywhere you'd normally work.
+          You can run agents anywhere you&apos;d normally work.
         </FAQItem>
         <FAQItem question="Can I get banned for using Paseo?">
-          <p>We can't make promises on behalf of providers.</p>
+          <p>We can&apos;t make promises on behalf of providers.</p>
           <p>
-            That said, Paseo launches the official first-party CLIs (Claude Code, Codex, OpenCode)
-            as subprocesses. It doesn't extract tokens or call inference APIs directly. From the
-            provider's perspective, usage through Paseo is indistinguishable from running the CLI
-            yourself.
+            That said, Paseo launches each provider&apos;s local CLI or integration (Claude Code,
+            Codex, Cursor, OpenCode, Pi) as a subprocess. It doesn&apos;t extract tokens or call
+            inference APIs directly. From the provider&apos;s perspective, usage through Paseo is
+            indistinguishable from running the provider yourself.
           </p>
-          <p>I've been using Paseo with all providers for months without issue.</p>
+          <p>I&apos;ve been using Paseo with all providers for months without issue.</p>
         </FAQItem>
         <FAQItem question="How do worktrees work?">
           When you launch an agent with the worktree option (from the app, desktop, or CLI), Paseo
@@ -1610,18 +1897,22 @@ function FAQ() {
 function SponsorCTA() {
   return (
     <motion.div
-      initial={{ opacity: 0, y: 20 }}
-      whileInView={{ opacity: 1, y: 0 }}
-      viewport={{ once: true, margin: "-60px" }}
-      transition={{ duration: 0.5, ease: "easeOut" }}
+      initial={FADE_IN_UP}
+      whileInView={FADE_IN}
+      viewport={VIEWPORT_60}
+      transition={EASE_OUT_05}
       className="rounded-xl bg-white/5 border border-white/10 p-8 md:p-10 text-left space-y-4 max-w-xl mx-auto"
     >
       <div className="text-sm text-muted-foreground leading-relaxed space-y-3">
         <p>
-          I built Paseo because I wanted better tools for coding agents on my own setup. It's an
-          independent open source project, built around freedom of choice and real workflows. If you
-          like what I'm building, consider becoming a supporter.
+          Paseo is an independent open source project for running coding agents across your own
+          machines, phone, desktop, and CLI.
         </p>
+        <p>
+          It&apos;s built around freedom of choice: use the provider you want, run it on your own
+          infrastructure, and keep your workflow portable.
+        </p>
+        <p>If you like Paseo, sponsorship is the best way to support continued development.</p>
         <p>- Mo</p>
       </div>
       <div className="pt-2">
@@ -1645,18 +1936,5 @@ function SponsorCTA() {
         </a>
       </div>
     </motion.div>
-  );
-}
-
-function FAQItem({ question, children }: { question: string; children: React.ReactNode }) {
-  return (
-    <details className="group">
-      <summary className="font-medium text-sm cursor-pointer list-none flex items-start gap-2 -ml-4">
-        <span className="font-mono text-white/40 flex-shrink-0 group-open:hidden">+</span>
-        <span className="font-mono text-white/40 flex-shrink-0 hidden group-open:inline">−</span>
-        {question}
-      </summary>
-      <div className="text-sm text-muted-foreground space-y-2 mt-2 prose">{children}</div>
-    </details>
   );
 }

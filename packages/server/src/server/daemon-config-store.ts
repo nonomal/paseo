@@ -3,17 +3,22 @@ import {
   savePersistedConfig,
   type PersistedConfig,
 } from "./persisted-config.js";
-import { MutableDaemonConfigSchema, MutableDaemonConfigPatchSchema } from "../shared/messages.js";
+import { ProviderOverrideSchema } from "./agent/provider-launch-config.js";
+import {
+  MutableDaemonConfigSchema,
+  MutableDaemonConfigPatchSchema,
+} from "@getpaseo/protocol/messages";
 
-export type { MutableDaemonConfig, MutableDaemonConfigPatch } from "../shared/messages.js";
+export type { MutableDaemonConfig, MutableDaemonConfigPatch } from "@getpaseo/protocol/messages";
 
-type MutableDaemonConfig = import("../shared/messages.js").MutableDaemonConfig;
-type MutableDaemonConfigPatch = import("../shared/messages.js").MutableDaemonConfigPatch;
+type MutableDaemonConfig = import("@getpaseo/protocol/messages").MutableDaemonConfig;
+type MutableDaemonConfigPatch = import("@getpaseo/protocol/messages").MutableDaemonConfigPatch;
+type ProviderOverride = import("./agent/provider-launch-config.js").ProviderOverride;
 
-type LoggerLike = {
+interface LoggerLike {
   child(bindings: Record<string, unknown>): LoggerLike;
-  info(...args: any[]): void;
-};
+  info(...args: unknown[]): void;
+}
 
 type ConfigListener = (config: MutableDaemonConfig) => void;
 type FieldChangeHandler = (value: unknown) => void;
@@ -55,6 +60,25 @@ function getValueAtPath(config: MutableDaemonConfig, path: string): unknown {
 
 function isEqualValue(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+export function applyMutableProviderConfigToOverrides(
+  baseOverrides: Record<string, ProviderOverride> | undefined,
+  mutableProviders: MutableDaemonConfig["providers"] | undefined,
+): Record<string, ProviderOverride> | undefined {
+  if (!baseOverrides && (!mutableProviders || Object.keys(mutableProviders).length === 0)) {
+    return undefined;
+  }
+
+  const nextOverrides: Record<string, ProviderOverride> = { ...baseOverrides };
+  for (const [providerId, providerConfig] of Object.entries(mutableProviders ?? {})) {
+    nextOverrides[providerId] = {
+      ...nextOverrides[providerId],
+      ...ProviderOverrideSchema.strip().parse(providerConfig),
+    };
+  }
+
+  return nextOverrides;
 }
 
 export class DaemonConfigStore {
@@ -148,6 +172,35 @@ function mergeMutableConfigIntoPersistedConfig(params: {
   mutable: MutableDaemonConfig;
 }): PersistedConfig {
   const { persisted, mutable } = params;
+  const browserToolsEnabled = readBrowserToolsEnabled(mutable);
+  const metadataGenerationProviders = readMetadataGenerationProviders(mutable);
+  const providerOverrides = applyMutableProviderConfigToOverrides(
+    persisted.agents?.providers as Record<string, ProviderOverride> | undefined,
+    mutable.providers,
+  );
+  const persistedAgents = persisted.agents as Record<string, unknown> | undefined;
+  const persistedMetadataGeneration = {
+    providers: metadataGenerationProviders,
+  };
+  const shouldPersistMetadataGeneration =
+    metadataGenerationProviders.length > 0 || persisted.agents?.metadataGeneration !== undefined;
+
+  let nextAgents = persisted.agents as PersistedConfig["agents"];
+  if (providerOverrides && Object.keys(providerOverrides).length > 0) {
+    nextAgents = {
+      ...persistedAgents,
+      providers: providerOverrides,
+      ...(shouldPersistMetadataGeneration
+        ? { metadataGeneration: persistedMetadataGeneration }
+        : {}),
+    } as PersistedConfig["agents"];
+  } else if (shouldPersistMetadataGeneration) {
+    nextAgents = {
+      ...persistedAgents,
+      metadataGeneration: persistedMetadataGeneration,
+    } as PersistedConfig["agents"];
+  }
+
   return {
     ...persisted,
     daemon: {
@@ -156,6 +209,52 @@ function mergeMutableConfigIntoPersistedConfig(params: {
         ...persisted.daemon?.mcp,
         injectIntoAgents: mutable.mcp.injectIntoAgents,
       },
+      browserTools: {
+        ...persisted.daemon?.browserTools,
+        enabled: browserToolsEnabled,
+      },
+      autoArchiveAfterMerge: mutable.autoArchiveAfterMerge,
+      enableTerminalAgentHooks: mutable.enableTerminalAgentHooks,
+      appendSystemPrompt: mutable.appendSystemPrompt,
+      ...(mutable.terminalProfiles !== undefined
+        ? { terminalProfiles: mutable.terminalProfiles }
+        : {}),
     },
-  };
+    agents: nextAgents,
+  } as PersistedConfig;
+}
+
+function readBrowserToolsEnabled(mutable: MutableDaemonConfig): boolean {
+  const browserTools = mutable.browserTools;
+  if (!isRecord(browserTools)) {
+    return false;
+  }
+  return browserTools["enabled"] === true;
+}
+
+function readMetadataGenerationProviders(
+  mutable: MutableDaemonConfig,
+): Array<{ provider: string; model?: string; thinkingOptionId?: string }> {
+  const metadataGeneration = mutable.metadataGeneration;
+  if (!isRecord(metadataGeneration)) {
+    return [];
+  }
+  const providers = metadataGeneration["providers"];
+  if (!Array.isArray(providers)) {
+    return [];
+  }
+  return providers.flatMap((entry) => {
+    if (!isRecord(entry) || typeof entry["provider"] !== "string") {
+      return [];
+    }
+    return [
+      {
+        provider: entry["provider"],
+        ...(typeof entry["model"] === "string" ? { model: entry["model"] } : {}),
+        ...(typeof entry["thinkingOptionId"] === "string"
+          ? { thinkingOptionId: entry["thinkingOptionId"] }
+          : {}),
+      },
+    ];
+  });
 }

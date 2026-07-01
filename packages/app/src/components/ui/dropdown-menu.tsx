@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -10,28 +11,34 @@ import {
   type ReactElement,
   type ReactNode,
 } from "react";
+import { useTranslation } from "react-i18next";
 import {
   ActivityIndicator,
   Modal,
   Pressable,
-  ScrollView,
   Text,
   View,
   Dimensions,
   Platform,
   StatusBar,
   type PressableProps,
+  type PressableStateCallbackType,
   type ViewStyle,
   type StyleProp,
 } from "react-native";
-import Animated, { Keyframe, runOnJS } from "react-native-reanimated";
+import { Keyframe, runOnJS } from "react-native-reanimated";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import { Check, CheckCircle } from "lucide-react-native";
+import { FloatingScrollView, FloatingSurface } from "@/components/ui/floating";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useWebScrollbarStyle } from "@/hooks/use-web-scrollbar-style";
+import { isWeb } from "@/constants/platform";
+import { useDismissKeyboardOnOpen } from "@/components/ui/keyboard-dismiss";
 
 // Action status for menu items with loading/success feedback
 export type ActionStatus = "idle" | "pending" | "success";
+
+const DROPDOWN_SCROLL_CONTENT_STYLE = { flexGrow: 1 } as const;
 
 type Placement = "top" | "bottom" | "left" | "right";
 type Alignment = "start" | "center" | "end";
@@ -43,13 +50,25 @@ interface Rect {
   height: number;
 }
 
-type DropdownMenuContextValue = {
+interface Size {
+  width: number;
+  height: number;
+}
+
+interface DropdownMenuContextValue {
   open: boolean;
   setOpen: (open: boolean) => void;
+  selectItem: (onSelect: (() => void) | undefined, closeOnSelect: boolean) => void;
+  flushPendingSelect: () => void;
   triggerRef: React.RefObject<View | null>;
-};
+}
 
 const DropdownMenuContext = createContext<DropdownMenuContextValue | null>(null);
+
+export function useDropdownMenuClose(): () => void {
+  const { setOpen } = useDropdownMenuContext("useDropdownMenuClose");
+  return useCallback(() => setOpen(false), [setOpen]);
+}
 
 function useDropdownMenuContext(componentName: string): DropdownMenuContextValue {
   const ctx = useContext(DropdownMenuContext);
@@ -70,7 +89,7 @@ function useControllableOpenState({
 }): [boolean, (next: boolean) => void] {
   const [internalOpen, setInternalOpen] = useState(Boolean(defaultOpen));
   const isControlled = typeof open === "boolean";
-  const value = isControlled ? Boolean(open) : internalOpen;
+  const value = isControlled ? open : internalOpen;
   const setValue = useCallback(
     (next: boolean) => {
       if (!isControlled) setInternalOpen(next);
@@ -156,6 +175,60 @@ function computePosition({
   return { x, y, actualPlacement };
 }
 
+function renderDropdownSurface(input: {
+  frameStyle: StyleProp<ViewStyle>;
+  testID?: string;
+  surfaceStyle: StyleProp<ViewStyle>;
+  scrollable: boolean;
+  scrollViewportStyle: StyleProp<ViewStyle>;
+  content: ReactElement;
+  surfaceNativeID: string;
+  onExited: () => void;
+}): ReactElement {
+  const {
+    frameStyle,
+    testID,
+    surfaceStyle,
+    scrollable,
+    scrollViewportStyle,
+    content,
+    surfaceNativeID,
+    onExited,
+  } = input;
+
+  const body = scrollable ? (
+    <FloatingScrollView
+      bounces={false}
+      showsVerticalScrollIndicator
+      style={scrollViewportStyle}
+      contentContainerStyle={DROPDOWN_SCROLL_CONTENT_STYLE}
+    >
+      {content}
+    </FloatingScrollView>
+  ) : (
+    content
+  );
+
+  return (
+    <FloatingSurface
+      collapsable={false}
+      nativeID={surfaceNativeID}
+      testID={testID}
+      style={surfaceStyle}
+      frameStyle={frameStyle}
+      entering={contentEntering}
+      exiting={contentExiting.withCallback((finished) => {
+        "worklet";
+        if (finished) {
+          runOnJS(onExited)();
+        }
+      })}
+    >
+      {body}
+    </FloatingSurface>
+  );
+}
+
 export function DropdownMenu({
   open,
   defaultOpen,
@@ -167,28 +240,70 @@ export function DropdownMenu({
   onOpenChange?: (open: boolean) => void;
 }>): ReactElement {
   const triggerRef = useRef<View>(null);
+  const pendingSelectRef = useRef<(() => void) | null>(null);
   const [isOpen, setIsOpen] = useControllableOpenState({
     open,
     defaultOpen,
     onOpenChange,
   });
+  useDismissKeyboardOnOpen(isOpen);
+
+  const flushPendingSelect = useCallback(() => {
+    const pendingSelect = pendingSelectRef.current;
+    pendingSelectRef.current = null;
+    if (!pendingSelect) return;
+
+    if (Platform.OS === "ios") {
+      // Native presenters such as PHPicker can hang if launched while an RN
+      // Modal is still completing dismissal on UIKit's side.
+      setTimeout(pendingSelect, 250);
+      return;
+    }
+
+    pendingSelect();
+  }, []);
+
+  const selectItem = useCallback(
+    (onSelect: (() => void) | undefined, closeOnSelect: boolean) => {
+      if (!closeOnSelect) {
+        onSelect?.();
+        return;
+      }
+
+      if (Platform.OS === "ios") {
+        pendingSelectRef.current = onSelect ?? null;
+        setIsOpen(false);
+        return;
+      }
+
+      setIsOpen(false);
+      onSelect?.();
+    },
+    [setIsOpen],
+  );
 
   const value = useMemo<DropdownMenuContextValue>(
     () => ({
       open: isOpen,
       setOpen: setIsOpen,
+      selectItem,
+      flushPendingSelect,
       triggerRef,
     }),
-    [isOpen, setIsOpen],
+    [flushPendingSelect, isOpen, selectItem, setIsOpen],
   );
 
   return <DropdownMenuContext.Provider value={value}>{children}</DropdownMenuContext.Provider>;
 }
 
-type TriggerState = { pressed: boolean; hovered: boolean; open: boolean };
+interface TriggerState {
+  pressed: boolean;
+  hovered: boolean;
+  open: boolean;
+}
 type TriggerStyleProp = StyleProp<ViewStyle> | ((state: TriggerState) => StyleProp<ViewStyle>);
 
-interface DropdownMenuTriggerProps extends Omit<PressableProps, "style" | "children"> {
+export interface DropdownMenuTriggerProps extends Omit<PressableProps, "style" | "children"> {
   style?: TriggerStyleProp;
   children: ReactNode | ((state: TriggerState) => ReactNode);
 }
@@ -206,6 +321,24 @@ export function DropdownMenuTrigger({
     ctx.setOpen(!ctx.open);
   }, [disabled, ctx]);
 
+  const pressableStyle = useCallback(
+    ({ pressed, hovered = false }: PressableStateCallbackType & { hovered?: boolean }) => {
+      if (typeof style === "function") {
+        return style({ pressed, hovered, open: ctx.open });
+      }
+      return style;
+    },
+    [style, ctx.open],
+  );
+
+  const renderChildren = useCallback(
+    ({ pressed, hovered = false }: PressableStateCallbackType & { hovered?: boolean }) => {
+      const state: TriggerState = { pressed, hovered, open: ctx.open };
+      return typeof children === "function" ? children(state) : children;
+    },
+    [children, ctx.open],
+  );
+
   return (
     <Pressable
       {...props}
@@ -213,36 +346,76 @@ export function DropdownMenuTrigger({
       collapsable={false}
       disabled={disabled}
       onPress={handlePress}
-      style={({ pressed, hovered = false }) => {
-        if (typeof style === "function") {
-          return style({ pressed, hovered: Boolean(hovered), open: ctx.open });
-        }
-        return style;
-      }}
+      style={pressableStyle}
     >
-      {({ pressed, hovered = false }) => {
-        const state: TriggerState = { pressed, hovered: Boolean(hovered), open: ctx.open };
-        return typeof children === "function" ? children(state) : children;
-      }}
+      {renderChildren}
     </Pressable>
   );
 }
 
 function getTransformOrigin(placement: Placement, alignment: Alignment): string {
-  const vertical = placement === "bottom" ? "top" : placement === "top" ? "bottom" : "center";
-  const horizontal = alignment === "start" ? "left" : alignment === "end" ? "right" : "center";
+  let vertical: string;
+  if (placement === "bottom") vertical = "top";
+  else if (placement === "top") vertical = "bottom";
+  else vertical = "center";
+  let horizontal: string;
+  if (alignment === "start") horizontal = "left";
+  else if (alignment === "end") horizontal = "right";
+  else horizontal = "center";
   return `${vertical} ${horizontal}`;
 }
+
+const CONTENT_ENTERING_DURATION_MS = 150;
 
 const contentEntering = new Keyframe({
   0: { opacity: 0, transform: [{ scale: 0.97 }] },
   100: { opacity: 1, transform: [{ scale: 1 }] },
-}).duration(150);
+}).duration(CONTENT_ENTERING_DURATION_MS);
 
 const contentExiting = new Keyframe({
   0: { opacity: 1, transform: [{ scale: 1 }] },
   100: { opacity: 0, transform: [{ scale: 0.97 }] },
 }).duration(100);
+
+function releaseFixedMenuHeight(surfaceNativeID: string): void {
+  if (!isWeb) return;
+  document.getElementById(surfaceNativeID)?.style.removeProperty("height");
+}
+
+function useReleaseFixedMenuHeight({
+  contentSize,
+  enabled,
+  surfaceNativeID,
+}: {
+  contentSize: Size | null;
+  enabled: boolean;
+  surfaceNativeID: string;
+}): void {
+  useEffect(() => {
+    if (!enabled) return undefined;
+
+    // Reanimated web entering animations leave the measured menu surface with
+    // an inline height snapshot. Once the menu is open, height must return to
+    // content-sized so rows can grow in place (for example service script URLs).
+    const release = () => {
+      releaseFixedMenuHeight(surfaceNativeID);
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => releaseFixedMenuHeight(surfaceNativeID));
+      }
+    };
+    const timers: ReturnType<typeof setTimeout>[] = [
+      setTimeout(release, CONTENT_ENTERING_DURATION_MS),
+    ];
+
+    if (contentSize) {
+      timers.push(setTimeout(release, 0));
+    }
+
+    return () => {
+      for (const timer of timers) clearTimeout(timer);
+    };
+  }, [contentSize, enabled, surfaceNativeID]);
+}
 
 export function DropdownMenuContent({
   children,
@@ -252,8 +425,10 @@ export function DropdownMenuContent({
   width,
   minWidth = 180,
   maxWidth,
+  maxHeight,
   fullWidth = false,
   horizontalPadding = 16,
+  scrollable = false,
   testID,
 }: PropsWithChildren<{
   side?: Placement;
@@ -262,18 +437,37 @@ export function DropdownMenuContent({
   width?: number;
   minWidth?: number;
   maxWidth?: number;
+  maxHeight?: number;
   fullWidth?: boolean;
   horizontalPadding?: number;
+  scrollable?: boolean;
   testID?: string;
 }>): ReactElement | null {
-  const { open, setOpen, triggerRef } = useDropdownMenuContext("DropdownMenuContent");
+  const { t } = useTranslation();
+  const { open, setOpen, triggerRef, flushPendingSelect } =
+    useDropdownMenuContext("DropdownMenuContent");
   const [modalVisible, setModalVisible] = useState(false);
+  const surfaceNativeID = useId();
   const webScrollbarStyle = useWebScrollbarStyle();
   const [closing, setClosing] = useState(false);
   const [triggerRect, setTriggerRect] = useState<Rect | null>(null);
-  const [contentSize, setContentSize] = useState<{ width: number; height: number } | null>(null);
+  const [contentSize, setContentSize] = useState<Size | null>(null);
   const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
   const [actualPlacement, setActualPlacement] = useState<Placement>(side);
+  const visibleContentSize = useMemo(() => {
+    if (!contentSize) return null;
+    if (!scrollable) return contentSize;
+
+    const { height: screenHeight } = Dimensions.get("window");
+    const viewportMaxHeight = Math.max(screenHeight - 16, 0);
+    const resolvedMaxHeight =
+      typeof maxHeight === "number" ? Math.min(maxHeight, viewportMaxHeight) : viewportMaxHeight;
+
+    return {
+      width: contentSize.width,
+      height: Math.min(contentSize.height, resolvedMaxHeight),
+    };
+  }, [contentSize, scrollable, maxHeight]);
 
   // Keep Modal mounted during exit animation
   useEffect(() => {
@@ -288,6 +482,18 @@ export function DropdownMenuContent({
     }
   }, [open, modalVisible]);
 
+  useEffect(() => {
+    if (!open && !modalVisible) {
+      flushPendingSelect();
+    }
+  }, [flushPendingSelect, modalVisible, open]);
+
+  useReleaseFixedMenuHeight({
+    contentSize,
+    enabled: modalVisible,
+    surfaceNativeID,
+  });
+
   const handleClose = useCallback(() => {
     setOpen(false);
   }, [setOpen]);
@@ -298,7 +504,7 @@ export function DropdownMenuContent({
       setTriggerRect(null);
       setContentSize(null);
       setPosition(null);
-      return;
+      return undefined;
     }
 
     // Capture status bar height synchronously before async measurement.
@@ -307,8 +513,8 @@ export function DropdownMenuContent({
     const statusBarHeight = Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) : 0;
     let cancelled = false;
 
-    measureElement(triggerRef.current).then((rect) => {
-      if (cancelled) return;
+    void measureElement(triggerRef.current).then((rect) => {
+      if (cancelled) return undefined;
       // On Android with statusBarTranslucent, measureInWindow returns coordinates
       // relative to below the status bar, but Modal content starts from screen top.
       // Add status bar height to align coordinate systems (same as react-native-popover-view).
@@ -316,6 +522,7 @@ export function DropdownMenuContent({
         ...rect,
         y: rect.y + statusBarHeight,
       });
+      return undefined;
     });
 
     return () => {
@@ -325,7 +532,7 @@ export function DropdownMenuContent({
 
   // Calculate position when we have both measurements
   useEffect(() => {
-    if (!triggerRect || !contentSize) return;
+    if (!triggerRect || !visibleContentSize) return;
 
     const { width: screenWidth, height: screenHeight } = Dimensions.get("window");
     // measureInWindow returns screen coordinates including status bar
@@ -339,7 +546,7 @@ export function DropdownMenuContent({
 
     const result = computePosition({
       triggerRect,
-      contentSize,
+      contentSize: visibleContentSize,
       displayArea,
       placement: side,
       alignment: align,
@@ -350,26 +557,63 @@ export function DropdownMenuContent({
     const x = fullWidth ? horizontalPadding : result.x;
     setPosition({ x, y: result.y });
     setActualPlacement(result.actualPlacement);
-  }, [triggerRect, contentSize, side, align, offset, fullWidth, horizontalPadding]);
+  }, [triggerRect, visibleContentSize, side, align, offset, fullWidth, horizontalPadding]);
 
-  const handleContentLayout = useCallback(
+  const handleMeasuredContentLayout = useCallback(
     (event: { nativeEvent: { layout: { width: number; height: number } } }) => {
       const { width: w, height: h } = event.nativeEvent.layout;
-      setContentSize({ width: w, height: h });
+      setContentSize((current) => {
+        if (current && current.width === w && current.height === h) {
+          return current;
+        }
+        return { width: w, height: h };
+      });
     },
     [],
   );
 
+  const surfaceStyle = styles.content;
+  const frameStyle = useMemo(() => {
+    const { width: screenWidth } = Dimensions.get("window");
+    const resolvedWidthStyle: ViewStyle = fullWidth
+      ? { width: screenWidth - horizontalPadding * 2 }
+      : {
+          ...(typeof width === "number" ? { width } : null),
+          ...(typeof minWidth === "number" ? { minWidth } : null),
+          ...(typeof maxWidth === "number" ? { maxWidth } : null),
+        };
+    return [
+      resolvedWidthStyle,
+      {
+        position: "absolute" as const,
+        top: position?.y ?? -9999,
+        left: position?.x ?? -9999,
+        transformOrigin: getTransformOrigin(actualPlacement, align),
+      },
+    ];
+  }, [
+    fullWidth,
+    horizontalPadding,
+    width,
+    minWidth,
+    maxWidth,
+    position?.x,
+    position?.y,
+    actualPlacement,
+    align,
+  ]);
+  const scrollViewportStyle = useMemo(
+    () => [webScrollbarStyle, visibleContentSize ? { height: visibleContentSize.height } : null],
+    [visibleContentSize, webScrollbarStyle],
+  );
+
   if (!modalVisible) return null;
 
-  const { width: screenWidth } = Dimensions.get("window");
-  const resolvedWidthStyle: ViewStyle = fullWidth
-    ? { width: screenWidth - horizontalPadding * 2 }
-    : {
-        ...(typeof width === "number" ? { width } : null),
-        ...(typeof minWidth === "number" ? { minWidth } : null),
-        ...(typeof maxWidth === "number" ? { maxWidth } : null),
-      };
+  const content = (
+    <View collapsable={false} onLayout={handleMeasuredContentLayout}>
+      {children}
+    </View>
+  );
 
   return (
     <Modal
@@ -377,49 +621,29 @@ export function DropdownMenuContent({
       transparent
       animationType="none"
       statusBarTranslucent={Platform.OS === "android"}
+      onDismiss={flushPendingSelect}
       onRequestClose={handleClose}
     >
       <View style={styles.overlay}>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="Menu backdrop"
+          accessibilityLabel={t("menu.backdrop")}
           style={styles.backdrop}
           onPress={handleClose}
           testID={testID ? `${testID}-backdrop` : undefined}
         />
-        {!closing ? (
-          <Animated.View
-            entering={contentEntering}
-            exiting={contentExiting.withCallback((finished) => {
-              "worklet";
-              if (finished) {
-                runOnJS(setModalVisible)(false);
-              }
-            })}
-            collapsable={false}
-            testID={testID}
-            onLayout={handleContentLayout}
-            style={[
-              styles.content,
-              resolvedWidthStyle,
-              {
-                position: "absolute",
-                top: position?.y ?? -9999,
-                left: position?.x ?? -9999,
-                transformOrigin: getTransformOrigin(actualPlacement, align),
-              },
-            ]}
-          >
-            <ScrollView
-              bounces={false}
-              showsVerticalScrollIndicator
-              style={webScrollbarStyle}
-              contentContainerStyle={{ flexGrow: 1 }}
-            >
-              {children}
-            </ScrollView>
-          </Animated.View>
-        ) : null}
+        {!closing
+          ? renderDropdownSurface({
+              frameStyle,
+              testID,
+              surfaceStyle,
+              scrollable,
+              scrollViewportStyle,
+              content,
+              surfaceNativeID,
+              onExited: () => setModalVisible(false),
+            })
+          : null}
       </View>
     </Modal>
   );
@@ -430,8 +654,9 @@ export function DropdownMenuLabel({
   style,
   testID,
 }: PropsWithChildren<{ style?: ViewStyle | ViewStyle[]; testID?: string }>): ReactElement {
+  const labelContainerStyle = useMemo(() => [styles.labelContainer, style], [style]);
   return (
-    <View style={[styles.labelContainer, style]} testID={testID}>
+    <View style={labelContainerStyle} testID={testID}>
       <Text style={styles.labelText}>{children}</Text>
     </View>
   );
@@ -444,7 +669,8 @@ export function DropdownMenuSeparator({
   style?: ViewStyle;
   testID?: string;
 }): ReactElement {
-  return <View style={[styles.separator, style]} testID={testID} />;
+  const separatorStyle = useMemo(() => [styles.separator, style], [style]);
+  return <View style={separatorStyle} testID={testID} />;
 }
 
 export function DropdownMenuHint({
@@ -456,6 +682,35 @@ export function DropdownMenuHint({
       <Text style={styles.hintText}>{children}</Text>
     </View>
   );
+}
+
+function resolveDropdownItemLeadingContent(input: {
+  isPending: boolean | undefined;
+  isSuccess: boolean;
+  leading: ReactElement | null;
+  theme: { colors: { foregroundMuted: string; palette: { green: Record<number, string> } } };
+}): ReactElement | null {
+  const { isPending, isSuccess, leading, theme } = input;
+  if (isPending) {
+    return <ActivityIndicator size={16} color={theme.colors.foregroundMuted} />;
+  }
+  if (isSuccess) {
+    return <CheckCircle size={16} color={theme.colors.palette.green[500]} />;
+  }
+  return leading;
+}
+
+function resolveDropdownItemLabel(input: {
+  children: ReactNode;
+  isPending: boolean | undefined;
+  isSuccess: boolean;
+  pendingLabel?: string;
+  successLabel?: string;
+}): ReactNode {
+  const { children, isPending, isSuccess, pendingLabel, successLabel } = input;
+  if (isPending && pendingLabel) return pendingLabel;
+  if (isSuccess && successLabel) return successLabel;
+  return children;
 }
 
 export function DropdownMenuItem({
@@ -501,30 +756,27 @@ export function DropdownMenuItem({
   tooltip?: string;
 }>): ReactElement {
   const { theme } = useUnistyles();
-  const { setOpen } = useDropdownMenuContext("DropdownMenuItem");
+  const { selectItem } = useDropdownMenuContext("DropdownMenuItem");
 
   // Derive state from status prop (preferred) or legacy loading prop
   const isPending = status === "pending" || loading;
   const isSuccess = status === "success";
   const isDisabled = disabled || isPending || isSuccess;
 
-  // Determine leading icon based on status
-  let leadingContent: ReactElement | null = null;
-  if (isPending) {
-    leadingContent = <ActivityIndicator size={16} color={theme.colors.foregroundMuted} />;
-  } else if (isSuccess) {
-    leadingContent = <CheckCircle size={16} color={theme.colors.palette.green[500]} />;
-  } else if (leading) {
-    leadingContent = leading;
-  }
+  const leadingContent = resolveDropdownItemLeadingContent({
+    isPending,
+    isSuccess,
+    leading: leading ?? null,
+    theme,
+  });
 
-  // Determine label based on status
-  let label = children;
-  if (isPending && pendingLabel) {
-    label = pendingLabel;
-  } else if (isSuccess && successLabel) {
-    label = successLabel;
-  }
+  const label = resolveDropdownItemLabel({
+    children,
+    isPending,
+    isSuccess,
+    pendingLabel,
+    successLabel,
+  });
 
   const trailingContent =
     trailing ??
@@ -532,25 +784,23 @@ export function DropdownMenuItem({
       <Check size={16} color={theme.colors.foregroundMuted} />
     ) : null);
 
-  const content = (
-    <Pressable
-      testID={testID}
-      accessibilityRole="button"
-      disabled={isDisabled}
-      onPress={() => {
-        if (isDisabled) return;
-        if (closeOnSelect) {
-          setOpen(false);
-        }
-        onSelect?.();
-      }}
-      style={({ pressed, hovered }) => [
+  const handleItemPress = useCallback(() => {
+    if (isDisabled) return;
+    selectItem(onSelect, closeOnSelect);
+  }, [isDisabled, selectItem, onSelect, closeOnSelect]);
+
+  const itemPressableStyle = useCallback(
+    ({ pressed, hovered = false }: PressableStateCallbackType & { hovered?: boolean }) => {
+      let selectedStyle: typeof styles.itemSelectedAccent | typeof styles.itemSelected | null =
+        null;
+      if (selected && selectedVariant === "accent") {
+        selectedStyle = styles.itemSelectedAccent;
+      } else if (selected) {
+        selectedStyle = styles.itemSelected;
+      }
+      return [
         styles.item,
-        selected
-          ? selectedVariant === "accent"
-            ? styles.itemSelectedAccent
-            : styles.itemSelected
-          : null,
+        selectedStyle,
         selected && (hovered || pressed) && selectedVariant !== "accent"
           ? styles.itemSelectedInteractive
           : null,
@@ -558,7 +808,37 @@ export function DropdownMenuItem({
         muted && !isDisabled ? styles.itemMuted : null,
         hovered && !pressed && !isDisabled ? styles.itemHovered : null,
         pressed && !isDisabled ? styles.itemPressed : null,
-      ]}
+      ];
+    },
+    [selected, selectedVariant, isDisabled, muted],
+  );
+
+  const itemTextStyle = useMemo(
+    () => [
+      styles.itemText,
+      destructive && !isSuccess ? styles.itemTextDestructive : null,
+      isSuccess ? styles.itemTextSuccess : null,
+      selected && selectedVariant === "accent" ? styles.itemTextSelectedAccent : null,
+      muted && !isDisabled ? styles.itemTextMuted : null,
+    ],
+    [destructive, isSuccess, selected, selectedVariant, muted, isDisabled],
+  );
+
+  const itemDescriptionStyle = useMemo(
+    () => [
+      styles.itemDescription,
+      selected && selectedVariant === "accent" ? styles.itemDescriptionSelectedAccent : null,
+    ],
+    [selected, selectedVariant],
+  );
+
+  const content = (
+    <Pressable
+      testID={testID}
+      accessibilityRole="button"
+      disabled={isDisabled}
+      onPress={handleItemPress}
+      style={itemPressableStyle}
     >
       {showSelectedCheck ? (
         <View style={styles.checkSlot}>
@@ -567,28 +847,11 @@ export function DropdownMenuItem({
       ) : null}
       {leadingContent ? <View style={styles.leadingSlot}>{leadingContent}</View> : null}
       <View style={styles.itemContent}>
-        <Text
-          numberOfLines={1}
-          style={[
-            styles.itemText,
-            destructive && !isSuccess ? styles.itemTextDestructive : null,
-            isSuccess ? styles.itemTextSuccess : null,
-            selected && selectedVariant === "accent" ? styles.itemTextSelectedAccent : null,
-            muted && !isDisabled ? styles.itemTextMuted : null,
-          ]}
-        >
+        <Text numberOfLines={1} style={itemTextStyle}>
           {label}
         </Text>
         {description && !isPending && !isSuccess ? (
-          <Text
-            numberOfLines={2}
-            style={[
-              styles.itemDescription,
-              selected && selectedVariant === "accent"
-                ? styles.itemDescriptionSelectedAccent
-                : null,
-            ]}
-          >
+          <Text numberOfLines={2} style={itemDescriptionStyle}>
             {description}
           </Text>
         ) : null}
@@ -638,8 +901,6 @@ const styles = StyleSheet.create((theme) => ({
   labelText: {
     fontSize: theme.fontSize.xs,
     color: theme.colors.foregroundMuted,
-    textTransform: "uppercase",
-    letterSpacing: 0.6,
   },
   separator: {
     height: 1,
@@ -731,5 +992,6 @@ const styles = StyleSheet.create((theme) => ({
   },
   itemContent: {
     flexShrink: 1,
+    minWidth: 0,
   },
 }));

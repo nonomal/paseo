@@ -11,7 +11,6 @@ import {
   useState,
   type PropsWithChildren,
   type ReactElement,
-  type Ref,
 } from "react";
 import {
   Dimensions,
@@ -26,9 +25,10 @@ import {
 } from "react-native";
 import { Portal } from "@gorhom/portal";
 import { useBottomSheetModalInternal } from "@gorhom/bottom-sheet";
-import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
+import { FadeIn, FadeOut } from "react-native-reanimated";
 import { StyleSheet } from "react-native-unistyles";
 import { useIsCompactFormFactor } from "@/constants/layout";
+import { FloatingSurface } from "@/components/ui/floating";
 import { isWeb } from "@/constants/platform";
 
 type Side = "top" | "bottom" | "left" | "right";
@@ -41,14 +41,14 @@ interface Rect {
   height: number;
 }
 
-type TooltipContextValue = {
+interface TooltipContextValue {
   open: boolean;
   setOpen: (open: boolean) => void;
   triggerRef: React.RefObject<View | null>;
   enabled: boolean;
   openOnPress: boolean;
   delayDuration: number;
-};
+}
 
 const TooltipContext = createContext<TooltipContextValue | null>(null);
 
@@ -60,24 +60,42 @@ function useTooltipContext(componentName: string): TooltipContextValue {
   return ctx;
 }
 
-function composeEventHandlers<E>(
-  original?: (event: E) => void,
-  injected?: (event: E) => void,
-): (event: E) => void {
-  return (event: E) => {
-    original?.(event);
-    injected?.(event);
+// Tooltips should open on hover or keyboard focus, not when focus is restored
+// programmatically (e.g. when a Modal closes and returns focus to its opener).
+// Track the last input modality on web so TooltipTrigger can ignore focus
+// events that weren't keyboard-driven. Native has no equivalent scenario.
+let lastInputWasKeyboard = false;
+if (isWeb && typeof window !== "undefined") {
+  const markKeyboard = () => {
+    lastInputWasKeyboard = true;
   };
+  const markPointer = () => {
+    lastInputWasKeyboard = false;
+  };
+  window.addEventListener("keydown", markKeyboard, true);
+  window.addEventListener("mousedown", markPointer, true);
+  window.addEventListener("pointerdown", markPointer, true);
+  window.addEventListener("touchstart", markPointer, true);
 }
 
-function assignRef<T>(ref: Ref<T> | undefined, value: T): void {
-  if (typeof ref === "function") {
-    ref(value);
-    return;
-  }
-  if (ref && typeof ref === "object") {
-    (ref as { current: T }).current = value;
-  }
+function shouldOpenOnFocus(): boolean {
+  return !isWeb || lastInputWasKeyboard;
+}
+
+function isCallable(fn: unknown): fn is (...args: unknown[]) => void {
+  return typeof fn === "function";
+}
+
+function composeEventHandlers(
+  original: unknown,
+  injected: (event: unknown) => void,
+): (event: unknown) => void {
+  return (event: unknown) => {
+    if (isCallable(original)) {
+      original(event);
+    }
+    injected(event);
+  };
 }
 
 function useControllableOpenState({
@@ -91,7 +109,7 @@ function useControllableOpenState({
 }): [boolean, (next: boolean) => void] {
   const [internalOpen, setInternalOpen] = useState(Boolean(defaultOpen));
   const isControlled = typeof open === "boolean";
-  const value = isControlled ? Boolean(open) : internalOpen;
+  const value = isControlled ? open : internalOpen;
   const setValue = useCallback(
     (next: boolean) => {
       if (!isControlled) setInternalOpen(next);
@@ -110,6 +128,37 @@ function measureElement(element: View): Promise<Rect> {
   });
 }
 
+function resolveActualSide(args: {
+  triggerRect: Rect;
+  contentSize: { width: number; height: number };
+  displayArea: Rect;
+  side: Side;
+}): Side {
+  const { triggerRect, contentSize, displayArea, side } = args;
+  const spaceTop = triggerRect.y - displayArea.y;
+  const spaceBottom = displayArea.y + displayArea.height - (triggerRect.y + triggerRect.height);
+  const spaceLeft = triggerRect.x - displayArea.x;
+  const spaceRight = displayArea.x + displayArea.width - (triggerRect.x + triggerRect.width);
+
+  if (side === "bottom" && spaceBottom < contentSize.height && spaceTop > spaceBottom) return "top";
+  if (side === "top" && spaceTop < contentSize.height && spaceBottom > spaceTop) return "bottom";
+  if (side === "left" && spaceLeft < contentSize.width && spaceRight > spaceLeft) return "right";
+  if (side === "right" && spaceRight < contentSize.width && spaceLeft > spaceRight) return "left";
+  return side;
+}
+
+function resolveAlignedCoordinate(args: {
+  align: Align;
+  start: number;
+  size: number;
+  contentSize: number;
+}): number {
+  const { align, start, size, contentSize } = args;
+  if (align === "start") return start;
+  if (align === "end") return start + size - contentSize;
+  return start + (size - contentSize) / 2;
+}
+
 function computePosition({
   triggerRect,
   contentSize,
@@ -126,62 +175,43 @@ function computePosition({
   offset: number;
 }): { x: number; y: number; actualSide: Side } {
   const { width: contentWidth, height: contentHeight } = contentSize;
-
-  const spaceTop = triggerRect.y - displayArea.y;
-  const spaceBottom = displayArea.y + displayArea.height - (triggerRect.y + triggerRect.height);
-  const spaceLeft = triggerRect.x - displayArea.x;
-  const spaceRight = displayArea.x + displayArea.width - (triggerRect.x + triggerRect.width);
-
-  let actualSide = side;
-  if (side === "bottom" && spaceBottom < contentHeight && spaceTop > spaceBottom) {
-    actualSide = "top";
-  } else if (side === "top" && spaceTop < contentHeight && spaceBottom > spaceTop) {
-    actualSide = "bottom";
-  } else if (side === "left" && spaceLeft < contentWidth && spaceRight > spaceLeft) {
-    actualSide = "right";
-  } else if (side === "right" && spaceRight < contentWidth && spaceLeft > spaceRight) {
-    actualSide = "left";
-  }
+  const actualSide = resolveActualSide({ triggerRect, contentSize, displayArea, side });
 
   let x = 0;
   let y = 0;
 
   if (actualSide === "bottom") {
     y = triggerRect.y + triggerRect.height + offset;
-    if (align === "start") {
-      x = triggerRect.x;
-    } else if (align === "end") {
-      x = triggerRect.x + triggerRect.width - contentWidth;
-    } else {
-      x = triggerRect.x + (triggerRect.width - contentWidth) / 2;
-    }
+    x = resolveAlignedCoordinate({
+      align,
+      start: triggerRect.x,
+      size: triggerRect.width,
+      contentSize: contentWidth,
+    });
   } else if (actualSide === "top") {
     y = triggerRect.y - contentHeight - offset;
-    if (align === "start") {
-      x = triggerRect.x;
-    } else if (align === "end") {
-      x = triggerRect.x + triggerRect.width - contentWidth;
-    } else {
-      x = triggerRect.x + (triggerRect.width - contentWidth) / 2;
-    }
+    x = resolveAlignedCoordinate({
+      align,
+      start: triggerRect.x,
+      size: triggerRect.width,
+      contentSize: contentWidth,
+    });
   } else if (actualSide === "left") {
     x = triggerRect.x - contentWidth - offset;
-    if (align === "start") {
-      y = triggerRect.y;
-    } else if (align === "end") {
-      y = triggerRect.y + triggerRect.height - contentHeight;
-    } else {
-      y = triggerRect.y + (triggerRect.height - contentHeight) / 2;
-    }
+    y = resolveAlignedCoordinate({
+      align,
+      start: triggerRect.y,
+      size: triggerRect.height,
+      contentSize: contentHeight,
+    });
   } else {
     x = triggerRect.x + triggerRect.width + offset;
-    if (align === "start") {
-      y = triggerRect.y;
-    } else if (align === "end") {
-      y = triggerRect.y + triggerRect.height - contentHeight;
-    } else {
-      y = triggerRect.y + (triggerRect.height - contentHeight) / 2;
-    }
+    y = resolveAlignedCoordinate({
+      align,
+      start: triggerRect.y,
+      size: triggerRect.height,
+      contentSize: contentHeight,
+    });
   }
 
   const padding = 8;
@@ -246,12 +276,10 @@ export function TooltipTrigger({
   asChild = false,
   triggerRefProp = "ref",
   ...props
-}: PropsWithChildren<
-  PressableProps & {
-    asChild?: boolean;
-    triggerRefProp?: string;
-  }
->): ReactElement {
+}: PressableProps & {
+  asChild?: boolean;
+  triggerRefProp?: string;
+}): ReactElement {
   const ctx = useTooltipContext("TooltipTrigger");
   const openTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -287,25 +315,26 @@ export function TooltipTrigger({
   }, [clearOpenTimer]);
 
   const handleHoverIn = useCallback(
-    (e?: any) => {
-      onHoverIn?.(e);
+    (e?: unknown) => {
+      if (isCallable(onHoverIn)) onHoverIn(e);
       scheduleOpen();
     },
     [onHoverIn, scheduleOpen],
   );
 
   const handleHoverOut = useCallback(
-    (e?: any) => {
-      onHoverOut?.(e);
+    (e?: unknown) => {
+      if (isCallable(onHoverOut)) onHoverOut(e);
       close();
     },
     [onHoverOut, close],
   );
 
   const handleFocus = useCallback(
-    (e: any) => {
-      onFocus?.(e);
+    (e: unknown) => {
+      if (isCallable(onFocus)) onFocus(e);
       if (!ctx.enabled || disabled) return;
+      if (!shouldOpenOnFocus()) return;
       clearOpenTimer();
       ctx.setOpen(true);
     },
@@ -313,16 +342,16 @@ export function TooltipTrigger({
   );
 
   const handleBlur = useCallback(
-    (e: any) => {
-      onBlur?.(e);
+    (e: unknown) => {
+      if (isCallable(onBlur)) onBlur(e);
       close();
     },
     [close, onBlur],
   );
 
   const handlePress = useCallback(
-    (e: any) => {
-      onPress?.(e);
+    (e: unknown) => {
+      if (isCallable(onPress)) onPress(e);
       if (!ctx.enabled || disabled) {
         return;
       }
@@ -351,7 +380,7 @@ export function TooltipTrigger({
           onPointerLeave: handleHoverOut,
           onMouseEnter: handleHoverIn,
           onMouseLeave: handleHoverOut,
-        } as any)
+        } as object)
       : null),
   };
 
@@ -361,25 +390,33 @@ export function TooltipTrigger({
       throw new Error("TooltipTrigger with asChild expects a single React element child");
     }
 
-    const childProps = child.props as Record<string, any>;
-    const mergedProps = {
-      ...childProps,
+    const rawProps: unknown = child.props;
+    if (typeof rawProps !== "object" || rawProps === null) {
+      throw new Error("TooltipTrigger asChild child must have props object");
+    }
+    const mergedProps: Record<string, unknown> = {
+      ...Object.assign({}, rawProps),
       ...triggerProps,
-      onHoverIn: composeEventHandlers(childProps.onHoverIn, handleHoverIn),
-      onHoverOut: composeEventHandlers(childProps.onHoverOut, handleHoverOut),
-      onFocus: composeEventHandlers(childProps.onFocus, handleFocus),
-      onBlur: composeEventHandlers(childProps.onBlur, handleBlur),
-      onPress: composeEventHandlers(childProps.onPress, handlePress),
-      onPointerEnter: composeEventHandlers(childProps.onPointerEnter, handleHoverIn),
-      onPointerLeave: composeEventHandlers(childProps.onPointerLeave, handleHoverOut),
-      onMouseEnter: composeEventHandlers(childProps.onMouseEnter, handleHoverIn),
-      onMouseLeave: composeEventHandlers(childProps.onMouseLeave, handleHoverOut),
-    } as Record<string, any>;
+      disabled: Reflect.get(rawProps, "disabled") || disabled,
+      onHoverIn: composeEventHandlers(Reflect.get(rawProps, "onHoverIn"), handleHoverIn),
+      onHoverOut: composeEventHandlers(Reflect.get(rawProps, "onHoverOut"), handleHoverOut),
+      onFocus: composeEventHandlers(Reflect.get(rawProps, "onFocus"), handleFocus),
+      onBlur: composeEventHandlers(Reflect.get(rawProps, "onBlur"), handleBlur),
+      onPress: composeEventHandlers(Reflect.get(rawProps, "onPress"), handlePress),
+      onPointerEnter: composeEventHandlers(Reflect.get(rawProps, "onPointerEnter"), handleHoverIn),
+      onPointerLeave: composeEventHandlers(Reflect.get(rawProps, "onPointerLeave"), handleHoverOut),
+      onMouseEnter: composeEventHandlers(Reflect.get(rawProps, "onMouseEnter"), handleHoverIn),
+      onMouseLeave: composeEventHandlers(Reflect.get(rawProps, "onMouseLeave"), handleHoverOut),
+    };
 
-    const existingRefProp = childProps[triggerRefProp] as Ref<View | null> | undefined;
-    mergedProps[triggerRefProp] = (node: View | null) => {
-      assignRef(existingRefProp, node);
-      assignRef(ctx.triggerRef, node);
+    const existingRefProp = Reflect.get(rawProps, triggerRefProp);
+    mergedProps[triggerRefProp] = (node: View) => {
+      if (isCallable(existingRefProp)) {
+        existingRefProp(node);
+      } else if (existingRefProp && typeof existingRefProp === "object") {
+        Object.assign(existingRefProp, { current: node });
+      }
+      Object.assign(ctx.triggerRef, { current: node });
     };
 
     return cloneElement(child, mergedProps);
@@ -419,15 +456,15 @@ export function TooltipContent({
       setTriggerRect(null);
       setContentSize(null);
       setPosition(null);
-      return;
+      return () => {};
     }
 
     const statusBarHeight = Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) : 0;
     let cancelled = false;
 
-    measureElement(ctx.triggerRef.current).then((rect) => {
-      if (cancelled) return;
-      setTriggerRect({ ...rect, y: rect.y + statusBarHeight });
+    void measureElement(ctx.triggerRef.current).then((rect) => {
+      if (!cancelled) setTriggerRect({ ...rect, y: rect.y + statusBarHeight });
+      return undefined;
     });
 
     return () => {
@@ -458,6 +495,21 @@ export function TooltipContent({
     [],
   );
 
+  const frameStyle = useMemo(
+    () => [
+      {
+        position: "absolute" as const,
+        top: position?.y ?? -9999,
+        left: position?.x ?? -9999,
+        maxWidth,
+      },
+    ],
+    [maxWidth, position?.x, position?.y],
+  );
+  const contentStyle = useMemo(() => [styles.content, style], [style]);
+
+  const handleDismiss = useCallback(() => ctx.setOpen(false), [ctx]);
+
   if (!ctx.open || !ctx.enabled) return null;
 
   // On web, avoid React Native's <Modal/> implementation (it uses <dialog> and can
@@ -467,26 +519,18 @@ export function TooltipContent({
     return (
       <Portal hostName={bottomSheetInternal?.hostName}>
         <View pointerEvents="none" style={styles.portalOverlay}>
-          <Animated.View
+          <FloatingSurface
             pointerEvents="none"
             entering={FadeIn.duration(80)}
             exiting={FadeOut.duration(80)}
             collapsable={false}
             testID={testID}
             onLayout={handleLayout}
-            style={[
-              styles.content,
-              { maxWidth },
-              style,
-              {
-                position: "absolute",
-                top: position?.y ?? -9999,
-                left: position?.x ?? -9999,
-              },
-            ]}
+            style={contentStyle}
+            frameStyle={frameStyle}
           >
             {children}
-          </Animated.View>
+          </FloatingSurface>
         </View>
       </Portal>
     );
@@ -498,29 +542,21 @@ export function TooltipContent({
       transparent
       animationType="none"
       statusBarTranslucent={Platform.OS === "android"}
-      onRequestClose={() => ctx.setOpen(false)}
+      onRequestClose={handleDismiss}
     >
-      <Pressable style={styles.overlay} onPress={() => ctx.setOpen(false)}>
-        <Animated.View
+      <Pressable style={styles.overlay} onPress={handleDismiss}>
+        <FloatingSurface
           pointerEvents="none"
           entering={FadeIn.duration(80)}
           exiting={FadeOut.duration(80)}
           collapsable={false}
           testID={testID}
           onLayout={handleLayout}
-          style={[
-            styles.content,
-            { maxWidth },
-            style,
-            {
-              position: "absolute",
-              top: position?.y ?? -9999,
-              left: position?.x ?? -9999,
-            },
-          ]}
+          style={contentStyle}
+          frameStyle={frameStyle}
         >
           {children}
-        </Animated.View>
+        </FloatingSurface>
       </Pressable>
     </Modal>
   );

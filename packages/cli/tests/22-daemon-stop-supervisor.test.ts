@@ -6,7 +6,7 @@
  */
 
 import assert from "node:assert";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,9 +39,9 @@ function isProcessRunning(pid: number): boolean {
   }
 }
 
-type PidLockState = {
+interface PidLockState {
   pid: number | null;
-};
+}
 
 async function readPidLockState(paseoHome: string): Promise<PidLockState> {
   const pidPath = join(paseoHome, "paseo.pid");
@@ -59,19 +59,10 @@ async function readPidLockState(paseoHome: string): Promise<PidLockState> {
   }
 }
 
-function readProcessCommand(pid: number): string | null {
-  const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
-  if (result.status !== 0 || result.error) {
-    return null;
-  }
-  const command = result.stdout.trim();
-  return command.length > 0 ? command : null;
-}
-
-type DaemonStatus = {
+interface DaemonStatus {
   localDaemon: string | null;
   pid: number | null;
-};
+}
 
 async function readDaemonStatus(paseoHome: string): Promise<DaemonStatus> {
   const result =
@@ -93,6 +84,11 @@ async function readDaemonStatus(paseoHome: string): Promise<DaemonStatus> {
   }
 }
 
+async function readCapturedSupervisorLogs(paseoHome: string, recentLogs: string): Promise<string> {
+  const durableLogs = await readFile(join(paseoHome, "daemon.log"), "utf8").catch(() => "");
+  return `${recentLogs}\n${durableLogs}`;
+}
+
 async function waitFor(
   check: () => Promise<boolean> | boolean,
   timeoutMs: number,
@@ -100,14 +96,14 @@ async function waitFor(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
 
-  while (Date.now() < deadline) {
-    if (await check()) {
-      return;
-    }
+  async function poll(): Promise<void> {
+    if (await check()) return;
+    if (Date.now() >= deadline) throw new Error(message);
     await sleep(pollIntervalMs);
+    return poll();
   }
 
-  throw new Error(message);
+  return poll();
 }
 
 console.log("=== Daemon Stop (supervisor regression) ===\n");
@@ -168,11 +164,10 @@ try {
   assert(isProcessRunning(daemonPid), "daemon process should be running");
   const pidLockBeforeStop = await readPidLockState(paseoHome);
   assert.strictEqual(pidLockBeforeStop.pid, daemonPid, "pid lock should match status pid");
-  const command = readProcessCommand(daemonPid);
-  assert(command !== null, "pid lock pid should resolve to a running process command");
-  assert(
-    command.includes("supervisor-entrypoint.ts") || command.includes("supervisor-entrypoint.js"),
-    `pid lock pid should be supervisor-entrypoint process, got: ${command}`,
+  assert.strictEqual(
+    daemonPid,
+    supervisorProcess.pid,
+    "pid lock pid should be the supervisor-entrypoint process",
   );
   console.log(`✓ dev daemon started with daemon pid ${daemonPid}\n`);
 
@@ -216,13 +211,20 @@ try {
     "stopped",
     "daemon should remain stopped after stop command",
   );
+  const capturedSupervisorLogs = await readCapturedSupervisorLogs(paseoHome, recentSupervisorLogs);
   assert(
-    recentSupervisorLogs.includes("Shutdown requested by worker. Stopping worker..."),
-    `stop should request lifecycle shutdown from daemon worker, logs:\n${recentSupervisorLogs}`,
+    capturedSupervisorLogs.includes('"msg":"Worker requested shutdown"') &&
+      capturedSupervisorLogs.includes('"reason":"client_shutdown_rpc"'),
+    `stop should log lifecycle shutdown reason from daemon worker, logs:\n${capturedSupervisorLogs}`,
   );
   assert(
-    !recentSupervisorLogs.includes("cli_shutdown"),
-    `supervisor logs should not route shutdown by reason string:\n${recentSupervisorLogs}`,
+    capturedSupervisorLogs.includes('"msg":"Supervisor sending signal to worker"') &&
+      capturedSupervisorLogs.includes('"signal":"SIGTERM"'),
+    `stop should log supervisor signal dispatch, logs:\n${capturedSupervisorLogs}`,
+  );
+  assert(
+    !capturedSupervisorLogs.includes("cli_shutdown"),
+    `supervisor logs should not route shutdown by reason string:\n${capturedSupervisorLogs}`,
   );
   console.log("✓ stop leaves supervised daemon stopped (no respawn)\n");
 } finally {

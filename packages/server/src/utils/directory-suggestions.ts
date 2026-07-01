@@ -1,6 +1,7 @@
 import type { Dirent } from "node:fs";
 import { readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { isPathInsideRoot } from "./path.js";
 
 export interface SearchHomeDirectoriesOptions {
   homeDir: string;
@@ -23,57 +24,83 @@ export interface SearchWorkspaceEntriesOptions {
   limit?: number;
   includeFiles?: boolean;
   includeDirectories?: boolean;
+  matchMode?: WorkspaceMatchMode;
   maxDepth?: number;
   maxEntriesScanned?: number;
 }
 
+export type WorkspaceMatchMode = "fuzzy" | "suffix";
+
 const DEFAULT_LIMIT = 30;
 const MAX_LIMIT = 100;
-const DEFAULT_MAX_DEPTH = 6;
-const DEFAULT_MAX_DIRECTORIES_SCANNED = 5000;
+const DEFAULT_MAX_DEPTH = 12;
+const DEFAULT_MAX_DIRECTORIES_SCANNED = 20000;
 const DIRECTORY_LIST_CACHE_TTL_MS = 8_000;
 const DIRECTORY_LIST_CACHE_MAX_ENTRIES = 4_000;
 
-type QueryParts = {
+interface QueryParts {
   isPathQuery: boolean;
   parentPart: string;
   searchTerm: string;
-};
+}
 
-type RankedDirectory = {
+interface RankedDirectory {
   absolutePath: string;
   matchTier: number;
   segmentIndex: number;
   matchOffset: number;
   depth: number;
-};
+}
 
-type ChildDirectoryEntry = {
+interface ChildDirectoryEntry {
   name: string;
   absolutePath: string;
-};
+}
 
-type ChildWorkspaceEntry = {
+interface ChildWorkspaceEntry {
   name: string;
   absolutePath: string;
   kind: WorkspaceSuggestionKind;
-};
+}
 
-type DirectoryListCacheEntry = {
+interface DirectoryListCacheEntry {
   expiresAt: number;
   entries: ChildDirectoryEntry[];
-};
+}
 
-type WorkspaceEntryListCacheEntry = {
+interface WorkspaceEntryListCacheEntry {
   expiresAt: number;
   entries: ChildWorkspaceEntry[];
-};
+}
 
 const directoryListCache = new Map<string, DirectoryListCacheEntry>();
 const workspaceEntryListCache = new Map<string, WorkspaceEntryListCacheEntry>();
 const NO_SEGMENT_INDEX = Number.MAX_SAFE_INTEGER;
 const NO_MATCH_OFFSET = Number.MAX_SAFE_INTEGER;
-const WORKSPACE_IGNORED_DIRECTORY_NAMES = new Set(["node_modules"]);
+const NO_FUZZY_SCORE = Number.MAX_SAFE_INTEGER;
+const NO_WORKSPACE_MATCH_TIER = 5;
+const IGNORED_SUGGESTION_DIRECTORY_NAMES = new Set([
+  "node_modules",
+  "venv",
+  "env",
+  "virtualenv",
+  "dist",
+  "build",
+  "target",
+  "out",
+  "coverage",
+  "vendor",
+  "__pycache__",
+  ".git",
+]);
+const TRAVERSABLE_HIDDEN_WORKSPACE_DIRECTORY_NAMES = new Set([
+  ".agents",
+  ".claude",
+  ".codex",
+  ".github",
+  ".paseo",
+  ".vscode",
+]);
 
 export async function searchHomeDirectories(
   options: SearchHomeDirectoriesOptions,
@@ -112,14 +139,15 @@ export async function searchHomeDirectories(
   });
 }
 
-type RankedWorkspaceEntry = {
+interface RankedWorkspaceEntry {
   relativePath: string;
   kind: WorkspaceSuggestionKind;
   matchTier: number;
   segmentIndex: number;
   matchOffset: number;
+  fuzzyScore: number;
   depth: number;
-};
+}
 
 export async function searchWorkspaceEntries(
   options: SearchWorkspaceEntriesOptions,
@@ -141,7 +169,21 @@ export async function searchWorkspaceEntries(
     return [];
   }
 
-  if (queryParts.isPathQuery) {
+  const matchMode = options.matchMode ?? "fuzzy";
+  const exactEntry =
+    queryParts.isPathQuery && matchMode === "suffix"
+      ? await resolveWorkspaceExactEntry({
+          workspaceRoot,
+          query: options.query,
+          includeDirectories,
+          includeFiles,
+        })
+      : null;
+  if (exactEntry && limit <= 1) {
+    return [exactEntry];
+  }
+
+  if (queryParts.isPathQuery && matchMode !== "suffix") {
     return searchWorkspaceWithinParentDirectory({
       workspaceRoot,
       parentPart: queryParts.parentPart,
@@ -152,15 +194,80 @@ export async function searchWorkspaceEntries(
     });
   }
 
-  return searchWorkspaceAcrossTree({
+  const searchTerm =
+    matchMode === "suffix"
+      ? [queryParts.parentPart, queryParts.searchTerm].filter(Boolean).join("/")
+      : queryParts.searchTerm;
+  const entries = await searchWorkspaceAcrossTree({
     workspaceRoot,
-    searchTerm: queryParts.searchTerm,
+    searchTerm,
     limit,
     includeDirectories,
     includeFiles,
+    matchMode,
     maxDepth: options.maxDepth ?? DEFAULT_MAX_DEPTH,
     maxEntriesScanned: options.maxEntriesScanned ?? DEFAULT_MAX_DIRECTORIES_SCANNED,
   });
+  return exactEntry ? prependWorkspaceEntry(exactEntry, entries).slice(0, limit) : entries;
+}
+
+async function resolveWorkspaceExactEntry(input: {
+  workspaceRoot: string;
+  query: string;
+  includeDirectories: boolean;
+  includeFiles: boolean;
+}): Promise<WorkspaceSuggestionEntry | null> {
+  const normalized = input.query
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/{2,}/g, "/");
+  if (!normalized) {
+    return null;
+  }
+
+  const candidatePath = path.isAbsolute(normalized)
+    ? path.resolve(normalized)
+    : path.resolve(input.workspaceRoot, normalized);
+  let resolvedPath: string;
+  try {
+    resolvedPath = await realpath(candidatePath);
+  } catch {
+    return null;
+  }
+  if (!isPathInsideRoot(input.workspaceRoot, resolvedPath)) {
+    return null;
+  }
+
+  const stats = await stat(resolvedPath).catch(() => null);
+  if (!stats) {
+    return null;
+  }
+  if (stats.isFile() && input.includeFiles) {
+    return {
+      path: normalizeRelativePath(input.workspaceRoot, resolvedPath),
+      kind: "file",
+    };
+  }
+  if (stats.isDirectory() && input.includeDirectories) {
+    return {
+      path: normalizeRelativePath(input.workspaceRoot, resolvedPath),
+      kind: "directory",
+    };
+  }
+  return null;
+}
+
+function prependWorkspaceEntry(
+  entry: WorkspaceSuggestionEntry,
+  entries: WorkspaceSuggestionEntry[],
+): WorkspaceSuggestionEntry[] {
+  return [
+    entry,
+    ...entries.filter(
+      (candidate) => candidate.kind !== entry.kind || candidate.path !== entry.path,
+    ),
+  ];
 }
 
 function normalizeLimit(limit: number | undefined): number {
@@ -294,18 +401,20 @@ async function searchWorkspaceWithinParentDirectory(input: {
     if (entry.kind === "file" && !input.includeFiles) {
       continue;
     }
-    if (searchLower && !entry.name.toLowerCase().includes(searchLower)) {
+    if (isHiddenWorkspaceSuggestion(entry)) {
+      continue;
+    }
+    const rankedEntry = rankWorkspaceEntry({
+      absolutePath: entry.absolutePath,
+      kind: entry.kind,
+      workspaceRoot: input.workspaceRoot,
+      searchLower,
+    });
+    if (searchLower && rankedEntry.matchTier === NO_WORKSPACE_MATCH_TIER) {
       continue;
     }
 
-    ranked.push(
-      rankWorkspaceEntry({
-        absolutePath: entry.absolutePath,
-        kind: entry.kind,
-        workspaceRoot: input.workspaceRoot,
-        searchLower,
-      }),
-    );
+    ranked.push(rankedEntry);
   }
 
   return dedupeAndSortWorkspaceEntries(ranked).slice(0, input.limit);
@@ -317,6 +426,7 @@ async function searchWorkspaceAcrossTree(input: {
   limit: number;
   includeDirectories: boolean;
   includeFiles: boolean;
+  matchMode: WorkspaceMatchMode;
   maxDepth: number;
   maxEntriesScanned: number;
 }): Promise<WorkspaceSuggestionEntry[]> {
@@ -361,31 +471,71 @@ async function searchWorkspaceAcrossTree(input: {
       if (entry.kind === "directory" && !input.includeDirectories) {
         continue;
       }
+      // Hidden directories are traversed, but not offered as suggestions.
+      if (isHiddenWorkspaceSuggestion(entry)) {
+        continue;
+      }
       if (entry.kind === "file" && !input.includeFiles) {
         continue;
       }
-
-      const relativePath = normalizeRelativePath(input.workspaceRoot, entry.absolutePath);
       if (
-        searchLower &&
-        !relativePath.toLowerCase().includes(searchLower) &&
-        !entry.name.toLowerCase().includes(searchLower)
+        input.matchMode === "suffix" &&
+        !workspaceEntryMatchesSuffixQuery({
+          absolutePath: entry.absolutePath,
+          workspaceRoot: input.workspaceRoot,
+          query: input.searchTerm,
+        })
       ) {
         continue;
       }
 
-      ranked.push(
-        rankWorkspaceEntry({
-          absolutePath: entry.absolutePath,
-          kind: entry.kind,
-          workspaceRoot: input.workspaceRoot,
-          searchLower,
-        }),
-      );
+      const rankedEntry = rankWorkspaceEntry({
+        absolutePath: entry.absolutePath,
+        kind: entry.kind,
+        workspaceRoot: input.workspaceRoot,
+        searchLower,
+      });
+      if (
+        input.matchMode !== "suffix" &&
+        searchLower &&
+        rankedEntry.matchTier === NO_WORKSPACE_MATCH_TIER
+      ) {
+        continue;
+      }
+
+      ranked.push(rankedEntry);
     }
   }
 
   return dedupeAndSortWorkspaceEntries(ranked).slice(0, input.limit);
+}
+
+function workspaceEntryMatchesSuffixQuery(input: {
+  absolutePath: string;
+  workspaceRoot: string;
+  query: string;
+}): boolean {
+  const querySegments = input.query
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => segment.toLowerCase());
+  if (querySegments.length === 0) {
+    return false;
+  }
+
+  const pathSegments = normalizeRelativePath(input.workspaceRoot, input.absolutePath)
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => segment.toLowerCase());
+  if (querySegments.length > pathSegments.length) {
+    return false;
+  }
+
+  const offset = pathSegments.length - querySegments.length;
+  return querySegments.every((segment, index) => pathSegments[offset + index] === segment);
 }
 
 function dedupeAndSortWorkspaceEntries(
@@ -420,6 +570,9 @@ function compareRankedWorkspaceEntries(
   }
   if (left.matchOffset !== right.matchOffset) {
     return left.matchOffset - right.matchOffset;
+  }
+  if (left.fuzzyScore !== right.fuzzyScore) {
+    return left.fuzzyScore - right.fuzzyScore;
   }
   if (left.depth !== right.depth) {
     return left.depth - right.depth;
@@ -529,6 +682,7 @@ function rankWorkspaceEntry(input: {
       matchTier: 3,
       segmentIndex: NO_SEGMENT_INDEX,
       matchOffset: 0,
+      fuzzyScore: NO_FUZZY_SCORE,
       depth,
     };
   }
@@ -542,7 +696,9 @@ function rankWorkspaceEntry(input: {
     segment.includes(searchLower),
   );
   const matchOffset = relativeLower.indexOf(searchLower);
-  let matchTier = 4;
+  const basename = segments.at(-1) ?? "";
+  const fuzzyScore = scoreFuzzySubsequence(searchLower, basename);
+  let matchTier = NO_WORKSPACE_MATCH_TIER;
   let segmentIndex = NO_SEGMENT_INDEX;
 
   if (exactSegmentIndex >= 0) {
@@ -556,6 +712,8 @@ function rankWorkspaceEntry(input: {
     segmentIndex = partialSegmentIndex;
   } else if (relativeLower.startsWith(searchLower)) {
     matchTier = 3;
+  } else if (fuzzyScore !== null) {
+    matchTier = 4;
   }
 
   return {
@@ -564,8 +722,45 @@ function rankWorkspaceEntry(input: {
     matchTier,
     segmentIndex,
     matchOffset: matchOffset >= 0 ? matchOffset : NO_MATCH_OFFSET,
+    fuzzyScore: fuzzyScore ?? NO_FUZZY_SCORE,
     depth,
   };
+}
+
+function scoreFuzzySubsequence(query: string, candidate: string): number | null {
+  if (!query) {
+    return 0;
+  }
+
+  let queryIndex = 0;
+  let firstMatchIndex = -1;
+  let previousMatchIndex = -1;
+  let gapScore = 0;
+
+  for (
+    let candidateIndex = 0;
+    candidateIndex < candidate.length && queryIndex < query.length;
+    candidateIndex += 1
+  ) {
+    if (candidate[candidateIndex] !== query[queryIndex]) {
+      continue;
+    }
+
+    if (firstMatchIndex === -1) {
+      firstMatchIndex = candidateIndex;
+    }
+    if (previousMatchIndex >= 0) {
+      gapScore += candidateIndex - previousMatchIndex - 1;
+    }
+    previousMatchIndex = candidateIndex;
+    queryIndex += 1;
+  }
+
+  if (queryIndex !== query.length || firstMatchIndex === -1) {
+    return null;
+  }
+
+  return firstMatchIndex + gapScore;
 }
 
 function findSegmentMatchIndex(
@@ -590,11 +785,6 @@ function normalizeRelativePath(homeRoot: string, absolutePath: string): string {
     return ".";
   }
   return relative.split(path.sep).join("/");
-}
-
-function isPathInsideRoot(root: string, target: string): boolean {
-  const relative = path.relative(root, target);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 function normalizeQueryParts(query: string, homeRoot: string): QueryParts | null {
@@ -720,28 +910,26 @@ async function listChildDirectories(input: {
   const dirents = await readdir(input.directory, { withFileTypes: true }).catch(
     () => [] as Dirent[],
   );
-  const entries: ChildDirectoryEntry[] = [];
-  for (const dirent of dirents) {
-    if (isHiddenDirectoryName(dirent.name)) {
-      continue;
-    }
-    if (!dirent.isDirectory() && !dirent.isSymbolicLink()) {
-      continue;
-    }
-    const candidatePath = path.join(input.directory, dirent.name);
-    const absolutePath = await resolveDirectoryCandidate({
-      candidatePath,
-      dirent,
-      homeRoot: input.homeRoot,
-    });
-    if (!absolutePath) {
-      continue;
-    }
-    entries.push({
-      name: dirent.name,
-      absolutePath,
-    });
-  }
+  const candidates = dirents.filter(
+    (dirent) =>
+      !isHiddenDirectoryName(dirent.name) &&
+      !isIgnoredSuggestionDirectoryName(dirent.name) &&
+      (dirent.isDirectory() || dirent.isSymbolicLink()),
+  );
+  const resolved = await Promise.all(
+    candidates.map(async (dirent) => {
+      const candidatePath = path.join(input.directory, dirent.name);
+      const absolutePath = await resolveDirectoryCandidate({
+        candidatePath,
+        dirent,
+        homeRoot: input.homeRoot,
+      });
+      return absolutePath ? { name: dirent.name, absolutePath } : null;
+    }),
+  );
+  const entries: ChildDirectoryEntry[] = resolved.filter(
+    (entry): entry is ChildDirectoryEntry => entry !== null,
+  );
 
   setDirectoryListCache(input.directory, {
     expiresAt: now + DIRECTORY_LIST_CACHE_TTL_MS,
@@ -764,30 +952,42 @@ async function listWorkspaceChildEntries(input: {
   const dirents = await readdir(input.directory, { withFileTypes: true }).catch(
     () => [] as Dirent[],
   );
-  const entries: ChildWorkspaceEntry[] = [];
-  for (const dirent of dirents) {
-    if (isHiddenDirectoryName(dirent.name)) {
-      continue;
+  const candidates = dirents.filter((dirent) => {
+    if (isIgnoredSuggestionDirectoryName(dirent.name)) {
+      return false;
     }
-    if (isIgnoredWorkspaceDirectoryName(dirent.name)) {
-      continue;
+    if (
+      isHiddenDirectoryName(dirent.name) &&
+      !dirent.isFile() &&
+      !isTraversableHiddenWorkspaceDirectoryName(dirent.name)
+    ) {
+      return false;
     }
+    // Allowlisted hidden directories remain traversable so file links like
+    // `.claude/settings.local.json` can resolve, but hidden files (e.g.
+    // `.DS_Store`) should never be suggested.
+    if (dirent.isFile() && isHiddenDirectoryName(dirent.name)) {
+      return false;
+    }
+    return true;
+  });
 
-    const candidatePath = path.join(input.directory, dirent.name);
-    const entry = await resolveWorkspaceCandidate({
-      candidatePath,
-      dirent,
-      workspaceRoot: input.workspaceRoot,
-    });
-    if (!entry) {
-      continue;
-    }
-    entries.push({
-      name: dirent.name,
-      absolutePath: entry.absolutePath,
-      kind: entry.kind,
-    });
-  }
+  const resolved = await Promise.all(
+    candidates.map(async (dirent) => {
+      const candidatePath = path.join(input.directory, dirent.name);
+      const entry = await resolveWorkspaceCandidate({
+        candidatePath,
+        dirent,
+        workspaceRoot: input.workspaceRoot,
+      });
+      return entry
+        ? { name: dirent.name, absolutePath: entry.absolutePath, kind: entry.kind }
+        : null;
+    }),
+  );
+  const entries: ChildWorkspaceEntry[] = resolved.filter(
+    (entry): entry is ChildWorkspaceEntry => entry !== null,
+  );
 
   setWorkspaceEntryListCache(input.directory, {
     expiresAt: now + DIRECTORY_LIST_CACHE_TTL_MS,
@@ -861,8 +1061,16 @@ function isHiddenDirectoryName(name: string): boolean {
   return name.startsWith(".");
 }
 
-function isIgnoredWorkspaceDirectoryName(name: string): boolean {
-  return WORKSPACE_IGNORED_DIRECTORY_NAMES.has(name);
+function isHiddenWorkspaceSuggestion(entry: ChildWorkspaceEntry): boolean {
+  return isHiddenDirectoryName(entry.name);
+}
+
+function isIgnoredSuggestionDirectoryName(name: string): boolean {
+  return IGNORED_SUGGESTION_DIRECTORY_NAMES.has(name);
+}
+
+function isTraversableHiddenWorkspaceDirectoryName(name: string): boolean {
+  return TRAVERSABLE_HIDDEN_WORKSPACE_DIRECTORY_NAMES.has(name);
 }
 
 function setDirectoryListCache(cacheKey: string, entry: DirectoryListCacheEntry): void {
@@ -888,7 +1096,7 @@ function pruneDirectoryListCache(): void {
   }
 
   while (directoryListCache.size > DIRECTORY_LIST_CACHE_MAX_ENTRIES) {
-    const oldestKey = directoryListCache.keys().next().value as string | undefined;
+    const oldestKey = directoryListCache.keys().next().value;
     if (!oldestKey) {
       return;
     }
@@ -909,7 +1117,7 @@ function pruneWorkspaceEntryListCache(): void {
   }
 
   while (workspaceEntryListCache.size > DIRECTORY_LIST_CACHE_MAX_ENTRIES) {
-    const oldestKey = workspaceEntryListCache.keys().next().value as string | undefined;
+    const oldestKey = workspaceEntryListCache.keys().next().value;
     if (!oldestKey) {
       return;
     }

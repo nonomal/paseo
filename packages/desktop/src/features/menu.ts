@@ -1,9 +1,14 @@
 import { app, Menu, BrowserWindow, ipcMain } from "electron";
+import { getMostRecentWorkspaceActivePaseoBrowserWebContents } from "./browser-webviews/index.js";
 
-type ShowContextMenuInput = {
+interface ShowContextMenuInput {
   kind?: "terminal";
   hasSelection?: boolean;
-};
+}
+
+interface ApplicationMenuOptions {
+  onNewWindow: () => void;
+}
 
 function withBrowserWindow(
   callback: (win: BrowserWindow) => void,
@@ -14,10 +19,38 @@ function withBrowserWindow(
   };
 }
 
-export function setupApplicationMenu(): void {
+function getReloadTargetBrowserWebContents(): Electron.WebContents | null {
+  return getMostRecentWorkspaceActivePaseoBrowserWebContents();
+}
+
+function reloadFocusedContentsOrWindow(win: BrowserWindow, options?: { ignoreCache?: boolean }) {
+  const browserContents = getReloadTargetBrowserWebContents();
+  if (browserContents) {
+    if (options?.ignoreCache) {
+      browserContents.reloadIgnoringCache();
+      return;
+    }
+    if (browserContents.isLoadingMainFrame()) {
+      browserContents.stop();
+      return;
+    }
+    browserContents.reload();
+    return;
+  }
+
+  if (options?.ignoreCache) {
+    win.webContents.reloadIgnoringCache();
+    return;
+  }
+  win.webContents.reload();
+}
+
+function buildApplicationMenuTemplate(
+  options: ApplicationMenuOptions,
+): Electron.MenuItemConstructorOptions[] {
   const isMac = process.platform === "darwin";
 
-  const template: Electron.MenuItemConstructorOptions[] = [
+  return [
     ...(isMac
       ? [
           {
@@ -36,6 +69,18 @@ export function setupApplicationMenu(): void {
           },
         ]
       : []),
+    {
+      label: "File",
+      submenu: [
+        {
+          label: "New Window",
+          accelerator: "CmdOrCtrl+Shift+N",
+          click: () => {
+            options.onNewWindow();
+          },
+        },
+      ],
+    },
     {
       label: "Edit",
       submenu: [
@@ -73,8 +118,20 @@ export function setupApplicationMenu(): void {
           }),
         },
         { type: "separator" },
-        { role: "reload" },
-        { role: "forceReload" },
+        {
+          label: "Reload",
+          accelerator: "CmdOrCtrl+R",
+          click: withBrowserWindow((win) => {
+            reloadFocusedContentsOrWindow(win);
+          }),
+        },
+        {
+          label: "Force Reload",
+          accelerator: "CmdOrCtrl+Shift+R",
+          click: withBrowserWindow((win) => {
+            reloadFocusedContentsOrWindow(win, { ignoreCache: true });
+          }),
+        },
         { role: "toggleDevTools" },
         { type: "separator" },
         { role: "togglefullscreen" },
@@ -91,8 +148,10 @@ export function setupApplicationMenu(): void {
       ],
     },
   ];
+}
 
-  const menu = Menu.buildFromTemplate(template);
+export function setupApplicationMenu(options: ApplicationMenuOptions): void {
+  const menu = Menu.buildFromTemplate(buildApplicationMenuTemplate(options));
   Menu.setApplicationMenu(menu);
 
   ipcMain.handle("paseo:menu:showContextMenu", (event, input?: ShowContextMenuInput) => {
@@ -105,7 +164,7 @@ export function setupApplicationMenu(): void {
       return;
     }
 
-    const menu = Menu.buildFromTemplate([
+    const contextMenu = Menu.buildFromTemplate([
       {
         label: "Copy",
         role: "copy",
@@ -124,6 +183,6 @@ export function setupApplicationMenu(): void {
       },
     ]);
 
-    menu.popup({ window: win });
+    contextMenu.popup({ window: win });
   });
 }
