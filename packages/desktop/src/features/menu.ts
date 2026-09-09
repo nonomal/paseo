@@ -1,9 +1,14 @@
 import { app, Menu, BrowserWindow, ipcMain } from "electron";
+import { getActivePaseoBrowserWebContentsForHostWindow } from "./browser-webviews/index.js";
 
-type ShowContextMenuInput = {
+interface ShowContextMenuInput {
   kind?: "terminal";
   hasSelection?: boolean;
-};
+}
+
+interface ApplicationMenuOptions {
+  onNewWindow: () => void;
+}
 
 function withBrowserWindow(
   callback: (win: BrowserWindow) => void,
@@ -14,10 +19,59 @@ function withBrowserWindow(
   };
 }
 
-export function setupApplicationMenu(): void {
-  const isMac = process.platform === "darwin";
+interface ReloadableWebContents {
+  isLoadingMainFrame(): boolean;
+  stop(): void;
+  reload(): void;
+  reloadIgnoringCache(): void;
+}
 
-  const template: Electron.MenuItemConstructorOptions[] = [
+interface ReloadableWindow {
+  webContents: ReloadableWebContents & { id: number };
+}
+
+interface ReloadActiveBrowserOrWindowInput {
+  win: ReloadableWindow;
+  getActiveBrowserContentsForHostWindow: (
+    hostWebContentsId: number,
+  ) => ReloadableWebContents | null;
+  ignoreCache?: boolean;
+}
+
+export function reloadActiveBrowserOrWindow({
+  win,
+  getActiveBrowserContentsForHostWindow,
+  ignoreCache = false,
+}: ReloadActiveBrowserOrWindowInput): void {
+  const browserContents = getActiveBrowserContentsForHostWindow(win.webContents.id);
+  if (browserContents) {
+    if (ignoreCache) {
+      browserContents.reloadIgnoringCache();
+      return;
+    }
+    if (browserContents.isLoadingMainFrame()) {
+      browserContents.stop();
+      return;
+    }
+    browserContents.reload();
+    return;
+  }
+
+  if (ignoreCache) {
+    win.webContents.reloadIgnoringCache();
+    return;
+  }
+  win.webContents.reload();
+}
+
+function buildApplicationMenuTemplate(
+  options: ApplicationMenuOptions,
+  capturing: boolean,
+): Electron.MenuItemConstructorOptions[] {
+  const isMac = process.platform === "darwin";
+  const zoomEnabled = !capturing;
+
+  return [
     ...(isMac
       ? [
           {
@@ -37,6 +91,18 @@ export function setupApplicationMenu(): void {
         ]
       : []),
     {
+      label: "File",
+      submenu: [
+        {
+          label: "New Window",
+          accelerator: "CmdOrCtrl+Shift+N",
+          click: () => {
+            options.onNewWindow();
+          },
+        },
+      ],
+    },
+    {
       label: "Edit",
       submenu: [
         { role: "undo" },
@@ -54,6 +120,7 @@ export function setupApplicationMenu(): void {
         {
           label: "Zoom In",
           accelerator: "CmdOrCtrl+=",
+          enabled: zoomEnabled,
           click: withBrowserWindow((win) => {
             win.webContents.setZoomLevel(win.webContents.getZoomLevel() + 0.5);
           }),
@@ -61,6 +128,7 @@ export function setupApplicationMenu(): void {
         {
           label: "Zoom Out",
           accelerator: "CmdOrCtrl+-",
+          enabled: zoomEnabled,
           click: withBrowserWindow((win) => {
             win.webContents.setZoomLevel(win.webContents.getZoomLevel() - 0.5);
           }),
@@ -68,13 +136,33 @@ export function setupApplicationMenu(): void {
         {
           label: "Actual Size",
           accelerator: "CmdOrCtrl+0",
+          enabled: zoomEnabled,
           click: withBrowserWindow((win) => {
             win.webContents.setZoomLevel(0);
           }),
         },
         { type: "separator" },
-        { role: "reload" },
-        { role: "forceReload" },
+        {
+          label: "Reload",
+          accelerator: "CmdOrCtrl+R",
+          click: withBrowserWindow((win) => {
+            reloadActiveBrowserOrWindow({
+              win,
+              getActiveBrowserContentsForHostWindow: getActivePaseoBrowserWebContentsForHostWindow,
+            });
+          }),
+        },
+        {
+          label: "Force Reload",
+          accelerator: "CmdOrCtrl+Shift+R",
+          click: withBrowserWindow((win) => {
+            reloadActiveBrowserOrWindow({
+              win,
+              getActiveBrowserContentsForHostWindow: getActivePaseoBrowserWebContentsForHostWindow,
+              ignoreCache: true,
+            });
+          }),
+        },
         { role: "toggleDevTools" },
         { type: "separator" },
         { role: "togglefullscreen" },
@@ -91,9 +179,22 @@ export function setupApplicationMenu(): void {
       ],
     },
   ];
+}
 
-  const menu = Menu.buildFromTemplate(template);
+let applicationMenuOptions: ApplicationMenuOptions | null = null;
+let capturingShortcut = false;
+
+function rebuildApplicationMenu(): void {
+  if (!applicationMenuOptions) return;
+  const menu = Menu.buildFromTemplate(
+    buildApplicationMenuTemplate(applicationMenuOptions, capturingShortcut),
+  );
   Menu.setApplicationMenu(menu);
+}
+
+export function setupApplicationMenu(options: ApplicationMenuOptions): void {
+  applicationMenuOptions = options;
+  rebuildApplicationMenu();
 
   ipcMain.handle("paseo:menu:showContextMenu", (event, input?: ShowContextMenuInput) => {
     const win = BrowserWindow.fromWebContents(event.sender);
@@ -105,7 +206,7 @@ export function setupApplicationMenu(): void {
       return;
     }
 
-    const menu = Menu.buildFromTemplate([
+    const contextMenu = Menu.buildFromTemplate([
       {
         label: "Copy",
         role: "copy",
@@ -124,6 +225,25 @@ export function setupApplicationMenu(): void {
       },
     ]);
 
-    menu.popup({ window: win });
+    contextMenu.popup({ window: win });
+  });
+
+  // Disable the zoom accelerators while capturing a shortcut so combos like
+  // Cmd+- / Cmd+= reach the renderer instead of zooming the window.
+  ipcMain.handle("paseo:menu:set-capturing-shortcut", (_event, capturing?: boolean) => {
+    capturingShortcut = capturing === true;
+    rebuildApplicationMenu();
+  });
+
+  // If the renderer reloads mid-capture (e.g. Cmd+R) the renderer-side effect
+  // never gets to send `false`, so reset the flag from the main process when a
+  // main window finishes loading. Workspace browser webviews are not
+  // BrowserWindows, so they don't trigger this.
+  app.on("browser-window-created", (_event, win) => {
+    win.webContents.on("did-finish-load", () => {
+      if (!capturingShortcut) return;
+      capturingShortcut = false;
+      rebuildApplicationMenu();
+    });
   });
 }

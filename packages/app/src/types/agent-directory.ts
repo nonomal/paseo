@@ -6,8 +6,10 @@ export type AgentDirectoryEntry = Pick<
   | "serverId"
   | "title"
   | "status"
+  | "turn"
   | "lastActivityAt"
   | "cwd"
+  | "workspaceId"
   | "provider"
   | "requiresAttention"
   | "attentionReason"
@@ -15,6 +17,7 @@ export type AgentDirectoryEntry = Pick<
   | "archivedAt"
   | "createdAt"
   | "labels"
+  | "projectPlacement"
 > & {
   pendingPermissionCount?: number;
 };

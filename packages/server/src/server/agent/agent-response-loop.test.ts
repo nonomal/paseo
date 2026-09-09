@@ -135,14 +135,26 @@ describe("generateStructuredAgentResponseWithFallback", () => {
 
   function createManager(
     availability: Array<{ provider: string; available: boolean; error: string | null }>,
-  ) {
+  ): AgentManager & { checkedProviders: string[] } {
+    const checkedProviders: string[] = [];
+    const availabilityByProvider = new Map(availability.map((entry) => [entry.provider, entry]));
     return {
-      listProviderAvailability: async () => availability,
-    } as unknown as AgentManager;
+      checkedProviders,
+      getProviderAvailability: async (provider: string) => {
+        checkedProviders.push(provider);
+        return (
+          availabilityByProvider.get(provider) ?? {
+            provider,
+            available: false,
+            error: `No client registered for provider '${provider}'`,
+          }
+        );
+      },
+    } as unknown as AgentManager & { checkedProviders: string[] };
   }
 
   it("uses the first available provider in the waterfall", async () => {
-    const calls: Array<{ provider: string; model?: string }> = [];
+    const calls: Array<{ provider: string; model?: string; persistSession?: boolean }> = [];
     const manager = createManager([
       { provider: "claude", available: true, error: null },
       { provider: "codex", available: true, error: null },
@@ -158,17 +170,20 @@ describe("generateStructuredAgentResponseWithFallback", () => {
         { provider: "claude", model: "haiku" },
         { provider: "codex", model: "gpt-5.4-mini" },
       ],
+      persistSession: false,
       runner: async (options) => {
         calls.push({
           provider: options.agentConfig.provider,
           model: options.agentConfig.model ?? undefined,
+          persistSession: options.persistSession,
         });
         return { summary: "ok" };
       },
     });
 
     expect(result).toEqual({ summary: "ok" });
-    expect(calls).toEqual([{ provider: "claude", model: "haiku" }]);
+    expect(calls).toEqual([{ provider: "claude", model: "haiku", persistSession: false }]);
+    expect(manager.checkedProviders).toEqual(["claude"]);
   });
 
   it("skips unavailable providers and uses the next available one", async () => {
@@ -199,6 +214,7 @@ describe("generateStructuredAgentResponseWithFallback", () => {
 
     expect(result).toEqual({ summary: "ok" });
     expect(calls).toEqual([{ provider: "codex", model: "gpt-5.4-mini" }]);
+    expect(manager.checkedProviders).toEqual(["claude", "codex"]);
   });
 
   it("falls back when an available provider fails", async () => {
@@ -235,6 +251,7 @@ describe("generateStructuredAgentResponseWithFallback", () => {
       { provider: "claude", model: "haiku" },
       { provider: "codex", model: "gpt-5.4-mini" },
     ]);
+    expect(manager.checkedProviders).toEqual(["claude", "codex"]);
   });
 
   it("throws a fallback error when all providers are unavailable or fail", async () => {

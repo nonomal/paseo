@@ -1,4 +1,4 @@
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import { withOutput } from "../../output/index.js";
 import { addJsonAndDaemonHostOptions } from "../../utils/command-options.js";
 import { runCreateCommand } from "./create.js";
@@ -8,6 +8,8 @@ import { runLogsCommand } from "./logs.js";
 import { runPauseCommand } from "./pause.js";
 import { runResumeCommand } from "./resume.js";
 import { runDeleteCommand } from "./delete.js";
+import { runRunOnceCommand } from "./run-once.js";
+import { runUpdateCommand } from "./update.js";
 
 export function createScheduleCommand(): Command {
   const schedule = new Command("schedule").description("Manage recurring schedules");
@@ -17,14 +19,22 @@ export function createScheduleCommand(): Command {
       .command("create")
       .description("Create a schedule")
       .argument("<prompt>", "Prompt to run on the schedule")
-      .option("--every <duration>", "Fixed interval cadence (for example: 5m, 1h)")
+      .option("--every <duration>", "Cron-compatible cadence preset (for example: 5m, 1h)")
       .option("--cron <expr>", "Cron cadence expression")
+      .option("--timezone <iana>", "IANA time zone for cron cadence (default: UTC)")
       .option("--name <name>", "Optional schedule name")
-      .option("--target <self|new-agent|agent-id>", "Run target")
+      .addOption(new Option("--target <target>", "Legacy schedule target").hideHelp())
       .option(
         "--provider <provider>",
         "Agent provider, or provider/model (e.g. codex or codex/gpt-5.4)",
       )
+      .option(
+        "--mode <mode>",
+        "Provider-specific mode (e.g. claude bypassPermissions, opencode build)",
+      )
+      .option("--thinking <id>", "Thinking option ID for new-agent runs")
+      .option("--cwd <path>", "Working directory (default: current; required with --host)")
+      .option("--run-now", "Fire one immediate run on creation")
       .option("--max-runs <n>", "Maximum number of runs")
       .option("--expires-in <duration>", "Time to live for the schedule"),
   ).action(withOutput(runCreateCommand));
@@ -58,6 +68,36 @@ export function createScheduleCommand(): Command {
   addJsonAndDaemonHostOptions(
     schedule.command("delete").description("Delete a schedule").argument("<id>", "Schedule ID"),
   ).action(withOutput(runDeleteCommand));
+
+  addJsonAndDaemonHostOptions(
+    schedule
+      .command("run-once")
+      .description("Manually trigger a single run of a schedule without affecting cadence")
+      .argument("<id>", "Schedule ID"),
+  ).action(withOutput(runRunOnceCommand));
+
+  addJsonAndDaemonHostOptions(
+    schedule
+      .command("update")
+      .description("Update an existing schedule in place")
+      .argument("<id>", "Schedule ID")
+      .option("--every <duration>", "Cron-compatible cadence preset (for example: 5m, 1h)")
+      .option("--cron <expr>", "Switch to cron cadence expression")
+      .option("--timezone <iana>", "IANA time zone for cron cadence (requires --cron)")
+      .option("--name <name>", "Rename the schedule (empty string clears the name)")
+      .option("--prompt <text>", "Replace the schedule prompt")
+      .option(
+        "--provider <provider>",
+        "New agent provider, or provider/model (only for new-agent target)",
+      )
+      .option("--model <model>", "New agent model (only for new-agent target)")
+      .option("--mode <mode>", "New agent provider mode (only for new-agent target)")
+      .option("--cwd <path>", "New working directory (only for new-agent target)")
+      .option("--max-runs <n>", "Set or change maximum number of runs")
+      .option("--no-max-runs", "Clear the max-runs limit")
+      .option("--expires-in <duration>", "Set or change time to live for the schedule")
+      .option("--no-expires-in", "Clear the expiration"),
+  ).action(withOutput(runUpdateCommand));
 
   return schedule;
 }

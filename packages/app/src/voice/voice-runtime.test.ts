@@ -1,11 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DaemonServerInfo } from "@/stores/session-store";
 import type { AudioEngine } from "@/voice/audio-engine-types";
-import {
-  createVoiceRuntime,
-  type VoiceRuntime,
-  type VoiceSessionAdapter,
-} from "@/voice/voice-runtime";
+import { createVoiceRuntime, type VoiceSessionAdapter } from "@/voice/voice-runtime";
 import { REALTIME_VOICE_VAD_CONFIG } from "@/voice/realtime-voice-config";
 
 function createAudioEngineMock(): AudioEngine {
@@ -128,7 +124,7 @@ describe("voice runtime", () => {
 
   it("moves from listening to playing on the first assistant audio", async () => {
     const adapter = createSessionAdapter();
-    const { runtime, engine } = createRuntime();
+    const { runtime, engine: _engine } = createRuntime();
     runtime.registerSession(adapter);
 
     await runtime.startVoice("server-1", "agent-1");
@@ -206,6 +202,7 @@ describe("voice runtime", () => {
     await runtime.startVoice("server-1", "agent-1");
     runtime.onTurnEvent("server-1", "agent-1", "turn_started");
     vi.mocked(engine.play).mockClear();
+    playResolvers.length = 0;
 
     runtime.handleAudioOutput(
       "server-1",
@@ -231,7 +228,6 @@ describe("voice runtime", () => {
     });
     expect(adapter.audioPlayed).not.toHaveBeenCalled();
 
-    playResolvers.shift()?.(0.1);
     playResolvers.shift()!(0.1);
     await vi.waitFor(() => {
       expect(adapter.audioPlayed).toHaveBeenCalledWith("chunk-0");
@@ -241,7 +237,7 @@ describe("voice runtime", () => {
     playResolvers.shift()!(0.1);
     await vi.waitFor(() => {
       expect(adapter.audioPlayed).toHaveBeenCalledWith("chunk-1");
-      expect(runtime.getSnapshot().phase).toBe("playing");
+      expect(runtime.getSnapshot().phase).toBe("waiting");
     });
   });
 
@@ -255,7 +251,7 @@ describe("voice runtime", () => {
     runtime.onAssistantAudioStarted("server-1");
     runtime.onAssistantAudioFinished("server-1");
 
-    expect(runtime.getSnapshot().phase).toBe("playing");
+    expect(runtime.getSnapshot().phase).toBe("waiting");
     expect(engine.play).toHaveBeenCalled();
   });
 
@@ -289,6 +285,8 @@ describe("voice runtime", () => {
 
     expect(runtime.getSnapshot().phase).toBe("waiting");
     expect(engine.play).toHaveBeenCalledTimes(1);
+    vi.mocked(engine.stop).mockClear();
+    vi.mocked(engine.clearQueue).mockClear();
 
     runtime.handleCaptureVolume(REALTIME_VOICE_VAD_CONFIG.volumeThreshold + 0.05);
     runtime.handleCaptureVolume(0);
@@ -299,8 +297,8 @@ describe("voice runtime", () => {
 
     runtime.onServerSpeechStateChanged("server-1", true);
 
-    expect(engine.stop).toHaveBeenCalledTimes(2);
-    expect(engine.clearQueue).toHaveBeenCalledTimes(2);
+    expect(engine.stop).toHaveBeenCalledTimes(1);
+    expect(engine.clearQueue).toHaveBeenCalledTimes(1);
 
     resolvePlay(0.1);
   });
@@ -329,6 +327,7 @@ describe("voice runtime", () => {
     runtime.onTurnEvent("server-1", "agent-1", "turn_started");
     runtime.onAssistantAudioStarted("server-1");
     vi.mocked(engine.stop).mockClear();
+    vi.mocked(engine.clearQueue).mockClear();
 
     runtime.handleCaptureVolume(0.5);
     expect(runtime.getTelemetrySnapshot().isSpeaking).toBe(false);
@@ -422,6 +421,22 @@ describe("voice runtime", () => {
     expect(engine.stopCapture).toHaveBeenCalled();
     expect(runtime.getSnapshot().phase).toBe("disabled");
     expect(runtime.shouldPlayVoiceAudio("server-1")).toBe(false);
+  });
+
+  it("rolls daemon voice mode back when capture fails after enabling it", async () => {
+    const adapter = createSessionAdapter();
+    const engine = createAudioEngineMock();
+    vi.mocked(engine.startCapture).mockRejectedValue(new Error("audio focus unavailable"));
+    const { runtime } = createRuntime({ engine });
+    runtime.registerSession(adapter);
+
+    await expect(runtime.startVoice("server-1", "agent-1")).rejects.toThrow(
+      "audio focus unavailable",
+    );
+
+    expect(adapter.setVoiceMode).toHaveBeenNthCalledWith(1, true, "agent-1");
+    expect(adapter.setVoiceMode).toHaveBeenNthCalledWith(2, false);
+    expect(runtime.getSnapshot().phase).toBe("disabled");
   });
 
   it("returns an explicit not-ready error when the adapter is missing", async () => {

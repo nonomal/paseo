@@ -1,13 +1,16 @@
-import { useEffect } from "react";
-import { View, Text } from "react-native";
-import { StyleSheet } from "react-native-unistyles";
-import { FolderOpen } from "lucide-react-native";
+import { useCallback, useEffect, useState, type ComponentType } from "react";
+import { useTranslation } from "react-i18next";
+import { View, Text, Pressable } from "react-native";
+import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { useRouter } from "expo-router";
+import { FolderOpen, Inbox, Plug, Smartphone } from "lucide-react-native";
 import { PaseoLogo } from "@/components/icons/paseo-logo";
-import { Button } from "@/components/ui/button";
+import { CommunityLinks } from "@/components/community-links";
 import { MenuHeader } from "@/components/headers/menu-header";
-import { useOpenProjectPicker } from "@/hooks/use-open-project-picker";
+import { useOpenAddProject } from "@/hooks/use-open-add-project";
+import { useImportSession } from "@/hooks/use-import-session";
+import { useHostChooser } from "@/hosts/host-chooser";
 import { usePanelStore } from "@/stores/panel-store";
-import { useSessionStore } from "@/stores/session-store";
 import {
   useIsCompactFormFactor,
   HEADER_INNER_HEIGHT,
@@ -15,20 +18,43 @@ import {
   HEADER_TOP_PADDING_MOBILE,
 } from "@/constants/layout";
 import { TitlebarDragRegion } from "@/components/desktop/titlebar-drag-region";
+import { useLocalDaemonServerId } from "@/hooks/use-is-local-daemon";
+import { PairDeviceModal } from "@/desktop/components/pair-device-modal";
+import { buildSettingsHostSectionRoute } from "@/utils/host-routes";
 
-export function OpenProjectScreen({ serverId }: { serverId: string }) {
-  const openAgentList = usePanelStore((s) => s.openAgentList);
-  const openProjectPicker = useOpenProjectPicker(serverId);
-  const hasHydrated = useSessionStore((s) => s.sessions[serverId]?.hasHydratedWorkspaces ?? false);
-  const hasProjects = useSessionStore((s) => (s.sessions[serverId]?.workspaces?.size ?? 0) > 0);
+export function OpenProjectScreen() {
+  const { t } = useTranslation();
+  const router = useRouter();
+  const openDesktopAgentList = usePanelStore((s) => s.openDesktopAgentList);
+  const openProjectPicker = useOpenAddProject();
+  const importSession = useImportSession();
+  const chooseHost = useHostChooser();
+  const localServerId = useLocalDaemonServerId();
+  const [isPairDeviceOpen, setIsPairDeviceOpen] = useState(false);
 
   const isCompactLayout = useIsCompactFormFactor();
 
   useEffect(() => {
     if (!isCompactLayout) {
-      openAgentList();
+      openDesktopAgentList();
     }
-  }, [isCompactLayout, openAgentList]);
+  }, [isCompactLayout, openDesktopAgentList]);
+
+  const handleOpenPicker = useCallback(() => {
+    void openProjectPicker();
+  }, [openProjectPicker]);
+
+  const handleOpenPairDevice = useCallback(() => setIsPairDeviceOpen(true), []);
+  const handleClosePairDevice = useCallback(() => setIsPairDeviceOpen(false), []);
+
+  const handleOpenProviders = useCallback(() => {
+    chooseHost({
+      title: "Choose host",
+      onChooseHost: (serverId) => {
+        router.push(buildSettingsHostSectionRoute(serverId, "providers"));
+      },
+    });
+  }, [chooseHost, router]);
 
   return (
     <View style={styles.container}>
@@ -36,28 +62,97 @@ export function OpenProjectScreen({ serverId }: { serverId: string }) {
       <View style={styles.content}>
         <TitlebarDragRegion />
         <View style={styles.logo}>
-          <PaseoLogo size={56} />
+          <PaseoLogo size={52} />
         </View>
-        <View style={styles.headingGroup}>
-          <Text style={styles.heading}>What shall we build today?</Text>
-          {hasHydrated && !hasProjects ? (
-            <Text style={styles.subtitle}>
-              Add a project folder to start running agents on your codebase
-            </Text>
+        <View style={styles.tiles}>
+          <HomeTile
+            icon={FolderOpen}
+            title={t("openProject.tiles.addProject.title")}
+            description={t("openProject.tiles.addProject.description")}
+            onPress={handleOpenPicker}
+            testID="open-project-submit"
+            accent
+          />
+          <HomeTile
+            icon={Inbox}
+            title={t("openProject.tiles.importSession.title")}
+            description={t("openProject.tiles.importSession.description")}
+            onPress={importSession.open}
+            testID="open-project-import-session"
+          />
+          <HomeTile
+            icon={Plug}
+            title={t("openProject.tiles.setupProviders.title")}
+            description={t("openProject.tiles.setupProviders.description")}
+            onPress={handleOpenProviders}
+            testID="open-project-setup-providers"
+          />
+          {localServerId ? (
+            <HomeTile
+              icon={Smartphone}
+              title={t("openProject.tiles.pairDevice.title")}
+              description={t("openProject.tiles.pairDevice.description")}
+              onPress={handleOpenPairDevice}
+              testID="open-project-pair-device"
+            />
           ) : null}
         </View>
-        <View style={styles.cta}>
-          <Button
-            variant="default"
-            leftIcon={FolderOpen}
-            onPress={() => void openProjectPicker()}
-            testID="open-project-submit"
-          >
-            Add a project
-          </Button>
-        </View>
       </View>
+      <View style={styles.communityRow}>
+        <CommunityLinks />
+      </View>
+      <PairDeviceModal
+        serverId={localServerId ?? ""}
+        visible={isPairDeviceOpen}
+        onClose={handleClosePairDevice}
+        testID="open-project-pair-device-modal"
+      />
+      {importSession.sheet}
     </View>
+  );
+}
+
+interface HomeTileProps {
+  icon: ComponentType<{ size: number; color: string }>;
+  title: string;
+  description: string;
+  onPress: () => void;
+  testID?: string;
+  accent?: boolean;
+}
+
+function HomeTile({ icon: Icon, title, description, onPress, testID, accent }: HomeTileProps) {
+  // useUnistyles is acceptable here: leaf component, off the hot path (home screen renders once).
+  const { theme } = useUnistyles();
+  const [hovered, setHovered] = useState(false);
+  const handleHoverIn = useCallback(() => setHovered(true), []);
+  const handleHoverOut = useCallback(() => setHovered(false), []);
+
+  const iconColor = accent ? theme.colors.accent : theme.colors.foregroundMuted;
+
+  const pressableStyle = useCallback(
+    ({ pressed }: { pressed: boolean }) => [
+      styles.tile,
+      hovered && styles.tileHovered,
+      pressed && styles.tilePressed,
+    ],
+    [hovered],
+  );
+
+  return (
+    <Pressable
+      onPress={onPress}
+      onHoverIn={handleHoverIn}
+      onHoverOut={handleHoverOut}
+      testID={testID}
+      style={pressableStyle}
+    >
+      <Icon size={20} color={iconColor} />
+      <View style={styles.tileText}>
+        <Text style={styles.tileTitle}>{title}</Text>
+        <Text style={styles.tileDescription}>{description}</Text>
+      </View>
+    </Pressable>
   );
 }
 
@@ -70,10 +165,11 @@ const styles = StyleSheet.create((theme) => ({
   content: {
     position: "relative",
     flex: 1,
-    justifyContent: "center",
+    justifyContent: { xs: "flex-start", md: "center" },
     alignItems: "center",
     gap: 0,
     padding: theme.spacing[6],
+    paddingTop: { xs: theme.spacing[12], md: theme.spacing[6] },
     paddingBottom: {
       xs: HEADER_INNER_HEIGHT_MOBILE + HEADER_TOP_PADDING_MOBILE + theme.spacing[6],
       md: HEADER_INNER_HEIGHT + theme.spacing[6],
@@ -82,22 +178,56 @@ const styles = StyleSheet.create((theme) => ({
   logo: {
     marginBottom: theme.spacing[8],
   },
-  headingGroup: {
-    alignItems: "center",
+  tiles: {
+    marginTop: { xs: theme.spacing[6], md: theme.spacing[12] },
+    width: "100%",
+    maxWidth: 452,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    justifyContent: "flex-start",
     gap: theme.spacing[3],
   },
-  cta: {
-    marginTop: theme.spacing[12],
+  tile: {
+    width: { xs: "100%", md: 220 },
+    minHeight: { xs: 0, md: 132 },
+    padding: theme.spacing[4],
+    backgroundColor: theme.colors.surface1,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: theme.borderRadius.xl,
+    gap: theme.spacing[3],
   },
-  heading: {
+  tileHovered: {
+    backgroundColor: theme.colors.surface2,
+    borderColor: theme.colors.borderAccent,
+  },
+  tilePressed: {
+    opacity: 0.85,
+  },
+  tileText: {
+    gap: theme.spacing[1],
+  },
+  tileTitle: {
     color: theme.colors.foreground,
-    fontSize: theme.fontSize["2xl"],
+    fontSize: theme.fontSize.base,
     fontWeight: theme.fontWeight.normal,
-    textAlign: "center",
   },
-  subtitle: {
+  tileDescription: {
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.base,
-    textAlign: "center",
+    lineHeight: 18,
+  },
+  communityRow: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: {
+      xs: HEADER_INNER_HEIGHT_MOBILE + HEADER_TOP_PADDING_MOBILE + theme.spacing[2],
+      md: HEADER_INNER_HEIGHT + theme.spacing[2],
+    },
+    flexDirection: "row",
+    justifyContent: "center",
+    alignItems: "center",
+    gap: 0,
   },
 }));

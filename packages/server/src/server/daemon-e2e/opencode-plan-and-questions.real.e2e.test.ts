@@ -4,23 +4,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import pino from "pino";
 
-import { OpenCodeAgentClient } from "../agent/providers/opencode-agent.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
-import { isProviderAvailable } from "./agent-configs.js";
+import { canRunRealProvider, createRealProviderClients } from "./real-provider-test-config.js";
 
 function tmpCwd(): string {
   return mkdtempSync(path.join(tmpdir(), "daemon-real-opencode-"));
-}
-
-function pickOpenCodeModel(
-  models: Array<{ id: string }>,
-  preferences: string[] = ["gpt-5-nano", "gpt-4.1-nano", "mini", "free"],
-): string {
-  const preferred = models.find((model) =>
-    preferences.some((fragment) => model.id.includes(fragment)),
-  );
-  return preferred?.id ?? models[0]!.id;
 }
 
 async function createHarness(): Promise<{
@@ -29,7 +18,7 @@ async function createHarness(): Promise<{
 }> {
   const logger = pino({ level: "silent" });
   const daemon = await createTestPaseoDaemon({
-    agentClients: { opencode: new OpenCodeAgentClient(logger) },
+    agentClients: createRealProviderClients(["opencode"], logger),
     logger,
   });
   const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
@@ -42,7 +31,7 @@ describe("daemon E2E (real opencode) - plan mode and clarifying questions", () =
   let canRun = false;
 
   beforeAll(async () => {
-    canRun = await isProviderAvailable("opencode");
+    canRun = await canRunRealProvider("opencode");
   });
 
   beforeEach((context) => {
@@ -63,7 +52,7 @@ describe("daemon E2E (real opencode) - plan mode and clarifying questions", () =
         provider: "opencode",
         cwd,
         title: "OpenCode question regression",
-        model: pickOpenCodeModel(modelList.models, ["minimax-m2.5-free", "minimax", "free"]),
+        model: "opencode/big-pickle",
         modeId: "plan",
       });
 
@@ -111,7 +100,7 @@ describe("daemon E2E (real opencode) - plan mode and clarifying questions", () =
         provider: "opencode",
         cwd,
         title: "OpenCode plan mode regression",
-        model: pickOpenCodeModel(modelList.models),
+        model: "opencode/big-pickle",
         modeId: "plan",
       });
 
@@ -129,12 +118,15 @@ describe("daemon E2E (real opencode) - plan mode and clarifying questions", () =
         limit: 0,
         projection: "projected",
       });
+      const toolCalls = timeline.entries.filter((entry) => entry.item.type === "tool_call");
       const assistantText = timeline.entries
         .filter((entry) => entry.item.type === "assistant_message")
         .map((entry) => entry.item.text)
-        .join(" ");
+        .join(" ")
+        .trim();
 
-      expect(assistantText.toLowerCase()).toContain("plan");
+      expect(toolCalls).toHaveLength(0);
+      expect(assistantText.length).toBeGreaterThan(0);
     } finally {
       await client.close().catch(() => undefined);
       await daemon.close();

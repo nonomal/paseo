@@ -1,13 +1,14 @@
 import type { Command } from "commander";
 import type { CommandOptions, ListResult, OutputSchema } from "../../output/index.js";
-import { AGENT_PROVIDER_DEFINITIONS } from "@getpaseo/server";
+import type { ProviderSnapshotEntry } from "@getpaseo/protocol/agent-types";
+import { AGENT_PROVIDER_DEFINITIONS } from "@getpaseo/protocol/provider-manifest";
 import { tryConnectToDaemon } from "../../utils/client.js";
 
-/** Provider list item for display */
 export interface ProviderListItem {
-  provider: string;
+  provider: ProviderSnapshotEntry["provider"];
   label: string;
   status: string;
+  enabled: "Enabled" | "Disabled";
   defaultMode: string;
   modes: string;
 }
@@ -17,8 +18,9 @@ const PROVIDERS: ProviderListItem[] = AGENT_PROVIDER_DEFINITIONS.map((def) => ({
   provider: def.id,
   label: def.label,
   status: "available",
-  defaultMode: def.defaultModeId ?? "default",
-  modes: def.modes.map((m) => m.label).join(", "),
+  enabled: def.enabledByDefault === false ? "Disabled" : "Enabled",
+  defaultMode: def.defaultModeId ?? "-",
+  modes: def.modes.length > 0 ? def.modes.map((m) => m.label).join(", ") : "-",
 }));
 
 function getStaticProviders(): ProviderListItem[] {
@@ -41,6 +43,7 @@ export const providerLsSchema: OutputSchema<ProviderListItem> = {
         return undefined;
       },
     },
+    { header: "ENABLED", field: "enabled", width: 10 },
     { header: "DEFAULT MODE", field: "defaultMode", width: 14 },
     { header: "MODES", field: "modes", width: 30 },
   ],
@@ -74,6 +77,7 @@ export async function runLsCommand(
         provider: entry.provider,
         label: entry.label ?? entry.provider,
         status: entry.status === "ready" ? "available" : entry.status,
+        enabled: !entry.enabled ? "Disabled" : "Enabled",
         defaultMode: entry.defaultModeId ?? "default",
         modes: (entry.modes ?? []).map((mode) => mode.label).join(", "),
       })),

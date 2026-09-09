@@ -8,6 +8,7 @@ export type ScheduleCadence =
   | {
       type: "cron";
       expression: string;
+      timezone?: string;
     };
 
 export type ScheduleTarget =
@@ -28,10 +29,7 @@ export type ScheduleTarget =
         model?: string;
         thinkingOptionId?: string;
         title?: string | null;
-        approvalPolicy?: string;
-        sandboxMode?: string;
-        networkAccess?: boolean;
-        webSearch?: boolean;
+        providerOptions?: Record<string, unknown>;
       };
     };
 
@@ -85,6 +83,7 @@ export interface CreateScheduleInput {
   target: ScheduleTarget;
   maxRuns?: number;
   expiresAt?: string;
+  runOnCreate?: boolean;
 }
 
 export interface ScheduleCreatePayload {
@@ -129,6 +128,35 @@ export interface ScheduleDeletePayload {
   error: string | null;
 }
 
+export interface ScheduleRunOncePayload {
+  requestId: string;
+  schedule: ScheduleRecord | null;
+  error: string | null;
+}
+
+export interface UpdateScheduleNewAgentConfig {
+  provider?: string;
+  model?: string | null;
+  modeId?: string | null;
+  cwd?: string;
+}
+
+export interface UpdateScheduleInput {
+  id: string;
+  name?: string | null;
+  prompt?: string;
+  cadence?: ScheduleCadence;
+  newAgentConfig?: UpdateScheduleNewAgentConfig;
+  maxRuns?: number | null;
+  expiresAt?: string | null;
+}
+
+export interface ScheduleUpdatePayload {
+  requestId: string;
+  schedule: ScheduleRecord | null;
+  error: string | null;
+}
+
 export interface ScheduleDaemonClient {
   scheduleCreate(input: CreateScheduleInput): Promise<ScheduleCreatePayload>;
   scheduleList(): Promise<ScheduleListPayload>;
@@ -137,5 +165,7 @@ export interface ScheduleDaemonClient {
   schedulePause(input: { id: string }): Promise<SchedulePausePayload>;
   scheduleResume(input: { id: string }): Promise<ScheduleResumePayload>;
   scheduleDelete(input: { id: string }): Promise<ScheduleDeletePayload>;
+  scheduleRunOnce(input: { id: string }): Promise<ScheduleRunOncePayload>;
+  scheduleUpdate(input: UpdateScheduleInput): Promise<ScheduleUpdatePayload>;
   close(): Promise<void>;
 }

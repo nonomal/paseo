@@ -7,9 +7,14 @@
 import type { Command } from "commander";
 import type { AnyCommandResult, CommandError, OutputOptions } from "./types.js";
 import { render, renderError, toCommandError, defaultOutputOptions } from "./render.js";
+import { withGlobalOptions } from "../utils/command-options.js";
 
 /** Options that include output settings from global options */
 export interface CommandOptions extends Partial<OutputOptions> {
+  /** Daemon host target from --host option */
+  host?: string;
+  /** JSON output flag from --json option */
+  json?: boolean;
   [key: string]: unknown;
 }
 
@@ -73,11 +78,8 @@ function extractOutputOptions(options: CommandOptions): OutputOptions {
 export function withOutput<T, Args extends unknown[]>(
   handler: (...args: [...Args, CommandOptions, Command]) => Promise<AnyCommandResult<T>>,
 ): (...args: [...Args, CommandOptions, Command]) => Promise<void> {
-  return async (...args) => {
-    // Last two args are options and command
-    const command = args[args.length - 1] as Command;
-    // Use optsWithGlobals() to get both local and global options
-    const options = command.optsWithGlobals() as CommandOptions;
+  return withGlobalOptions(async (...args) => {
+    const options = args[args.length - 2] as CommandOptions;
     const outputOptions = extractOutputOptions(options);
 
     try {
@@ -93,7 +95,7 @@ export function withOutput<T, Args extends unknown[]>(
       process.stderr.write(errorOutput + "\n");
       process.exit(1);
     }
-  };
+  });
 }
 
 /**

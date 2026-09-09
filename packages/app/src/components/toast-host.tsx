@@ -3,9 +3,10 @@ import { createPortal } from "react-dom";
 import { Animated, Easing, Platform, Text, ToastAndroid, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { useTranslation } from "react-i18next";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isWeb } from "@/constants/platform";
-import { AlertTriangle, CheckCircle2 } from "lucide-react-native";
+import { AlertTriangle, CheckCircle2, Info } from "lucide-react-native";
 import { getOverlayRoot, OVERLAY_Z } from "@/lib/overlay-root";
 import {
   HEADER_INNER_HEIGHT,
@@ -13,35 +14,36 @@ import {
   HEADER_TOP_PADDING_MOBILE,
 } from "@/constants/layout";
 
-export type ToastVariant = "default" | "success" | "error";
+export type ToastVariant = "default" | "info" | "success" | "warning" | "error";
 
-export type ToastShowOptions = {
+export interface ToastShowOptions {
   icon?: ReactNode;
   variant?: ToastVariant;
-  durationMs?: number;
+  durationMs?: number | null;
   nativeAndroid?: boolean;
   testID?: string;
-};
+}
 
-export type ToastState = {
+export interface ToastState {
   id: number;
   content: ReactNode;
   nativeMessage: string | null;
   icon?: ReactNode;
   variant: ToastVariant;
-  durationMs: number;
+  durationMs: number | null;
   testID?: string;
-};
+}
 
-export type ToastApi = {
+export interface ToastApi {
   show: (content: ReactNode, options?: ToastShowOptions) => void;
   copied: (label?: string) => void;
   error: (message: string) => void;
-};
+}
 
 type ToastViewportPlacement = "app-shell" | "panel";
 
 const DEFAULT_DURATION_MS = 2200;
+const TOAST_MAX_WIDTH = 480;
 
 export function useToastHost(): {
   api: ToastApi;
@@ -49,6 +51,7 @@ export function useToastHost(): {
   dismiss: () => void;
 } {
   const { theme } = useUnistyles();
+  const { t } = useTranslation();
   const [toast, setToast] = useState<ToastState | null>(null);
   const idRef = useRef(0);
 
@@ -59,11 +62,12 @@ export function useToastHost(): {
     }
 
     const variant = options?.variant ?? "default";
-    const durationMs = options?.durationMs ?? DEFAULT_DURATION_MS;
+    const durationMs = options?.durationMs === undefined ? DEFAULT_DURATION_MS : options.durationMs;
     const nativeAndroid = options?.nativeAndroid ?? false;
 
     if (Platform.OS === "android" && nativeAndroid && nativeMessage) {
-      const duration = durationMs <= 2500 ? ToastAndroid.SHORT : ToastAndroid.LONG;
+      const duration =
+        durationMs !== null && durationMs <= 2500 ? ToastAndroid.SHORT : ToastAndroid.LONG;
       ToastAndroid.showWithGravity(nativeMessage, duration, ToastAndroid.TOP);
       return;
     }
@@ -84,13 +88,13 @@ export function useToastHost(): {
     () => ({
       show,
       copied: (label?: string) =>
-        show(label ? `Copied ${label}` : "Copied", {
+        show(label ? t("common.states.copiedLabel", { label }) : t("common.states.copied"), {
           variant: "success",
           icon: <CheckCircle2 size={18} color={theme.colors.foreground} />,
         }),
       error: (message: string) => show(message, { variant: "error", durationMs: 3200 }),
     }),
-    [show, theme.colors.foreground],
+    [show, theme.colors.foreground, t],
   );
 
   const dismiss = useCallback(() => {
@@ -148,8 +152,13 @@ export function ToastViewport({
   }, [clearTimer, onDismiss, opacity, translateY]);
 
   const scheduleDismiss = useCallback(
-    (durationMs: number) => {
+    (durationMs: number | null) => {
       clearTimer();
+      if (durationMs === null) {
+        remainingDurationRef.current = 0;
+        dismissDeadlineRef.current = null;
+        return;
+      }
       const nextDurationMs = Math.max(0, durationMs);
       remainingDurationRef.current = nextDurationMs;
       dismissDeadlineRef.current = Date.now() + nextDurationMs;
@@ -169,7 +178,7 @@ export function ToastViewport({
   }, [clearTimer]);
 
   const resumeDismiss = useCallback(() => {
-    if (!toast) {
+    if (!toast || toast.durationMs === null) {
       return;
     }
     scheduleDismiss(remainingDurationRef.current || toast.durationMs);
@@ -204,17 +213,12 @@ export function ToastViewport({
       }),
     ]).start();
 
-    remainingDurationRef.current = toast.durationMs;
     scheduleDismiss(toast.durationMs);
 
     return () => {
       clearTimer();
     };
   }, [clearTimer, opacity, scheduleDismiss, toast, translateY]);
-
-  if (!toast) {
-    return null;
-  }
 
   const headerHeight = isMobile ? HEADER_INNER_HEIGHT_MOBILE : HEADER_INNER_HEIGHT;
   const headerTopPadding = isMobile ? HEADER_TOP_PADDING_MOBILE : 0;
@@ -223,46 +227,65 @@ export function ToastViewport({
       ? insets.top + headerTopPadding + headerHeight + theme.spacing[2]
       : theme.spacing[3];
 
-  const icon =
-    toast.icon ??
-    (toast.variant === "success" ? (
-      <CheckCircle2 size={18} color={theme.colors.primary} />
-    ) : toast.variant === "error" ? (
-      <AlertTriangle size={18} color={theme.colors.destructive} />
-    ) : null);
+  const toastVariant = toast?.variant;
+  const toastAnimatedStyle = useMemo(
+    () => [
+      styles.toast,
+      toastVariant === "info" ? styles.toastInfo : null,
+      toastVariant === "success" ? styles.toastSuccess : null,
+      toastVariant === "warning" ? styles.toastWarning : null,
+      toastVariant === "error" ? styles.toastError : null,
+      {
+        marginTop: topOffset,
+        opacity,
+        transform: [{ translateY }],
+      },
+    ],
+    [toastVariant, topOffset, opacity, translateY],
+  );
+  const toastMessageStyle = useMemo(
+    () => [styles.message, toastVariant === "error" ? styles.messageError : null],
+    [toastVariant],
+  );
+
+  if (!toast) {
+    return null;
+  }
+
+  let defaultIcon: ReactNode = null;
+  if (toast.variant === "info") {
+    defaultIcon = <Info size={18} color={theme.colors.palette.blue[300]} />;
+  } else if (toast.variant === "success") {
+    defaultIcon = <CheckCircle2 size={18} color={theme.colors.primary} />;
+  } else if (toast.variant === "warning") {
+    defaultIcon = <AlertTriangle size={18} color={theme.colors.palette.amber[500]} />;
+  } else if (toast.variant === "error") {
+    defaultIcon = <AlertTriangle size={18} color={theme.colors.destructive} />;
+  }
+  const icon = toast.icon ?? defaultIcon;
 
   const content = (
     <View style={styles.container} pointerEvents="box-none">
-      <Animated.View
-        testID={toast.testID ?? "app-toast"}
-        onPointerEnter={isWeb ? pauseDismiss : undefined}
-        onPointerLeave={isWeb ? resumeDismiss : undefined}
-        style={[
-          styles.toast,
-          toast.variant === "success" ? styles.toastSuccess : null,
-          toast.variant === "error" ? styles.toastError : null,
-          {
-            marginTop: topOffset,
-            opacity,
-            transform: [{ translateY }],
-          },
-        ]}
-        accessibilityRole="alert"
-      >
-        {icon ? <View style={styles.iconSlot}>{icon}</View> : null}
-        {typeof toast.content === "string" ? (
-          <Text
-            testID="app-toast-message"
-            style={[styles.message, toast.variant === "error" ? styles.messageError : null]}
-          >
-            {toast.content}
-          </Text>
-        ) : (
-          <View testID="app-toast-message" style={styles.contentSlot}>
-            {toast.content}
-          </View>
-        )}
-      </Animated.View>
+      <View style={styles.widthBoundary} pointerEvents="box-none">
+        <Animated.View
+          testID={toast.testID ?? "app-toast"}
+          onPointerEnter={isWeb ? pauseDismiss : undefined}
+          onPointerLeave={isWeb ? resumeDismiss : undefined}
+          style={toastAnimatedStyle}
+          accessibilityRole="alert"
+        >
+          {icon ? <View style={styles.iconSlot}>{icon}</View> : null}
+          {typeof toast.content === "string" ? (
+            <Text testID="app-toast-message" style={toastMessageStyle}>
+              {toast.content}
+            </Text>
+          ) : (
+            <View testID="app-toast-message" style={styles.contentSlot}>
+              {toast.content}
+            </View>
+          )}
+        </Animated.View>
+      </View>
     </View>
   );
 
@@ -282,9 +305,14 @@ const styles = StyleSheet.create((theme) => ({
     zIndex: OVERLAY_Z.toast,
     alignItems: "center",
   },
+  widthBoundary: {
+    width: "92%",
+    maxWidth: TOAST_MAX_WIDTH,
+    alignItems: "center",
+  },
   toast: {
     alignSelf: "center",
-    maxWidth: "92%",
+    maxWidth: "100%",
     flexDirection: "row",
     alignItems: "center",
     gap: theme.spacing[2],
@@ -298,6 +326,12 @@ const styles = StyleSheet.create((theme) => ({
   },
   toastSuccess: {
     borderColor: theme.colors.border,
+  },
+  toastInfo: {
+    borderColor: theme.colors.palette.blue[300],
+  },
+  toastWarning: {
+    borderColor: theme.colors.palette.amber[500],
   },
   toastError: {
     borderColor: theme.colors.destructive,
@@ -313,7 +347,7 @@ const styles = StyleSheet.create((theme) => ({
   message: {
     flexShrink: 1,
     color: theme.colors.foreground,
-    fontSize: theme.fontSize.sm,
+    fontSize: theme.fontSize.base,
     fontWeight: theme.fontWeight.normal,
   },
   messageError: {

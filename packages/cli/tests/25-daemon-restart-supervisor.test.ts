@@ -7,7 +7,7 @@
 
 import assert from "node:assert";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { $ } from "zx";
@@ -69,10 +69,10 @@ function readWorkerPid(supervisorPid: number): number | null {
   return null;
 }
 
-type DaemonStatus = {
+interface DaemonStatus {
   localDaemon: string | null;
   pid: number | null;
-};
+}
 
 async function readDaemonStatus(paseoHome: string): Promise<DaemonStatus> {
   const result =
@@ -94,6 +94,11 @@ async function readDaemonStatus(paseoHome: string): Promise<DaemonStatus> {
   }
 }
 
+async function readCapturedSupervisorLogs(paseoHome: string, recentLogs: string): Promise<string> {
+  const durableLogs = await readFile(join(paseoHome, "daemon.log"), "utf8").catch(() => "");
+  return `${recentLogs}\n${durableLogs}`;
+}
+
 async function waitFor(
   check: () => Promise<boolean> | boolean,
   timeoutMs: number,
@@ -101,14 +106,14 @@ async function waitFor(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
 
-  while (Date.now() < deadline) {
-    if (await check()) {
-      return;
-    }
+  async function poll(): Promise<void> {
+    if (await check()) return;
+    if (Date.now() >= deadline) throw new Error(message);
     await sleep(pollIntervalMs);
+    return poll();
   }
 
-  throw new Error(message);
+  return poll();
 }
 
 console.log("=== Daemon Restart (supervisor regression) ===\n");
@@ -222,9 +227,19 @@ try {
     supervisorPid,
     "supervisor pid should remain stable across restart",
   );
+  const capturedSupervisorLogs = await readCapturedSupervisorLogs(paseoHome, recentSupervisorLogs);
   assert(
-    recentSupervisorLogs.includes("Restart requested by worker. Stopping worker for restart..."),
-    `restart should route through supervisor restart intent, logs:\n${recentSupervisorLogs}`,
+    capturedSupervisorLogs.includes('"msg":"Worker requested restart"') &&
+      capturedSupervisorLogs.includes('"reason":"settings_update"'),
+    `restart should log lifecycle restart reason from daemon worker, logs:\n${capturedSupervisorLogs}`,
+  );
+  assert(
+    capturedSupervisorLogs.includes('"msg":"Supervisor requesting graceful worker shutdown"'),
+    `restart should log the graceful worker shutdown request, logs:\n${capturedSupervisorLogs}`,
+  );
+  assert(
+    capturedSupervisorLogs.includes("Server closed"),
+    `restart should run daemon cleanup before replacing the worker, logs:\n${capturedSupervisorLogs}`,
   );
   console.log("✓ app-style restart keeps daemon healthy and restarts worker\n");
 } finally {

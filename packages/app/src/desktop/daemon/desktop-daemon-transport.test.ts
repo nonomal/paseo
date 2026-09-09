@@ -1,135 +1,111 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import {
+  buildDesktopDaemonTransportUrl,
+  createDesktopDaemonTransportFactory,
+} from "./desktop-daemon-transport";
+import { createFakeLocalDaemonTransportRpc } from "./test-local-daemon-transport-rpc";
 
-const desktopDaemonMock = vi.hoisted(() => {
-  let eventHandler:
-    | ((payload: {
-        sessionId: string;
-        kind: "open" | "message" | "close" | "error";
-        text?: string | null;
-        binaryBase64?: string | null;
-        code?: number | null;
-        reason?: string | null;
-        error?: string | null;
-      }) => void)
-    | null = null;
-
-  const openLocalTransportSession = vi.fn<(...args: unknown[]) => Promise<string>>();
-  const listenToLocalTransportEvents = vi.fn(
-    async (
-      handler: typeof eventHandler extends ((...args: infer A) => any) | null
-        ? (...args: A) => void
-        : never,
-    ) => {
-      eventHandler = handler;
-      return () => {
-        eventHandler = null;
-      };
-    },
-  );
-  const sendLocalTransportMessage = vi.fn(async () => undefined);
-  const closeLocalTransportSession = vi.fn(async () => undefined);
-
-  return {
-    openLocalTransportSession,
-    listenToLocalTransportEvents,
-    sendLocalTransportMessage,
-    closeLocalTransportSession,
-    emitEvent(payload: {
-      sessionId: string;
-      kind: "open" | "message" | "close" | "error";
-      text?: string | null;
-      binaryBase64?: string | null;
-      code?: number | null;
-      reason?: string | null;
-      error?: string | null;
-    }) {
-      eventHandler?.(payload);
-    },
-  };
-});
-
-vi.mock("./desktop-daemon", () => ({
-  openLocalTransportSession: desktopDaemonMock.openLocalTransportSession,
-  listenToLocalTransportEvents: desktopDaemonMock.listenToLocalTransportEvents,
-  sendLocalTransportMessage: desktopDaemonMock.sendLocalTransportMessage,
-  closeLocalTransportSession: desktopDaemonMock.closeLocalTransportSession,
-}));
+const LOCAL_URL = "paseo+desktop://socket?path=%2Ftmp%2Fpaseo.sock";
 
 describe("desktop-daemon-transport", () => {
-  beforeEach(() => {
-    desktopDaemonMock.openLocalTransportSession.mockReset();
-    desktopDaemonMock.listenToLocalTransportEvents.mockClear();
-    desktopDaemonMock.sendLocalTransportMessage.mockClear();
-    desktopDaemonMock.closeLocalTransportSession.mockClear();
-  });
-
-  it("emits open after the session resolves even if the rust open event raced earlier", async () => {
-    let resolveSession!: (sessionId: string) => void;
-    desktopDaemonMock.openLocalTransportSession.mockImplementation(
-      () =>
-        new Promise<string>((resolve) => {
-          resolveSession = resolve;
-        }),
-    );
-
-    const mod = await import("./desktop-daemon-transport");
-    const transportFactory = mod.createDesktopLocalDaemonTransportFactory();
+  it("uses the main-process event as readiness when it races registration", async () => {
+    const rpc = createFakeLocalDaemonTransportRpc();
+    const cleanup = vi.fn();
+    const transportFactory = createDesktopDaemonTransportFactory(rpc);
     expect(transportFactory).not.toBeNull();
 
-    const transport = transportFactory!({
-      url: "paseo+local://socket?path=%2Ftmp%2Fpaseo.sock",
-    });
+    const transport = transportFactory!({ url: LOCAL_URL });
 
     const onOpen = vi.fn();
     transport.onOpen(onOpen);
 
-    desktopDaemonMock.emitEvent({
-      sessionId: "local-session-1",
-      kind: "open",
-    });
+    rpc.resolveListen(cleanup);
+    await Promise.resolve();
 
-    expect(onOpen).not.toHaveBeenCalled();
+    const sessionId = rpc.openCalls[0]?.sessionId ?? "";
+    expect(sessionId).not.toBe("");
+    rpc.emitEvent({ sessionId, kind: "open" });
+    expect(onOpen).toHaveBeenCalledTimes(1);
 
-    resolveSession("local-session-1");
+    rpc.resolveRegistration();
     await Promise.resolve();
 
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
-  it("cleans up late async setup after the transport is closed", async () => {
-    let resolveSession!: (sessionId: string) => void;
-    let resolveListen!: (cleanup: () => void) => void;
+  it("does not start a session when listener setup finishes after close", async () => {
+    const rpc = createFakeLocalDaemonTransportRpc();
     const cleanup = vi.fn();
 
-    desktopDaemonMock.openLocalTransportSession.mockImplementation(
-      () =>
-        new Promise<string>((resolve) => {
-          resolveSession = resolve;
-        }),
-    );
-    desktopDaemonMock.listenToLocalTransportEvents.mockImplementation(
-      () =>
-        new Promise<() => void>((resolve) => {
-          resolveListen = resolve;
-        }),
-    );
-
-    const mod = await import("./desktop-daemon-transport");
-    const transportFactory = mod.createDesktopLocalDaemonTransportFactory();
+    const transportFactory = createDesktopDaemonTransportFactory(rpc);
     expect(transportFactory).not.toBeNull();
 
-    const transport = transportFactory!({
-      url: "paseo+local://socket?path=%2Ftmp%2Fpaseo.sock",
-    });
+    const transport = transportFactory!({ url: LOCAL_URL });
 
     transport.close();
 
-    resolveSession("local-session-2");
-    resolveListen(cleanup);
+    rpc.resolveListen(cleanup);
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(desktopDaemonMock.closeLocalTransportSession).toHaveBeenCalledWith("local-session-2");
+    expect(rpc.openCalls).toHaveLength(0);
+    expect(rpc.closedSessions).toHaveLength(1);
     expect(cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a registered session while readiness is pending", async () => {
+    const rpc = createFakeLocalDaemonTransportRpc();
+    const transportFactory = createDesktopDaemonTransportFactory(rpc);
+    expect(transportFactory).not.toBeNull();
+
+    const transport = transportFactory!({ url: LOCAL_URL });
+    rpc.resolveListen(vi.fn());
+    await Promise.resolve();
+
+    const sessionId = rpc.openCalls[0]?.sessionId ?? "";
+    expect(sessionId).not.toBe("");
+
+    transport.close();
+
+    expect(rpc.closedSessions).toEqual([sessionId]);
+  });
+
+  it("passes Remote SSH parameters to the desktop transport bridge", async () => {
+    const rpc = createFakeLocalDaemonTransportRpc();
+    const transportFactory = createDesktopDaemonTransportFactory(rpc);
+    expect(transportFactory).not.toBeNull();
+
+    const url = buildDesktopDaemonTransportUrl({
+      transportType: "ssh",
+      host: "deploy@example.com",
+      sshPort: 2222,
+      daemonPort: 7777,
+    });
+    transportFactory!({ url });
+    rpc.resolveListen(vi.fn());
+    await Promise.resolve();
+
+    expect(rpc.openCalls).toHaveLength(1);
+    expect(rpc.openCalls[0]?.target).toEqual({
+      transportType: "ssh",
+      host: "deploy@example.com",
+      sshPort: 2222,
+      daemonPort: 7777,
+    });
+  });
+
+  it.each([0, 65536])("rejects an out-of-range Remote SSH port (%s)", (sshPort) => {
+    const transportFactory = createDesktopDaemonTransportFactory(
+      createFakeLocalDaemonTransportRpc(),
+    );
+    expect(transportFactory).not.toBeNull();
+
+    const url = buildDesktopDaemonTransportUrl({
+      transportType: "ssh",
+      host: "deploy@example.com",
+      sshPort,
+    });
+
+    expect(() => transportFactory!({ url })).toThrow("Invalid SSH transport target");
   });
 });

@@ -1,55 +1,42 @@
-import { useEffect } from "react";
+import { createElement, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Platform } from "react-native";
 import type { ViewStyle } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
+import {
+  useGenericKeyboardHandler,
+  useReanimatedKeyboardAnimation,
+} from "react-native-keyboard-controller";
 import {
   useAnimatedStyle,
+  useAnimatedReaction,
   useDerivedValue,
   useSharedValue,
   type SharedValue,
 } from "react-native-reanimated";
-
-const DEFAULT_IOS_KEYBOARD_INSET_MIN_HEIGHT = 120;
-
-function resolveKeyboardShift(input: {
-  rawKeyboardHeight: number;
-  bottomInset: number;
-  isIos: boolean;
-  iosMinHeight: number;
-  enabled: boolean;
-}): number {
-  "worklet";
-
-  if (!input.enabled) {
-    return 0;
-  }
-
-  // iOS can report a small accessory/prediction bar height during touch focus.
-  // Treat that as non-keyboard so layouts don't "bounce" while interacting.
-  if (input.isIos && input.rawKeyboardHeight < input.iosMinHeight) {
-    return 0;
-  }
-
-  return Math.max(0, input.rawKeyboardHeight - input.bottomInset);
-}
+import { scheduleOnRN } from "react-native-worklets";
+import {
+  DEFAULT_IOS_KEYBOARD_INSET_MIN_HEIGHT,
+  resolveKeyboardShift,
+  shouldReconcileHiddenKeyboardEnd,
+} from "@/hooks/keyboard-shift-policy";
+import {
+  KeyboardShiftContext,
+  SettledKeyboardShiftContext,
+  useKeyboardShift,
+} from "@/hooks/keyboard-shift-context";
 
 type KeyboardShiftMode = "translate" | "padding";
 
-export function useKeyboardShiftStyle(input: {
-  mode: KeyboardShiftMode;
-  enabled?: boolean;
-  iosMinHeight?: number;
-}): {
-  shift: SharedValue<number>;
-  style: ReturnType<typeof useAnimatedStyle<ViewStyle>>;
-} {
+export function KeyboardShiftProvider({ children }: { children: ReactNode }) {
   const insets = useSafeAreaInsets();
-  const { height: keyboardHeight } = useReanimatedKeyboardAnimation();
+  const { height: keyboardHeight, progress: keyboardProgress } = useReanimatedKeyboardAnimation();
   const bottomInset = useSharedValue(insets.bottom);
-  const enabled = input.enabled ?? true;
   const isIos = Platform.OS === "ios";
-  const iosMinHeight = input.iosMinHeight ?? DEFAULT_IOS_KEYBOARD_INSET_MIN_HEIGHT;
+  const isMoving = useSharedValue(false);
+  const [settledShift, setSettledShift] = useState(0);
+  const publishSettledShift = useCallback((nextShift: number) => {
+    setSettledShift((currentShift) => (currentShift === nextShift ? currentShift : nextShift));
+  }, []);
 
   useEffect(() => {
     bottomInset.value = insets.bottom;
@@ -57,19 +44,70 @@ export function useKeyboardShiftStyle(input: {
 
   const shift = useDerivedValue(() => {
     "worklet";
-    const rawKeyboardHeight = Math.abs(keyboardHeight.value);
     return resolveKeyboardShift({
-      rawKeyboardHeight,
+      rawKeyboardHeight: Math.abs(keyboardHeight.value),
+      keyboardProgress: keyboardProgress.value,
       bottomInset: bottomInset.value,
       isIos,
-      iosMinHeight,
-      enabled,
+      iosMinHeight: DEFAULT_IOS_KEYBOARD_INSET_MIN_HEIGHT,
     });
   });
 
+  useGenericKeyboardHandler(
+    {
+      onStart: () => {
+        "worklet";
+        isMoving.value = true;
+      },
+      onEnd: (event) => {
+        "worklet";
+        if (isIos && shouldReconcileHiddenKeyboardEnd(event)) {
+          keyboardHeight.value = 0;
+          keyboardProgress.value = 0;
+        }
+        isMoving.value = false;
+      },
+    },
+    [isIos, isMoving, keyboardHeight, keyboardProgress],
+  );
+
+  useAnimatedReaction(
+    () => ({ moving: isMoving.value, shift: shift.value }),
+    (current, previous) => {
+      if (!current.moving && (previous === null || previous.moving)) {
+        scheduleOnRN(publishSettledShift, current.shift);
+      }
+    },
+    [isMoving, publishSettledShift, shift],
+  );
+
+  const value = useMemo(
+    () => ({
+      shift,
+      isMoving,
+      bottomInset,
+    }),
+    [bottomInset, isMoving, shift],
+  );
+
+  return createElement(
+    KeyboardShiftContext.Provider,
+    { value },
+    createElement(SettledKeyboardShiftContext.Provider, { value: settledShift }, children),
+  );
+}
+
+export function useKeyboardShiftStyle(input: { mode: KeyboardShiftMode; enabled?: boolean }): {
+  shift: SharedValue<number>;
+  style: ReturnType<typeof useAnimatedStyle<ViewStyle>>;
+} {
+  const { shift, bottomInset } = useKeyboardShift();
+  const mode = input.mode;
+  const enabled = input.enabled ?? true;
+
   const style = useAnimatedStyle<ViewStyle>(() => {
     "worklet";
-    if (input.mode === "padding") {
+    if (mode === "padding") {
       if (!enabled) {
         return { paddingBottom: 0 };
       }
@@ -77,8 +115,8 @@ export function useKeyboardShiftStyle(input: {
       return { paddingBottom: bottomInset.value + shift.value };
     }
 
-    return { transform: [{ translateY: -shift.value }] };
-  }, [input.mode]);
+    return { transform: [{ translateY: enabled ? -shift.value : 0 }] };
+  }, [enabled, mode]);
 
   return { shift, style };
 }

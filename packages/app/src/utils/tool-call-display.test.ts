@@ -48,13 +48,6 @@ describe("tool-call-display", () => {
         subAgentType: "Explore",
         description: "Inspect repository structure",
         log: "[Read] README.md",
-        actions: [
-          {
-            index: 1,
-            toolName: "Read",
-            summary: "README.md",
-          },
-        ],
       },
     });
 
@@ -77,7 +70,7 @@ describe("tool-call-display", () => {
     });
 
     expect(display).toEqual({
-      displayName: "Custom Tool Name",
+      displayName: "Custom tool name",
     });
   });
 
@@ -96,6 +89,7 @@ describe("tool-call-display", () => {
             index: 1,
             command: "npm install",
             cwd: "/tmp/repo/.paseo/worktrees/repo/branch",
+            log: "",
             status: "running",
             exitCode: null,
           },
@@ -104,7 +98,7 @@ describe("tool-call-display", () => {
     });
 
     expect(display).toEqual({
-      displayName: "Worktree Setup",
+      displayName: "Worktree setup",
       summary: "feature-branch",
     });
   });
@@ -122,7 +116,7 @@ describe("tool-call-display", () => {
     });
 
     expect(display).toEqual({
-      displayName: "Exec Command",
+      displayName: "Exec command",
     });
   });
 

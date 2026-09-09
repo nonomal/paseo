@@ -1,69 +1,230 @@
-import { afterEach, describe, expect, test, vi } from "vitest";
-
-vi.mock("@opencode-ai/sdk/v2/client", () => ({
-  createOpencodeClient: vi.fn(),
-}));
-
-import { createOpencodeClient } from "@opencode-ai/sdk/v2/client";
+import { afterEach, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
-import { OpenCodeAgentClient, OpenCodeServerManager } from "./opencode-agent.js";
+import { OpenCodeAgentClient } from "./opencode-agent.js";
+import { runProviderRefreshWithDeadline } from "../provider-refresh-deadline.js";
+import {
+  TestOpenCodeClient,
+  TestOpenCodeHarness,
+} from "./opencode/test-utils/test-opencode-harness.js";
 
-describe("OpenCodeAgentClient.listModels timeout", () => {
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.restoreAllMocks();
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+test("the catalog deadline aborts provider.list and releases the server", async () => {
+  vi.useFakeTimers();
+
+  const runtime = new TestOpenCodeHarness();
+  const openCodeClient = new TestOpenCodeClient();
+  openCodeClient.providerListImplementation = (_parameters, options) =>
+    new Promise((_resolve, reject) => {
+      const signal = (options as { signal: AbortSignal }).signal;
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  runtime.enqueueClient(openCodeClient);
+
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: runtime,
+    createClient: runtime.createClient,
+  });
+  const modelsPromise = runProviderRefreshWithDeadline({
+    label: "OpenCode",
+    timeoutMs: 100,
+    operation: (context) =>
+      client.fetchCatalog(
+        { scope: "workspace", cwd: "/tmp/opencode-models", force: false },
+        context,
+      ),
+  });
+  const rejection = expect(modelsPromise).rejects.toThrow(
+    "Timed out refreshing OpenCode after 100ms; pending: provider.list",
+  );
+
+  await vi.advanceTimersByTimeAsync(100);
+
+  await rejection;
+  expect(openCodeClient.calls.providerList).toHaveLength(1);
+  expect(openCodeClient.calls.providerListOptions[0]).toMatchObject({
+    signal: expect.objectContaining({ aborted: true }),
+  });
+  expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+});
+
+test("the catalog deadline aborts app.agents and releases the server", async () => {
+  vi.useFakeTimers();
+
+  const runtime = new TestOpenCodeHarness();
+  const openCodeClient = new TestOpenCodeClient();
+  openCodeClient.providerListResponse = {
+    data: {
+      connected: ["openai"],
+      all: [{ id: "openai", name: "OpenAI", models: {} }],
+    },
+  };
+  openCodeClient.appAgentsImplementation = (_parameters, options) =>
+    new Promise((_resolve, reject) => {
+      const signal = (options as { signal: AbortSignal }).signal;
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  runtime.enqueueClient(openCodeClient);
+
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: runtime,
+    createClient: runtime.createClient,
+  });
+  const catalogPromise = runProviderRefreshWithDeadline({
+    label: "OpenCode",
+    timeoutMs: 100,
+    operation: (context) =>
+      client.fetchCatalog(
+        { scope: "workspace", cwd: "/tmp/opencode-agents", force: false },
+        context,
+      ),
+  });
+  const rejection = expect(catalogPromise).rejects.toThrow(
+    "Timed out refreshing OpenCode after 100ms; pending: app.agents",
+  );
+
+  await vi.advanceTimersByTimeAsync(100);
+
+  await rejection;
+  expect(openCodeClient.calls.appAgents).toHaveLength(1);
+  expect(openCodeClient.calls.appAgentsOptions[0]).toMatchObject({
+    signal: expect.objectContaining({ aborted: true }),
+  });
+  expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+});
+
+test("uses a new server for explicit catalog refresh", async () => {
+  const runtime = new TestOpenCodeHarness();
+  const openCodeClient = new TestOpenCodeClient();
+  openCodeClient.providerListResponse = {
+    data: {
+      connected: ["openai"],
+      all: [{ id: "openai", name: "OpenAI", models: {} }],
+    },
+  };
+  runtime.enqueueClient(openCodeClient);
+
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: runtime,
+    createClient: runtime.createClient,
   });
 
-  test("allows a slow provider.list call to succeed instead of failing after 10 seconds", async () => {
-    vi.useFakeTimers();
+  await client.fetchCatalog({ scope: "workspace", cwd: "/tmp/opencode-models", force: true });
 
-    const providerList = vi.fn(
-      () =>
-        new Promise((resolve) => {
-          setTimeout(() => {
-            resolve({
-              data: {
-                connected: ["zai"],
-                all: [
-                  {
-                    id: "zai",
-                    name: "Z.AI",
-                    models: {
-                      "glm-5.1": {
-                        name: "GLM 5.1",
-                        limit: { context: 128_000 },
-                      },
-                    },
-                  },
-                ],
-              },
-            });
-          }, 15_000);
-        }),
-    );
+  expect(runtime.acquisitions).toEqual([{ kind: "new", releaseCount: 1 }]);
+});
 
-    vi.mocked(createOpencodeClient).mockReturnValue({
-      provider: {
-        list: providerList,
-      },
-    } as never);
+test("includes models from api-source providers not in connected", async () => {
+  // Providers with source "api" are managed by the OpenCode console/subscription.
+  // They don't appear in `connected` but are fully usable.
+  const runtime = new TestOpenCodeHarness();
+  const openCodeClient = new TestOpenCodeClient();
+  openCodeClient.providerListResponse = {
+    data: {
+      connected: [],
+      all: [
+        {
+          id: "pi",
+          name: "Pi",
+          source: "api",
+          models: {
+            "pi-model-1": {
+              name: "Pi Model 1",
+              limit: { context: 200_000 },
+            },
+          },
+        },
+      ],
+    },
+  };
+  runtime.enqueueClient(openCodeClient);
 
-    vi.spyOn(OpenCodeServerManager, "getInstance").mockReturnValue({
-      ensureRunning: vi.fn().mockResolvedValue({ port: 1234, url: "http://127.0.0.1:1234" }),
-    } as never);
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: runtime,
+    createClient: runtime.createClient,
+  });
+  const { models } = await client.fetchCatalog({
+    scope: "workspace",
+    cwd: "/tmp/opencode-models",
+    force: false,
+  });
 
-    const client = new OpenCodeAgentClient(createTestLogger());
-    const modelsPromise = client.listModels();
+  expect(models).toMatchObject([
+    {
+      provider: "opencode",
+      id: "pi/pi-model-1",
+      label: "Pi Model 1",
+    },
+  ]);
+});
 
-    await vi.advanceTimersByTimeAsync(15_000);
+test("throws when no providers are accessible (neither connected nor api-source)", async () => {
+  const runtime = new TestOpenCodeHarness();
+  const openCodeClient = new TestOpenCodeClient();
+  openCodeClient.providerListResponse = {
+    data: {
+      connected: [],
+      all: [
+        {
+          id: "anthropic",
+          name: "Anthropic",
+          source: "env",
+          models: {
+            "claude-opus": { name: "Claude Opus", limit: { context: 1_000_000 } },
+          },
+        },
+      ],
+    },
+  };
+  runtime.enqueueClient(openCodeClient);
 
-    await expect(modelsPromise).resolves.toMatchObject([
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: runtime,
+    createClient: runtime.createClient,
+  });
+
+  await expect(
+    client.fetchCatalog({ scope: "workspace", cwd: "/tmp/opencode-models", force: false }),
+  ).rejects.toThrow("OpenCode has no connected providers");
+});
+
+test("does not throw when only api-source providers are present with no connected providers", async () => {
+  const runtime = new TestOpenCodeHarness();
+  const openCodeClient = new TestOpenCodeClient();
+  openCodeClient.providerListResponse = {
+    data: {
+      connected: [],
+      all: [
+        {
+          id: "pi",
+          name: "Pi",
+          source: "api",
+          models: {
+            "pi-model-1": { name: "Pi Model 1", limit: { context: 200_000 } },
+          },
+        },
+      ],
+    },
+  };
+  runtime.enqueueClient(openCodeClient);
+
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: runtime,
+    createClient: runtime.createClient,
+  });
+
+  await expect(
+    client.fetchCatalog({ scope: "workspace", cwd: "/tmp/opencode-models", force: false }),
+  ).resolves.toMatchObject({
+    models: [
       {
         provider: "opencode",
-        id: "zai/glm-5.1",
-        label: "GLM 5.1",
+        id: "pi/pi-model-1",
+        label: "Pi Model 1",
       },
-    ]);
+    ],
   });
 });

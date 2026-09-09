@@ -7,6 +7,17 @@ const mockState = vi.hoisted(() => ({
 }));
 
 vi.mock("./acp-agent.js", () => ({
+  DEFAULT_ACP_CAPABILITIES: {
+    supportsStreaming: true,
+    supportsSessionPersistence: true,
+    supportsDynamicModes: true,
+    supportsMcpServers: true,
+    supportsReasoningStream: true,
+    supportsToolInvocations: true,
+    supportsRewindConversation: false,
+    supportsRewindFiles: false,
+    supportsRewindBoth: false,
+  },
   ACPAgentClient: class ACPAgentClient {
     readonly provider: string;
 
@@ -21,13 +32,14 @@ import { GenericACPAgentClient } from "./generic-acp-agent.js";
 
 describe("GenericACPAgentClient", () => {
   test("passes the custom command only as defaultCommand", () => {
-    new GenericACPAgentClient({
+    const _client = new GenericACPAgentClient({
       logger: createTestLogger(),
       command: ["hermes", "acp"],
       env: {
         HERMES_LOG: "info",
       },
     });
+    void _client;
 
     expect(mockState.superConstructorOptions).toEqual([
       {
@@ -39,7 +51,35 @@ describe("GenericACPAgentClient", () => {
           },
         },
         defaultCommand: ["hermes", "acp"],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+          supportsRewindConversation: false,
+          supportsRewindFiles: false,
+          supportsRewindBoth: false,
+        },
       },
     ]);
+  });
+
+  test("uses provider params to report MCP support", () => {
+    const _client = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: ["no-mcp-acp", "serve"],
+      providerParams: {
+        supportsMcpServers: false,
+      },
+    });
+    void _client;
+
+    expect(mockState.superConstructorOptions.at(-1)).toMatchObject({
+      capabilities: {
+        supportsMcpServers: false,
+      },
+    });
   });
 });
